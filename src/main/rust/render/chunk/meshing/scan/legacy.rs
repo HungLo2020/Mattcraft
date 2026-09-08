@@ -9,6 +9,64 @@ use std::slice;
 use std::time::Instant;
 
 use super::*;
+
+// The replay ABI must not inherit fields added to the internal compact
+// scanner record. Java still writes the historical 316-byte layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LegacySectionBlockRecord {
+    state_id: i32,
+    block_id: i32,
+    local_x: i32,
+    local_y: i32,
+    local_z: i32,
+    seed_lo: i32,
+    seed_hi: i32,
+    neighbor_state_ids: [i32; 6],
+    light_words: [i32; 27],
+    neighborhood_state_ids: [i32; 27],
+    tint: i32,
+    fluid_tint: i32,
+    fluid_flow_x: f32,
+    fluid_flow_z: f32,
+    absolute_x: i32,
+    absolute_y: i32,
+    absolute_z: i32,
+    legacy_offset_x: f32,
+    legacy_offset_y: f32,
+    legacy_offset_z: f32,
+    fluid_block_id: i32,
+    flags: i32,
+}
+
+impl LegacySectionBlockRecord {
+    fn decoded(self) -> NativeSectionBlockRecord {
+        NativeSectionBlockRecord {
+            state_id: self.state_id, block_id: self.block_id,
+            local_x: self.local_x, local_y: self.local_y, local_z: self.local_z,
+            seed_lo: self.seed_lo, seed_hi: self.seed_hi,
+            neighbor_state_ids: self.neighbor_state_ids,
+            light_words: self.light_words,
+            neighborhood_state_ids: self.neighborhood_state_ids,
+            // Legacy records carry one tint, not spatial provider samples.
+            tint_lattice: [[[self.tint; 4]; 4]; 4],
+            tint: self.tint, fluid_tint: self.fluid_tint,
+            fluid_flow_x: self.fluid_flow_x, fluid_flow_z: self.fluid_flow_z,
+            absolute_x: self.absolute_x, absolute_y: self.absolute_y, absolute_z: self.absolute_z,
+            legacy_offset_x: self.legacy_offset_x, legacy_offset_y: self.legacy_offset_y,
+            legacy_offset_z: self.legacy_offset_z,
+            fluid_block_id: self.fluid_block_id, flags: self.flags,
+        }
+    }
+}
+
+#[test]
+fn legacy_record_keeps_its_316_byte_wire_layout() {
+    assert_eq!(316, std::mem::size_of::<LegacySectionBlockRecord>());
+    assert_eq!(268, std::mem::offset_of!(LegacySectionBlockRecord, tint));
+    assert_eq!(312, std::mem::offset_of!(LegacySectionBlockRecord, flags));
+}
+
 pub(in crate::render::chunk::meshing) unsafe fn section_builder_append_native_section_records_encoded(
     builder: &mut NativeSectionMeshBuilder,
     record_address: u64,
@@ -25,7 +83,7 @@ pub(in crate::render::chunk::meshing) unsafe fn section_builder_append_native_se
     if record_address == 0 {
         return Err(ERR_NULL_POINTER);
     }
-    if record_stride != std::mem::size_of::<NativeSectionBlockRecord>() {
+    if record_stride != std::mem::size_of::<LegacySectionBlockRecord>() {
         return Err(ERR_INVALID_ARGUMENT);
     }
     if pass_id >= 0
@@ -39,7 +97,7 @@ pub(in crate::render::chunk::meshing) unsafe fn section_builder_append_native_se
     }
 
     let records = slice::from_raw_parts(
-        record_address as *const NativeSectionBlockRecord,
+        record_address as *const LegacySectionBlockRecord,
         record_count,
     );
     let emit_all_passes = pass_id < 0;
@@ -79,6 +137,8 @@ pub(in crate::render::chunk::meshing) unsafe fn section_builder_append_native_se
 
     let scan_started = Instant::now();
     for record in records {
+        let decoded = record.decoded();
+        let record = &decoded;
         let iteration_started = profile_start(profile_scan_substages);
         let decoding_started = profile_start(profile_scan_substages);
         let state_lookup_started = profile_start(profile_static_substages);

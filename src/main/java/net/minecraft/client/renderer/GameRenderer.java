@@ -1054,17 +1054,9 @@ public class GameRenderer implements Projector, AutoCloseable, FogStorage {
 			this.minecraft.levelRenderer.collectRustPoiSemantics(this.mainCamera, this.submitNodeStorage);
 			this.minecraft.levelRenderer.collectRustBrainSemantics(this.mainCamera);
 			this.minecraft.levelRenderer.collectRustBeeSemantics(this.mainCamera, this.submitNodeStorage);
-		// Post-effect identity is copied into the semantic whole-frame request;
-			// Rust admits bundled routes or rejects custom graphs using its own
-			// source/asset snapshots. Java never classifies or executes the effect.
-			// The semantic marker calls below are retained as compatibility inputs
-			// for older replay fixtures; Rust also derives the same route directly
-		// from the copied identity, so no Java renderer state is consulted.
-		// Compatibility audit vocabulary: `this.effectActive && this.postEffectId != null`
-		// and “Rust whole-frame Vulkan post effect is unavailable” describe the
-		// Rust-owned fail-closed diagnostic, never a Java PostChain fallback.
-		// `rustSemanticPostEffect` is now derived in the Rust frontend from this
-		// copied identity rather than maintained as a Java whitelist.
+			// The final whole-frame request carries the active semantic effect
+			// identity. Rust resolves and validates its copied source/asset graph;
+			// Java neither classifies nor executes that graph.
 			LocalPlayer localPlayer = this.minecraft.player;
 			if (this.minecraft.getCameraEntity() == null) {
 				this.minecraft.setCameraEntity(localPlayer);
@@ -1136,6 +1128,9 @@ public class GameRenderer implements Projector, AutoCloseable, FogStorage {
 			}
 			net.minecraft.client.renderer.culling.Frustum rustFrameFrustum =
 				net.minecraft.client.renderer.culling.Frustum.forCamera(view, projection, this.mainCamera.getPosition());
+			// Observe immutable CPU camera data for the copied-world fluid test.
+			net.minecraft.client.dev.GraphicsAuditFlowingWaterFixture.observeWorldView(this.minecraft, projection, view, this.mainCamera.getPosition());
+			net.minecraft.client.dev.GraphicsAuditMixedFluidFixture.observeWorldView(this.minecraft, projection, view, this.mainCamera.getPosition());
 			if (this.minecraft.debugEntries.isCurrentlyEnabled(DebugScreenEntries.CHUNK_SECTION_OCTREE)) {
 				this.minecraft.levelRenderer.collectRustOctreeSemantics(this.mainCamera, this.submitNodeStorage,
 					rustFrameFrustum);
@@ -1273,18 +1268,6 @@ public class GameRenderer implements Projector, AutoCloseable, FogStorage {
 		net.minecraft.client.dev.GraphicsFrameBenchmark.beginPhase("gui.state-create");
 		GuiGraphics guiGraphics = new GuiGraphics(this.minecraft, this.guiRenderState);
 		net.minecraft.client.dev.GraphicsFrameBenchmark.endPhase("gui.state-create");
-		if (gameLoadFinished && bl && this.minecraft.level != null && this.minecraft.player != null
-			&& this.effectActive && ResourceLocation.withDefaultNamespace("invert").equals(this.postEffectId)) {
-			net.vulkanic.gui.RustGalGuiRenderer.enqueuePostEffectInvert(this.minecraft, guiGraphics);
-		}
-		if (gameLoadFinished && bl && this.minecraft.level != null && this.minecraft.player != null
-			&& this.effectActive && ResourceLocation.withDefaultNamespace("creeper").equals(this.postEffectId)) {
-			net.vulkanic.gui.RustGalGuiRenderer.enqueuePostEffectCreeper(this.minecraft, guiGraphics);
-		}
-		if (gameLoadFinished && bl && this.minecraft.level != null && this.minecraft.player != null
-			&& this.effectActive && ResourceLocation.withDefaultNamespace("spider").equals(this.postEffectId)) {
-			net.vulkanic.gui.RustGalGuiRenderer.enqueuePostEffectSpider(this.minecraft, guiGraphics);
-		}
 		// The blur boundary is semantic frame data. RustGalFrameCoordinator
 		// transports the boundary stratum and bounded radius through the whole-frame
 		// ABI, and Rust's GUI frontend owns the snapshot/blur/composite passes.
@@ -1375,12 +1358,22 @@ public class GameRenderer implements Projector, AutoCloseable, FogStorage {
 		profilerFiller.popPush("rustVulkanWholeFramePresent");
 		net.minecraft.client.dev.GraphicsFrameBenchmark.beginPhase("game.rust-vulkan.frame-coordinator");
 		// executeWholeFrameVulkan(this.minecraft, this.guiRenderState)
+		int semanticMenuBlurRadius = this.minecraft.options.getMenuBackgroundBlurriness();
+		if (this.minecraft.screen instanceof net.irisshaders.iris.gui.screen.ShaderPackScreen shaderPackScreen) {
+			semanticMenuBlurRadius = (int) Math.min(semanticMenuBlurRadius, shaderPackScreen.blurTransition.getAsFloat());
+		}
 		net.vulkanic.gui.RustGalFrameCoordinator.executeWholeFrameVulkan(
 			this.minecraft,
 			this.guiRenderState,
 			this.effectActive && this.postEffectId != null
 				? this.postEffectId.toString()
-				: Minecraft.useShaderTransparency() ? "minecraft:transparency" : null
+				: Minecraft.useShaderTransparency() ? "minecraft:transparency" : null,
+			new net.vulkanic.bridge.VulkanicGalBridge.EngineGlobalsRecord(
+				this.minecraft.getWindow().getWidth(), this.minecraft.getWindow().getHeight(),
+				this.minecraft.level == null ? 0L : this.minecraft.level.getGameTime(),
+				deltaTracker.getGameTimeDeltaPartialTick(false),
+				this.minecraft.options.glintStrength().get().floatValue(),
+				semanticMenuBlurRadius)
 		);
 		net.minecraft.client.dev.GraphicsFrameBenchmark.endPhase("game.rust-vulkan.frame-coordinator");
 		profilerFiller.pop();

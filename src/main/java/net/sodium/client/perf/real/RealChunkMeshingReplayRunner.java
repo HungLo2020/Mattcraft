@@ -788,7 +788,7 @@ public final class RealChunkMeshingReplayRunner implements GameHooks {
     }
 
     private static int nativeStateFlags(BlockState state) {
-        int flags = 0;
+        int flags = NativeStaticBlockModelRegistry.fluidOverlayFlags(state);
         if (state.isAir()) flags |= NativeStaticBlockModelRegistry.STATE_FLAG_AIR;
         if (state.getRenderShape() == RenderShape.MODEL && NativeStaticBlockModelRegistry.hasNativeModel(state)) {
             flags |= NativeStaticBlockModelRegistry.STATE_FLAG_MODEL;
@@ -812,7 +812,7 @@ public final class RealChunkMeshingReplayRunner implements GameHooks {
         if (block == Blocks.LARGE_FERN || block == Blocks.TALL_GRASS) return 7;
         if (block == Blocks.OAK_LEAVES || block == Blocks.JUNGLE_LEAVES || block == Blocks.ACACIA_LEAVES
                 || block == Blocks.DARK_OAK_LEAVES || block == Blocks.VINE || block == Blocks.MANGROVE_LEAVES
-                || block == Blocks.LEAF_LITTER || block == Blocks.AZALEA_LEAVES
+                || block == Blocks.AZALEA_LEAVES
                 || block == Blocks.FLOWERING_AZALEA_LEAVES) return 2;
         if (block == Blocks.WATER || block == Blocks.BUBBLE_COLUMN || block == Blocks.WATER_CAULDRON) return 3;
         if (block == Blocks.REDSTONE_WIRE) return 4;
@@ -820,7 +820,8 @@ public final class RealChunkMeshingReplayRunner implements GameHooks {
         if (block == Blocks.SPRUCE_LEAVES) return 8;
         if (block == Blocks.BIRCH_LEAVES) return 9;
         if (block == Blocks.ATTACHED_MELON_STEM || block == Blocks.ATTACHED_PUMPKIN_STEM
-                || block == Blocks.LILY_PAD || block == Blocks.BAMBOO || block == Blocks.POTTED_BAMBOO) return 5;
+                || block == Blocks.LILY_PAD || block == Blocks.BAMBOO || block == Blocks.POTTED_BAMBOO
+                || block == Blocks.LEAF_LITTER) return 5;
         return 0;
     }
 
@@ -867,9 +868,11 @@ public final class RealChunkMeshingReplayRunner implements GameHooks {
             return BiomeColors.getAverageGrassColor(slice, pos) | 0xFF000000;
         }
         if (block == Blocks.OAK_LEAVES || block == Blocks.JUNGLE_LEAVES || block == Blocks.ACACIA_LEAVES
-                || block == Blocks.DARK_OAK_LEAVES || block == Blocks.VINE || block == Blocks.MANGROVE_LEAVES
-                || block == Blocks.LEAF_LITTER) {
+                || block == Blocks.DARK_OAK_LEAVES || block == Blocks.VINE || block == Blocks.MANGROVE_LEAVES) {
             return BiomeColors.getAverageFoliageColor(slice, pos) | 0xFF000000;
+        }
+        if (block == Blocks.LEAF_LITTER) {
+            return BiomeColors.getAverageDryFoliageColor(slice, pos) | 0xFF000000;
         }
         if (block == Blocks.REDSTONE_WIRE) {
             return RedStoneWireBlock.getColorForPower(state.getValue(RedStoneWireBlock.POWER)) | 0xFF000000;

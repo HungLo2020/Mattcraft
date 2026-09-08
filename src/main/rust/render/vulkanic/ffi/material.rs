@@ -225,7 +225,11 @@ pub(crate) unsafe fn decode_world_mesh_asset_update(
                 duration_ticks: frame.duration_ticks,
             });
         }
+        if texture.requested_mip_levels > 32 {
+            return Err(GalError::invalid_argument("invalid explicit texture mip count"));
+        }
         textures.push(WorldMeshTextureAssetPayload {
+            requested_mip_levels: texture.requested_mip_levels,
             texture_id: texture.texture_id,
             png_bytes,
             mip_png_bytes,
@@ -238,6 +242,8 @@ pub(crate) unsafe fn decode_world_mesh_asset_update(
             interpolation_policy: texture.interpolation_policy,
             animation_frames,
             coordinate_origin: texture.reserved0,
+            sampling: super::super::texture_sampling::TextureSampling::decode(
+                texture.sampling_filter, texture.sampling_address)?,
         });
     }
     let raw_meshes = read_limited_slice(request.meshes, true, "world mesh assets")?;
@@ -507,6 +513,8 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_world_mesh_update_assets(
             .saturating_add(size_of::<FfiStatusResult>() as u64);
         let result = decode_world_mesh_asset_update(request, context.gal.capabilities()).and_then(
             |(generation, meshes, textures, sorted_indices, retirements)| {
+                context.gui_frontend.invalidate_atlas_texture_views(
+                    &mut context.gal, textures.iter().map(|texture| texture.texture_id))?;
                 context
                     .world_primitive_frontend
                     .apply_world_mesh_asset_update_with_sorted_and_retirements(

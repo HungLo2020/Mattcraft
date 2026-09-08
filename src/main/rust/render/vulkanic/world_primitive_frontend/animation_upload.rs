@@ -1,4 +1,4 @@
-//! Explicit patch uploads for an already sampled Rust-owned terrain atlas.
+//! Explicit patch uploads for already sampled Rust-owned atlas resources.
 use super::*;
 use crate::render::vulkanic::sprite_interpolation::PreparedAtlasTick;
 
@@ -300,6 +300,8 @@ mod tests {
         mip_rgba: Vec<Vec<u8>>,
     ) -> WorldMaterialTextureAsset {
         WorldMaterialTextureAsset {
+            sampling: None,
+            requested_mip_levels: 0,
             width,
             height,
             rgba,
@@ -545,6 +547,83 @@ mod tests {
         gal.destroy(upload).unwrap();
         gal.destroy(texture).unwrap();
         assert!(gal.mock_backend().unwrap().live.is_empty());
+    }
+
+    #[test]
+    fn atlas_animation_registry_updates_two_vulkan_images_without_cross_atlas_writes() {
+        let mut gal = VulkanicGal::new_with_backend(
+            Box::new(VulkanBackend::new("independent atlas animation readback").unwrap()), false);
+        let mut frontend = WorldPrimitiveFrontend::default();
+        for (id, baseline, base) in [(101, 9, 20u8), (202, 8, 120u8)] {
+            let mut asset = retained_atlas(2, 1, vec![baseline; 8], vec![]);
+            asset.requested_mip_levels = 1;
+            frontend.mesh_texture_assets.insert(id, asset);
+            frontend.ensure_mesh_texture_resources(&mut gal, id, "atlas-isolation-test").unwrap();
+            frontend.stage_atlas_animation_assets(OwnedAtlasAnimationUpdate {
+                texture_id: id, generation: 1,
+                sprites: vec![OwnedSpriteAnimation {
+                    sprite_id: 1,
+                    region: SpriteAtlasRegion { x: 0, y: 0, width: 1, height: 1 },
+                    clock: SpriteAnimationClock::new(vec![
+                        SpriteAnimationFrame { index: 0, duration_ticks: 2 },
+                        SpriteAnimationFrame { index: 1, duration_ticks: 2 },
+                    ], 2, true, 0).unwrap(),
+                    sheets: vec![SpriteMipSheet { width: 2, height: 1,
+                        rgba: vec![base, 0, 0, 255, base + 60, 0, 0, 255] }],
+                }],
+            }).unwrap();
+        }
+        assert_ne!(frontend.mesh_texture_resources[&101].texture, frontend.mesh_texture_resources[&202].texture);
+        let read_images = |gal: &mut VulkanicGal, frontend: &WorldPrimitiveFrontend| {
+            let readback = gal.create_buffer(BufferDesc {
+                label: "two-atlas.readback".into(), size: 16, memory: MemoryDomain::Readback,
+                usages: vec![BufferUsage::TransferDst, BufferUsage::HostRead],
+            }).unwrap();
+            let mut operations = Vec::new();
+            for (id, offset) in [(101, 0), (202, 8)] {
+                let texture = frontend.mesh_texture_resources[&id].texture;
+                let range = TextureSubresourceRange { base_mip: 0, mip_count: 1, base_layer: 0, layer_count: 1 };
+                operations.push(CommandOp::Barrier(texture_subresource_barrier(texture, range,
+                    TextureUsageState::ShaderRead, TextureUsageState::TransferSrc)));
+                operations.push(CommandOp::CopyTextureToBuffer(BufferImageCopyRegion {
+                    buffer: readback, buffer_offset: offset, bytes_per_row: 8, rows_per_image: 1,
+                    texture, texture_mip: 0, texture_layer: 0,
+                    texture_origin: TextureOrigin3d { x: 0, y: 0, z: 0 },
+                    extent: Extent3d { width: 2, height: 1, depth: 1 },
+                }));
+                operations.push(CommandOp::Barrier(texture_subresource_barrier(texture, range,
+                    TextureUsageState::TransferSrc, TextureUsageState::ShaderRead)));
+            }
+            operations.push(CommandOp::Barrier(buffer_barrier(readback,
+                TextureUsageState::TransferDst, TextureUsageState::ShaderRead)));
+            operations.push(CommandOp::HostReadBuffer { buffer: readback, offset: 0, size: 16 });
+            let receipt = gal.submit(SubmissionBatch { label: "two-atlas.readback".into(),
+                command_lists: vec![CommandList::from(CommandListDesc {
+                    label: "two-atlas.readback.commands".into(), operations,
+                })],
+            }).unwrap();
+            gal.retire_through_for_test(receipt.submission).unwrap();
+            let bytes = gal.completed_host_reads().iter().rev()
+                .find(|read| read.buffer == readback).unwrap().bytes.clone();
+            gal.destroy(readback).unwrap();
+            bytes
+        };
+        let event = |texture_id, tick| AtlasAnimationTickEvent {
+            texture_id, generation: 1, tick, visible: BTreeSet::from([1]), animate_only_visible: true,
+        };
+        assert!(frontend.advance_atlas_animation(&mut gal, event(101, 1)).unwrap());
+        assert_eq!(read_images(&mut gal, &frontend),
+            vec![50, 0, 0, 255, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
+        assert!(frontend.advance_atlas_animation(&mut gal, event(202, 1)).unwrap());
+        assert_eq!(read_images(&mut gal, &frontend),
+            vec![50, 0, 0, 255, 9, 9, 9, 9, 150, 0, 0, 255, 8, 8, 8, 8]);
+        assert!(frontend.advance_atlas_animation(&mut gal, event(101, 2)).unwrap());
+        assert_eq!(read_images(&mut gal, &frontend),
+            vec![80, 0, 0, 255, 9, 9, 9, 9, 150, 0, 0, 255, 8, 8, 8, 8]);
+        frontend.reset(&mut gal);
+        assert!(frontend.mesh_texture_resources.is_empty());
+        assert!(frontend.staged_atlas_animations.is_empty());
+        assert!(frontend.atlas_animation_uploads.pending.is_empty());
     }
 
     #[test]

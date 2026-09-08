@@ -11,6 +11,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class AtlasAnimationPublicationTest {
     private static final int ATLAS = 0x54a17a1a;
+    private static AtlasAnimationResource resource(SemanticAtlasAnimationSource source) {
+        return new AtlasAnimationResource(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS, ATLAS, source);
+    }
 
     private static SemanticAtlasAnimationSource source() {
         return new SemanticAtlasAnimationSource(77, 2, 1, 1, List.of(
@@ -22,9 +25,9 @@ class AtlasAnimationPublicationTest {
 
     @Test
     void stagingFailureRetainsOnlyAcceptedGenerationForRetry() {
-        var texture = new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, new byte[]{1});
+        var texture = new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, new byte[]{1}, List.of());
         var source = source();
-        var publication = new AtlasAnimationPublication(texture, source);
+        var publication = new AtlasAnimationPublication(texture, resource(source));
         AtomicInteger calls = new AtomicInteger();
         AtlasAnimationPublication.Stage stage = (id, generation, tick, copied) -> {
             assertEquals(ATLAS, id);
@@ -37,7 +40,7 @@ class AtlasAnimationPublicationTest {
         assertNull(publication.flush(stage));
         assertEquals(0, calls.get());
         assertThrows(IllegalArgumentException.class, () -> publication.textureAccepted(12,
-            new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, new byte[]{2})));
+            new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, new byte[]{2}, List.of())));
         publication.textureAccepted(12, texture);
         assertThrows(IllegalStateException.class, () -> publication.flush(stage));
         assertTrue(publication.pending());
@@ -51,8 +54,8 @@ class AtlasAnimationPublicationTest {
 
     @Test
     void queuedEventsRemainEpochBoundAcrossDuplicateReceiptsFailuresAndReplacement() {
-        var texture = new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, new byte[]{1});
-        var resource = new AtlasAnimationResource(source());
+        var texture = new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, new byte[]{1}, List.of());
+        var resource = resource(source());
         var publication = new AtlasAnimationPublication(texture, resource);
         var atlas = net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS;
         var sprite = source().sprites().getFirst().name();
@@ -92,7 +95,7 @@ class AtlasAnimationPublicationTest {
             fail("old events cannot enter a replaced native image");
             return true;
         }));
-        var replacement = new AtlasAnimationPublication(texture, source());
+        var replacement = new AtlasAnimationPublication(texture, resource(source()));
         replacement.enqueueTick(1, false);
         replacement.textureAccepted(13, texture);
         assertThrows(IllegalStateException.class, () -> replacement.flush((id, gen, tick, data) -> {
@@ -115,8 +118,8 @@ class AtlasAnimationPublicationTest {
         var png = new java.io.ByteArrayOutputStream();
         assertTrue(javax.imageio.ImageIO.write(new java.awt.image.BufferedImage(2, 1,
             java.awt.image.BufferedImage.TYPE_INT_ARGB), "PNG", png));
-        var texture = new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, png.toByteArray());
-        var resource = new AtlasAnimationResource(source());
+        var texture = new VulkanicGalBridge.WorldMeshTextureAssetRecord(ATLAS, png.toByteArray(), List.of());
+        var resource = resource(source());
         resource.recordUse(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS,
             source().sprites().getFirst().name());
         resource.enqueueNextTick(true);
@@ -144,7 +147,7 @@ class AtlasAnimationPublicationTest {
             publication.enqueueTick(154, true);
             long beforeReplacement = bridge.tickAtlasAnimation(ATLAS, 1, 153, new int[0], false).status().submissionId();
             bridge.updateWorldMeshAssets(2, List.of(), List.of(texture), List.of());
-            var replacementPublication = new AtlasAnimationPublication(texture, source());
+            var replacementPublication = new AtlasAnimationPublication(texture, resource(source()));
             replacementPublication.enqueueTick(1, false);
             replacementPublication.textureAccepted(2, texture);
             assertNotNull(replacementPublication.flush(bridge::stageAtlasAnimationAssets));

@@ -62,7 +62,11 @@ public class SoundEngineExecutor extends BlockableEventLoop<Runnable> {
 	public void shutDown() {
 		this.shutdown = true;
 		this.dropAllTasks();
-		this.thread.interrupt();
+		// Wake an idle worker without interrupting an active resource read.
+		// Interrupting ZIP-backed audio I/O can close the archive channel used
+		// by unrelated texture/model readers. The shutdown flag ends the loop
+		// after the active task; join still waits before audio teardown.
+		LockSupport.unpark(this.thread);
 
 		try {
 			this.thread.join();

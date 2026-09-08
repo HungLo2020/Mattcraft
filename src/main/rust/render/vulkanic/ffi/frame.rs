@@ -292,6 +292,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_frame_cancel(
             context
                 .gal
                 .cancel_frame(crate::render::vulkanic::frame::FrameId(request.frame_id))?;
+            context.gui_frontend.discard_prepared_post_effects(&mut context.gal);
             // The swapchain recreation waits for device quiescence, so all
             // cached frame-target wrappers are now safe to retire as well.
             destroy_all_frame_targets(context)
@@ -328,7 +329,11 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_frame_shutdown(
         context.ffi_output_bytes = context
             .ffi_output_bytes
             .saturating_add(size_of::<FfiStatusResult>() as u64);
-        context.gui_frontend.reset(&mut context.gal);
+        if let Err(error) = context.gui_frontend.reset(&mut context.gal) {
+            set_last_error(context, &error);
+            write_status_out(status_out, status_error(Some(context), &error));
+            return error.code as i32;
+        }
         context.world_primitive_frontend.reset(&mut context.gal);
         if let Err(error) = destroy_all_frame_targets(context) {
             set_last_error(context, &error);

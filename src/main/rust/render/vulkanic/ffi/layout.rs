@@ -537,7 +537,11 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 clip_left,
                 clip_top,
                 clip_width,
-                clip_height
+                clip_height,
+                material_mode,
+                item_raster_scale,
+                item_raster_corners,
+                item_raster_layers
             ]
         ),
         96 => layout!(
@@ -575,7 +579,12 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 clip_width,
                 clip_height,
                 vertices,
-                indices
+                indices,
+                item_foil_mode,
+                item_foil_clock_millis,
+                item_foil_speed,
+                item_foil_strength,
+                item_raster_scale
             ]
         ),
         91 => layout!(
@@ -725,7 +734,14 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 post_effect_id,
                 gui_projection_width,
                 gui_projection_height,
-                gui_tiled_quads
+                gui_tiled_quads,
+                engine_globals_present,
+                engine_screen_width,
+                engine_screen_height,
+                engine_game_ticks,
+                engine_partial_tick,
+                engine_glint_alpha,
+                engine_menu_blur_radius
             ]
         ),
         89 => layout!(
@@ -1065,7 +1081,10 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 interpolation_policy,
                 reserved0,
                 animation_frames,
-                mip_png_bytes
+                mip_png_bytes,
+                sampling_filter,
+                sampling_address,
+                requested_mip_levels
             ]
         ),
         71 => layout!(
@@ -1106,7 +1125,14 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 transform,
                 outline_color_argb,
                 flags,
-                block_entity_id
+                block_entity_id,
+                terrain_placement_mode,
+                terrain_origin,
+                terrain_camera,
+                item_foil_mode,
+                item_foil_clock_millis,
+                item_foil_speed,
+                item_foil_strength
             ]
         ),
         70 => layout!(
@@ -1396,6 +1422,13 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
              interpolate, reserved0, frames, mips]),
         104 => layout!(104, FfiAtlasAnimationAssetUpdate,
             [header, texture_id, reserved0, generation, initial_tick, sprites]),
+        105 => layout!(105, FfiGuiAtlasReference,
+            [byte_size, texture_id, asset_id, atlas_generation, atlas_width, atlas_height,
+             x, y, width, height]),
+        106 => layout!(106, FfiGuiAtlasReferenceUpdate,
+            [header, revision, references, negotiated_feature_bits]),
+        107 => layout!(107, FfiGuiItemRasterLayer,
+            [byte_size, material_mode, asset_id, color_argb, corners, uv, model_transform]),
         _ => {
             return Err(GalError::ffi(
                 StatusCode::UnknownEnum,

@@ -27,11 +27,54 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class VulkanicGalBridgeAbiTest {
+	@Test
+	void itemRasterPreservesBoundedAuthoredUvSubrectangles() {
+		var quad = new VulkanicGalBridge.GuiAffineQuadRecord(1,7L,
+			0,0,16,0,0,16,0,0.25F,0,0.75F,0.5F,-1,100,100)
+			.withMaterialMode(1).withItemRasterScale(2).withSequence(3).withClip(0,0,20,20);
+		assertEquals(0.25F,quad.u0());
+		assertEquals(0.75F,quad.u1());
+		assertEquals(0.5F,quad.v1());
+		for (float u0 : new float[] {-0.001F,0.75F,Float.NaN}) {
+			assertThrows(IllegalArgumentException.class, () -> new VulkanicGalBridge.GuiAffineQuadRecord(1,7L,
+				0,0,16,0,0,16,0,u0,0,0.75F,0.5F,-1,100,100).withMaterialMode(1).withItemRasterScale(2));
+		}
+	}
+	@Test
+	void affineMaterialSurvivesSchedulingAndClipping() {
+		var unlit = new VulkanicGalBridge.GuiAffineQuadRecord(1, 7L,
+			0, 0, 16, 0, 0, 16, 0, 0, 0, 1, 1, -1, 100, 100);
+		assertEquals(0, unlit.materialMode());
+		var geometry = new VulkanicGalBridge.GuiItemRasterGeometryRecord(4,2,12,2,4,14);
+		var item = unlit.withMaterialMode(1).withItemRasterScale(3).withItemRasterGeometry(geometry)
+			.withSequence(4).withStratum(10).withClip(0, 0, 20, 20);
+		assertEquals(geometry, item.itemRasterGeometry());
+		assertEquals(geometry, item.withMaterialMode(2).withItemRasterScale(2).itemRasterGeometry());
+		assertThrows(IllegalArgumentException.class, () -> unlit.withItemRasterGeometry(geometry));
+		float[] copied = geometry.corners();
+		copied[0] = 0;
+		assertEquals(4, geometry.x0());
+		assertThrows(IllegalArgumentException.class,
+			() -> new VulkanicGalBridge.GuiItemRasterGeometryRecord(0,0,16,4,4,16));
+		assertEquals(3, item.itemRasterScale());
+		assertThrows(IllegalArgumentException.class, () -> unlit.withItemRasterScale(3));
+		assertThrows(IllegalArgumentException.class, () -> item.withItemRasterScale(257));
+		assertEquals(1, item.materialMode());
+		assertEquals(4, item.sequence());
+		assertEquals(10, item.stratum());
+		assertEquals(20, item.clipWidth());
+		assertEquals(2, item.withMaterialMode(2).withSequence(9).materialMode());
+		assertThrows(IllegalArgumentException.class, () -> unlit.withMaterialMode(3));
+	}
+
 	private static String readRustFfiModules() throws Exception {
 		Path root = Path.of("src/main/rust/render/vulkanic/ffi");
 		StringBuilder source = new StringBuilder();
@@ -59,11 +102,13 @@ class VulkanicGalBridgeAbiTest {
 	}
 
 	@Test
-	void wholeFrameGuiPostEffectsAreEnqueuedExactlyOnce() throws Exception {
+	void copiedEffectsUseSemanticIdentityWithoutLegacyEffectMarkers() throws Exception {
 		String gameRenderer = Files.readString(Path.of("src/main/java/net/minecraft/client/renderer/GameRenderer.java"));
-		assertEquals(1, occurrences(gameRenderer, "RustGalGuiRenderer.enqueuePostEffectInvert"));
-		assertEquals(1, occurrences(gameRenderer, "RustGalGuiRenderer.enqueuePostEffectCreeper"));
-		assertEquals(1, occurrences(gameRenderer, "RustGalGuiRenderer.enqueuePostEffectSpider"));
+		assertEquals(0, occurrences(gameRenderer, "RustGalGuiRenderer.enqueuePostEffectInvert"),
+			"the inverse resource graph must not be replaced by a GUI marker");
+		assertTrue(gameRenderer.contains("this.postEffectId.toString()"));
+		assertEquals(0, occurrences(gameRenderer, "RustGalGuiRenderer.enqueuePostEffectCreeper"));
+		assertEquals(0, occurrences(gameRenderer, "RustGalGuiRenderer.enqueuePostEffectSpider"));
 		assertTrue(gameRenderer.contains("&& !net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled()"),
 			"Java PostChain processing must be disabled while Rust owns whole-frame Vulkan presentation");
 		String guiRenderer = Files.readString(Path.of("src/main/java/net/vulkanic/gui/RustGalGuiRenderer.java"));
@@ -807,6 +852,12 @@ class VulkanicGalBridgeAbiTest {
 		String frameFfi = readRustFfiModules();
 		assertTrue(frameFfi.contains("mattmc_vulkanic_gal_frame_cancel"),
 			"the native frame cancellation ABI must be present");
+		String frameSource = Files.readString(Path.of("src/main/rust/render/vulkanic/ffi/frame.rs"));
+		String cancel = frameSource.substring(frameSource.indexOf("fn mattmc_vulkanic_gal_frame_cancel("),
+			frameSource.indexOf("fn mattmc_vulkanic_gal_frame_shutdown("));
+		int discard = cancel.indexOf("discard_prepared_post_effects(&mut context.gal)");
+		assertTrue(discard >= 0 && discard < cancel.indexOf("destroy_all_frame_targets(context)"),
+			"cancelled post-effect uploads and image states must be discarded before target retirement");
 	}
 
 	private static int occurrences(String source, String needle) {
@@ -1361,8 +1412,8 @@ class VulkanicGalBridgeAbiTest {
 		assertTrue(worldRenderer.contains("readModelTexturePayload(textureIdentity)"));
 		assertTrue(worldRenderer.contains("getResourceStack(textureLocation)"),
 			"semantic model textures must resolve through the complete resource-pack stack");
-		assertFalse(worldRenderer.contains("resources.reversed()"),
-			"resource-pack precedence must preserve the resource manager's highest-priority-first stack order");
+		assertTrue(worldRenderer.contains("resources.reversed()"),
+			"getResourceStack is lowest-priority-first; semantic texture selection must start at the end");
 		assertTrue(worldRenderer.contains("path.startsWith(\"textures/\") && path.endsWith(\".png\")"));
 		assertTrue(worldRenderer.contains("neither the RenderType nor its backing GPU"));
 		assertTrue(worldRenderer.contains("modelMeshRenderSemantics(renderType)"));
@@ -4051,7 +4102,7 @@ class VulkanicGalBridgeAbiTest {
 		String experienceBar = Files.readString(Path.of("src/main/java/net/minecraft/client/gui/contextualbar/ExperienceBarRenderer.java"));
 		String bossOverlay = Files.readString(Path.of("src/main/java/net/minecraft/client/gui/components/BossHealthOverlay.java"));
 
-		assertEquals(30, VulkanicGalBridge.ABI_VERSION);
+		assertEquals(42, VulkanicGalBridge.ABI_VERSION);
 		assertTrue(bridge.contains("GUI_TILED_QUAD_REQUEST(101)"));
 		assertTrue(bridge.contains("Struct.WHOLE_FRAME_SUBMIT.setFloat(request, 34, guiProjection.width())"));
 		assertTrue(bridge.contains("Struct.GUI_FRAME_SUBMIT.setFloat(request, 10, guiProjection.width())"));
@@ -9079,6 +9130,70 @@ class VulkanicGalBridgeAbiTest {
 		}
 		assertEquals(-1, VulkanicGalBridge.activeSemanticBlockEntityId());
 		assertThrows(IllegalStateException.class, VulkanicGalBridge::endSemanticBlockEntity);
+	}
+
+	@Test
+	void terrainPlacementRetainsDoublePrecisionAndRejectsAmbiguousOwnership() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		var placement = new VulkanicGalBridge.TerrainSectionPlacement(112, 80, 528, 150.5, 101.62, 530.5);
+		assertEquals(101.62, placement.cameraY());
+		assertNotEquals((double)(float)101.62, placement.cameraY());
+		var original = new VulkanicGalBridge.WorldMeshInstanceRecord(
+			60, 41L, 2L, -1, 0, 0, 0, 0xffffffff, new float[16], 640, 480, 0, 0, 0, 0, -1);
+		var semantic = original.withTerrainPlacement(placement);
+		assertEquals(placement, semantic.terrainPlacement());
+		assertNull(original.terrainPlacement());
+		assertArrayEquals(new float[] {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1}, semantic.transform());
+		float[] detached = semantic.transform();
+		detached[12] = 99;
+		assertEquals(0, semantic.transform()[12]);
+		var frame = new RustGalWorldPrimitiveRenderer.PrimitiveFrame(640, 480,
+			semantic.transform(), semantic.transform(), new VulkanicGalBridge.WorldBackgroundRecord(false, 0, 0, 0, 0, 640, 480),
+			List.of(), List.of(), List.of(), List.of(), List.of(semantic));
+		var resized = RustGalWorldPrimitiveRenderer.withViewport(frame, 1280, 720);
+		assertEquals(placement, resized.meshInstances().getFirst().terrainPlacement());
+		assertEquals(1280, resized.meshInstances().getFirst().viewportWidth());
+		assertArrayEquals(semantic.transform(), resized.meshInstances().getFirst().transform());
+		assertThrows(IllegalArgumentException.class, () -> new VulkanicGalBridge.TerrainSectionPlacement(1, 0, 0, 0, 0, 0));
+		assertThrows(IllegalArgumentException.class, () -> new VulkanicGalBridge.TerrainSectionPlacement(0, 0, 0, Double.NaN, 0, 0));
+		assertThrows(IllegalArgumentException.class, () -> new VulkanicGalBridge.WorldMeshInstanceRecord(
+			60, 41L, 2L, -1, 0, 0, 0, 0xffffffff, detached, 640, 480, 0, 0, 0, 0, -1, placement));
+		assertThrows(IllegalArgumentException.class, () -> new VulkanicGalBridge.WorldMeshInstanceRecord(
+			67, 41L, 2L, -1, 0, 0, 0, 0xffffffff, semantic.transform(), 640, 480, 0, 0, 0, 0, -1, placement));
+	}
+
+	@Test
+	void viewportResizePreservesWorldAndFirstPersonFoilSemantics() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		float[] transform = new org.joml.Matrix4f().translation(0.3f, -0.2f, 0.7f).get(new float[16]);
+		var plain = new VulkanicGalBridge.WorldMeshInstanceRecord(
+			67, 41L, 2L, -1, 0, 0, 0, 0xffffffff, transform, 640, 480);
+		var foil = plain.withItemFoil(new VulkanicGalBridge.StandardItemFoilRecord(12345L, 0.25, 0.5f));
+		var frame = new RustGalWorldPrimitiveRenderer.PrimitiveFrame(640, 480, transform, transform,
+			new VulkanicGalBridge.WorldBackgroundRecord(false, 0, 0, 0, 0, 640, 480),
+			List.of(), List.of(), List.of(), List.of(), List.of(), List.of(plain, foil), List.of(),
+			VulkanicGalBridge.WorldVoxelVolumeFrameRecord.disabled(),
+			VulkanicGalBridge.WorldShaderEnvironmentFrameRecord.disabled(),
+			VulkanicGalBridge.WorldFeatureCoverageRecord.empty(), List.of(),
+			VulkanicGalBridge.WorldLodRenderFrameRecord.disabled(), 0,
+			VulkanicGalBridge.WorldFirstPersonFrameRecord.disabled(), List.of(plain, foil));
+		assertSame(frame, RustGalWorldPrimitiveRenderer.withViewport(frame, 640, 480));
+		var resized = RustGalWorldPrimitiveRenderer.withViewport(frame, 1280, 720);
+		for (var instances : List.of(resized.meshInstances(), resized.firstPersonMeshInstances())) {
+			assertNull(instances.getFirst().itemFoil());
+			assertEquals(foil.itemFoil(), instances.get(1).itemFoil());
+			for (var instance : instances) {
+				assertEquals(1280, instance.viewportWidth());
+				assertEquals(720, instance.viewportHeight());
+				assertArrayEquals(transform, instance.transform());
+				assertEquals(plain.meshKey(), instance.meshKey());
+				assertEquals(plain.meshGeneration(), instance.meshGeneration());
+			}
+		}
+		assertEquals(640, frame.firstPersonMeshInstances().get(1).viewportWidth());
+		assertEquals(foil.itemFoil(), frame.firstPersonMeshInstances().get(1).itemFoil());
 	}
 
 	@Test

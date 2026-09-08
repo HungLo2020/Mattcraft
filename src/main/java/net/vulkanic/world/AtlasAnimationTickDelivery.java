@@ -14,6 +14,9 @@ final class AtlasAnimationTickDelivery {
     // Retain at most one immutable, already-allocated semantic event for
     // capture observation (visibility is bounded to 16384 IDs / 64 KiB).
     private Event lastQueuedEvent;
+    // One additional bounded immutable event, diagnostics only. Empty catch-up
+    // ticks must not erase evidence of the real use which preceded them.
+    private Event lastNonemptyQueuedEvent;
 
     private record Event(long tick, int[] visible, boolean onlyVisible) {}
 
@@ -41,6 +44,7 @@ final class AtlasAnimationTickDelivery {
         pendingBytes += bytes;
         lastQueuedTick = tick;
         lastQueuedEvent = event;
+        if (event.visible.length > 0) lastNonemptyQueuedEvent = event;
         visibility.clearUses();
     }
 
@@ -71,5 +75,11 @@ final class AtlasAnimationTickDelivery {
         pending.clear();
         pendingBytes = 0;
         lastQueuedEvent = null;
+        lastNonemptyQueuedEvent = null;
+    }
+    long lastNonemptyTickNamingSpriteForDiagnostics(int spriteId) {
+        return lastNonemptyQueuedEvent != null
+            && java.util.Arrays.binarySearch(lastNonemptyQueuedEvent.visible, spriteId) >= 0
+            ? lastNonemptyQueuedEvent.tick : -1;
     }
 }

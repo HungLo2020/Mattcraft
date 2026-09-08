@@ -310,6 +310,7 @@ mod analyzer;
 mod bsp;
 mod ffi;
 mod geometry;
+pub(crate) mod semantic;
 mod sort;
 mod topology;
 

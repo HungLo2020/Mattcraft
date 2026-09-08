@@ -480,7 +480,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_destroy(
     out: *mut FfiStatusResult,
 ) -> i32 {
     with_registry_mut(|registry| {
-        let Some(mut context) = registry.contexts.remove(&context_id) else {
+        let Some(context) = registry.contexts.get_mut(&context_id) else {
             let error = GalError::ffi(
                 StatusCode::StaleHandle,
                 format!("unknown context id {context_id}"),
@@ -488,11 +488,18 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_destroy(
             write_status_out(out, status_result_from_error(&error));
             return error.code as i32;
         };
+        if let Err(error) = context.gui_frontend.reset(&mut context.gal) {
+            // Keep ownership and presenter reservation intact on dependency
+            // failure, so the caller can release the dependent and retry.
+            set_last_error(context, &error);
+            write_status_out(out, status_error(Some(context), &error));
+            return error.code as i32;
+        }
+        let mut context = registry.contexts.remove(&context_id).expect("context was checked above");
         if context.windowed_presenter {
             release_windowed_presenter(registry);
         }
         release_context_slot();
-        context.gui_frontend.reset(&mut context.gal);
         context.world_primitive_frontend.reset(&mut context.gal);
         let mut status = status_ok(&context);
         status.metrics.ffi_calls = status.metrics.ffi_calls.saturating_add(1);

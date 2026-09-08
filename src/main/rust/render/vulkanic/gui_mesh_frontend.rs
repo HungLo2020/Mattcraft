@@ -15,6 +15,8 @@ use super::commands::{
 };
 use super::error::{GalError, GalResult, StatusCode};
 use super::gal::VulkanicGal;
+pub use super::item_foil::StandardItemFoil as GuiItemFoil;
+pub use super::gui_item_material::GuiFlatItemLighting;
 use super::gui_frontend::GUI_MAX_VIEWPORT_AXIS;
 use super::handles::Handle;
 use super::resources::{
@@ -411,6 +413,9 @@ pub enum GuiMeshMaterialMode {
 pub enum GuiMeshLightingMode {
     Flat,
     Block,
+    /// Ordinary inventory models, with normals in the Y-down GUI space.
+    /// Distinct from upright picture-in-picture model lighting.
+    InventoryBlock,
 }
 
 /// One copied model vertex. `normal_packed` is a Java-resolved normal in the
@@ -429,6 +434,13 @@ pub struct GuiMeshVertex {
 /// refers to a Rust-owned raw image asset, never a Minecraft atlas object.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GuiMeshBatchRequest {
+    /// Zero for explicit meshes; positive for a native 16-unit flat item cell.
+    pub item_raster_scale: u32,
+    /// Resolved solely from the Rust-owned frame lightmap, never transported.
+    pub item_lighting: Option<GuiFlatItemLighting>,
+    /// When present, vertices contain original atlas UVs and Rust prepares
+    /// standard item foil. Absent for ordinary or explicitly prepared meshes.
+    pub item_foil: Option<GuiItemFoil>,
     pub stratum: u32,
     /// Ordering within one item PIP raster. Every layer of a GUI item shares
     /// its scheduler sequence and composes only after the final layer.
@@ -1174,6 +1186,20 @@ fn model_transform_determinant(matrix: [f32; 16]) -> GalResult<f32> {
     Ok(determinant)
 }
 
+/// Flat semantic meshes carry original model-space normals. Resolve the
+/// inverse transpose in Rust, including the native GUI Y reflection.
+/// Explicit/PIP meshes already carry resolved normals and do not use this.
+fn transform_flat_item_normal(matrix: [f32; 16], normal: [f32; 3]) -> GalResult<[f32; 3]> {
+    let determinant = model_transform_determinant(matrix)?;
+    let a = [matrix[0], matrix[1], matrix[2]];
+    let b = [matrix[4], matrix[5], matrix[6]];
+    let c = [matrix[8], matrix[9], matrix[10]];
+    let cofactors = [cross(b, c), cross(c, a), cross(a, b)];
+    normalize(std::array::from_fn(|axis|
+        (cofactors[0][axis] * normal[0] + cofactors[1][axis] * normal[1]
+            + cofactors[2][axis] * normal[2]) / determinant))
+}
+
 fn first_triangle_indices(indices: &[u32], vertex_count: usize) -> GalResult<[usize; 3]> {
     let [first, second, third, ..] = indices else {
         return Err(GalError::ffi(
@@ -1389,6 +1415,50 @@ impl GuiMeshCompositeResources {
                 "GUI mesh composite source extent does not match its prepared draw",
             ));
         }
+        self.append_composite_uniforms(source.color, TextureUsageState::ColorAttachment,
+            destination_pass, destination_target, destination_color_view, destination_depth_view,
+            composite_uniform_bytes(draw), uniform_offset, operations)
+    }
+
+    /// Compose a Rust-owned item raster cell. Screen-space geometry remains
+    /// distinct from item-local raster geometry, and the caller supplies the
+    /// source's explicit usage instead of inferring an implicit framebuffer.
+    pub(crate) fn append_item_raster_composite(
+        &self, source_color: Handle, source_usage: TextureUsageState,
+        placement: super::gui_item_raster::GuiItemRasterPlacement,
+        destination_pass: Handle, destination_target: Handle,
+        destination_color_view: Handle, destination_depth_view: Option<Handle>,
+        screen: &super::gui_frontend::GuiAffineQuadRequest,
+        pre_present_y_flip: bool, uniform_offset: u64, operations: &mut Vec<CommandOp>,
+    ) -> GalResult<()> {
+        placement.validate()?;
+        let [u0,v0,u1,v1] = placement.composite_uv();
+        let mut clip = if screen.clip_mode == 1 {
+            [screen.clip_left as f32, screen.clip_top as f32,
+             (screen.clip_left as f32 + screen.clip_width as f32),
+             (screen.clip_top as f32 + screen.clip_height as f32)]
+        } else { [0.0,0.0,screen.projection_extent[0],screen.projection_extent[1]] };
+        let (origin_y,axis_u_y,axis_v_y) = if pre_present_y_flip {
+            clip = [clip[0],screen.projection_extent[1]-clip[3],clip[2],screen.projection_extent[1]-clip[1]];
+            (screen.projection_extent[1]-screen.y0,screen.y0-screen.y1,screen.y0-screen.y3)
+        } else {(screen.y0,screen.y1-screen.y0,screen.y3-screen.y0)};
+        let values = [screen.x1-screen.x0, axis_u_y,
+            screen.x3-screen.x0, axis_v_y,
+            screen.x0,origin_y,screen.projection_extent[0],screen.projection_extent[1],
+            0.0,0.0,1.0,1.0,u0,v0,u1-u0,v1-v0,clip[0],clip[1],clip[2],clip[3]];
+        if values.iter().any(|v| !v.is_finite()) || screen.projection_extent.iter().any(|v| *v <= 0.0)
+            || screen.clip_mode > 1 || screen.z != 0.0 {
+            return Err(GalError::invalid_argument("invalid or unsupported item raster composition"));
+        }
+        self.append_composite_uniforms(source_color, source_usage, destination_pass,
+            destination_target, destination_color_view, destination_depth_view,
+            values.into_iter().flat_map(f32::to_le_bytes).collect(), uniform_offset, operations)
+    }
+
+    fn append_composite_uniforms(&self, source_color: Handle, source_usage: TextureUsageState,
+        destination_pass: Handle, destination_target: Handle, destination_color_view: Handle,
+        destination_depth_view: Option<Handle>, uniforms: Vec<u8>, uniform_offset: u64,
+        operations: &mut Vec<CommandOp>) -> GalResult<()> {
         if uniform_offset % GUI_MESH_COMPOSITE_UNIFORM_STRIDE != 0
             || uniform_offset
                 .checked_add(GUI_MESH_COMPOSITE_UNIFORM_BYTES as u64)
@@ -1407,21 +1477,23 @@ impl GuiMeshCompositeResources {
         operations.push(CommandOp::HostWriteBuffer {
             buffer: self.uniform_buffer,
             offset: uniform_offset,
-            data: composite_uniform_bytes(draw),
+            data: uniforms,
         });
         operations.push(CommandOp::Barrier(buffer_barrier(
             self.uniform_buffer,
             TextureUsageState::TransferDst,
             TextureUsageState::ShaderRead,
         )));
-        operations.push(CommandOp::Barrier(ResourceBarrier {
-            resource: source.color,
-            subresources: None,
-            before: TextureUsageState::ColorAttachment,
-            after: TextureUsageState::ShaderRead,
-            src_queue: QueueClass::Graphics,
-            dst_queue: QueueClass::Graphics,
-        }));
+        if source_usage != TextureUsageState::ShaderRead {
+            operations.push(CommandOp::Barrier(ResourceBarrier {
+                resource: source_color,
+                subresources: None,
+                before: source_usage,
+                after: TextureUsageState::ShaderRead,
+                src_queue: QueueClass::Graphics,
+                dst_queue: QueueClass::Graphics,
+            }));
+        }
         operations.push(CommandOp::BeginPass {
             pass: destination_pass,
             target: destination_target,
@@ -1547,19 +1619,22 @@ fn frame_uniform_bytes(
     lighting_mode: GuiMeshLightingMode,
 ) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(GUI_MESH_FRAME_UNIFORM_BYTES);
-    let enabled = matches!(lighting_mode, GuiMeshLightingMode::Block) as u8 as f32;
+    let enabled = matches!(lighting_mode, GuiMeshLightingMode::Block | GuiMeshLightingMode::InventoryBlock) as u8 as f32;
     for value in [extent[0] as f32, extent[1] as f32, alpha_cutoff, enabled] {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    // Matches Lighting.Entry.ITEMS_3D_UPRIGHT. These are semantic light
-    // directions, not a borrowed Java UBO or backend resource.
+    // Frozen OpenGL GuiRenderer.renderItemToAtlas uses ITEMS_3D with
+    // scale(k, -k, k) normals. ITEMS_3D_UPRIGHT belongs to the separate
+    // PIP convention, not ordinary inventory icons. Keep the light-space
+    // selection explicit; never infer it from a backend or borrowed UBO.
+    let light_y_sign = if lighting_mode == GuiMeshLightingMode::InventoryBlock { -1.0 } else { 1.0 };
     for value in [
         -0.933_439_2_f32,
-        0.262_694_72,
+        0.262_694_72 * light_y_sign,
         -0.244_300_16,
         0.0,
         -0.103_571_37,
-        0.976_606_8,
+        0.976_606_8 * light_y_sign,
         0.188_446_42,
         0.0,
     ] {
@@ -1868,7 +1943,59 @@ pub fn validate_batches(batches: &[GuiMeshBatchRequest]) -> GalResult<()> {
     Ok(())
 }
 
+impl GuiMeshBatchRequest {
+    fn requires_item_lightmap(&self) -> bool {
+        (self.item_raster_scale != 0 || self.lighting_mode == GuiMeshLightingMode::InventoryBlock)
+            && self.material_mode != GuiMeshMaterialMode::Glint
+    }
+
+    pub fn resolve_item_lighting(&mut self, frame: Option<super::shader_pack::lightmap::VanillaLightmapFrame>) -> GalResult<()> {
+        if self.requires_item_lightmap() {
+            self.item_lighting = Some(GuiFlatItemLighting::prepare(frame.ok_or_else(||
+                GalError::invalid_argument("GUI item mesh requires explicit frame lightmap inputs"))?)?);
+        }
+        Ok(())
+    }
+}
+
+/// Frozen's flat atlas cell uses translate(k/2,k/2,0), scale(k,-k,k).
+/// Resolve that layout here, without a caller-provided PIP target or guard band.
+fn resolved_item_raster(batch: &GuiMeshBatchRequest) -> GalResult<([u32; 2], [f32; 16])> {
+    if batch.item_raster_scale == 0 {
+        if batch.item_lighting.is_some() && !batch.requires_item_lightmap() {
+            return Err(GalError::invalid_argument("explicit mesh cannot carry flat item lighting"));
+        }
+        return Ok((batch.render_extent, batch.model_transform));
+    }
+    if batch.render_extent != [0, 0] || batch.guard_pixels != 0
+        || batch.lighting_mode != GuiMeshLightingMode::Flat
+        || batch.material_mode == GuiMeshMaterialMode::Panorama
+        || (batch.material_mode == GuiMeshMaterialMode::Glint && batch.item_foil.is_none()) {
+        return Err(GalError::invalid_argument("flat item mesh has conflicting raster/material semantics"));
+    }
+    let side = batch.item_raster_scale.checked_mul(16)
+        .filter(|side| *side <= GUI_MESH_MAX_OFFSCREEN_AXIS)
+        .ok_or_else(|| GalError::unsupported_feature("flat item raster scale exceeds bounded extent"))?;
+    super::gui_item_raster::GuiItemModelTransform(batch.model_transform).validate()?;
+    let mut matrix = batch.model_transform;
+    let k = side as f32;
+    for column in 0..4 {
+        let index = column * 4;
+        matrix[index] = k * batch.model_transform[index] + k * 0.5 * batch.model_transform[index + 3];
+        matrix[index + 1] = -k * batch.model_transform[index + 1] + k * 0.5 * batch.model_transform[index + 3];
+        matrix[index + 2] = k * batch.model_transform[index + 2];
+    }
+    Ok(([side, side], matrix))
+}
+
 pub fn validate_batch(batch: &GuiMeshBatchRequest) -> GalResult<()> {
+    let render_extent = resolved_item_raster(batch)?.0;
+    if let Some(foil) = batch.item_foil {
+        foil.validate()?;
+        if batch.material_mode != GuiMeshMaterialMode::Glint {
+            return Err(GalError::invalid_argument("item foil requires the glint material"));
+        }
+    }
     if batch.stratum == 0 {
         return Err(GalError::ffi(
             StatusCode::InvalidArgument,
@@ -1895,15 +2022,15 @@ pub fn validate_batch(batch: &GuiMeshBatchRequest) -> GalResult<()> {
             batch.gui_extent[0], batch.gui_extent[1], GUI_MAX_VIEWPORT_AXIS
         )));
     }
-    if batch.render_extent[0] == 0 || batch.render_extent[1] == 0 {
+    if render_extent[0] == 0 || render_extent[1] == 0 {
         return Err(GalError::ffi(
             StatusCode::InvalidArgument,
             "GUI mesh batch requires a positive offscreen raster extent",
         ));
     }
     super::gui_frontend::validate_gui_projection(batch.gui_extent, batch.projection_extent)?;
-    if batch.render_extent[0] > GUI_MESH_MAX_OFFSCREEN_AXIS
-        || batch.render_extent[1] > GUI_MESH_MAX_OFFSCREEN_AXIS
+    if render_extent[0] > GUI_MESH_MAX_OFFSCREEN_AXIS
+        || render_extent[1] > GUI_MESH_MAX_OFFSCREEN_AXIS
     {
         return Err(GalError::unsupported_feature(format!(
             "GUI mesh offscreen extent {}x{} exceeds bounded axis {}",
@@ -1958,8 +2085,8 @@ pub fn validate_batch(batch: &GuiMeshBatchRequest) -> GalResult<()> {
             "GUI mesh transforms must be finite",
         ));
     }
-    if batch.guard_pixels.saturating_mul(2) >= batch.render_extent[0]
-        || batch.guard_pixels.saturating_mul(2) >= batch.render_extent[1]
+    if batch.guard_pixels.saturating_mul(2) >= render_extent[0]
+        || batch.guard_pixels.saturating_mul(2) >= render_extent[1]
     {
         return Err(GalError::ffi(
             StatusCode::InvalidArgument,
@@ -2012,30 +2139,62 @@ pub fn validate_batch(batch: &GuiMeshBatchRequest) -> GalResult<()> {
 
 /// Consumes the caller-independent request family into a compact render-plan
 /// family. Transforming at this boundary means later GUI mesh resource and
-/// command construction only sees Rust-owned data. `atlas_uv` remains in the
-/// source request for parity diagnostics; local UVs are the semantic contract
-/// for the Rust-owned image resource used by the eventual GUI mesh pass.
+/// command construction only sees Rust-owned data. Standard item foil consumes
+/// original `atlas_uv`; other meshes use the supplied local texture UVs.
 pub fn prepare_draws(batches: &[GuiMeshBatchRequest]) -> GalResult<Vec<GuiMeshPreparedDraw>> {
     validate_batches(batches)?;
     batches.iter().map(prepare_draw).collect()
 }
 
 fn prepare_draw(batch: &GuiMeshBatchRequest) -> GalResult<GuiMeshPreparedDraw> {
+    let (render_extent, model_transform) = resolved_item_raster(batch)?;
     let vertices = batch
         .vertices
         .iter()
         .map(|vertex| {
-            let position = transform_point(batch.model_transform, vertex.position)?;
-            let normal = normalize_semantic_normal(unpack_normal_i8(vertex.normal_packed))?;
+            let position = transform_point(model_transform, vertex.position)?;
+            let mut normal = normalize_semantic_normal(unpack_normal_i8(vertex.normal_packed))?;
+            if batch.item_raster_scale != 0 {
+                normal = transform_flat_item_normal(model_transform, normal)?;
+                if position[0] < 0.0 || position[1] < 0.0
+                    || position[0] > render_extent[0] as f32 || position[1] > render_extent[1] as f32 {
+                    return Err(GalError::unsupported_feature("flat item mesh exceeds admitted cell geometry"));
+                }
+            }
+            let mut color=argb_to_rgba(vertex.color_argb);
+            let local_uv = if let Some(foil) = batch.item_foil {
+                color = foil.color()?;
+                foil.texture_uv(vertex.atlas_uv)?
+            } else {
+                vertex.local_uv
+            };
+            if batch.item_foil.is_none() && batch.material_mode==GuiMeshMaterialMode::Glint {
+                // The copied item glint color's alpha encodes strength, not
+                // coverage. Frozen glint.fsh applies GlintAlpha to RGB after
+                // the texture alpha test, preserving the destination alpha.
+                let strength=color[3];
+                color=[color[0]*strength,color[1]*strength,color[2]*strength,1.0];
+            }
+            if batch.requires_item_lightmap() {
+                color = batch.item_lighting.ok_or_else(|| GalError::invalid_argument(
+                    "GUI item mesh requires resolved frame lightmap semantics"))?.modulate(color)?;
+            }
             Ok(GuiMeshPreparedVertex {
                 position,
-                local_uv: vertex.local_uv,
-                color: argb_to_rgba(vertex.color_argb),
+                local_uv,
+                color,
                 normal,
             })
         })
         .collect::<GalResult<Vec<_>>>()?;
-    let front_face = transformed_front_face(batch.model_transform, &vertices, &batch.indices)?;
+    if batch.item_raster_scale != 0 {
+        let first = vertices[0].normal;
+        if vertices.iter().any(|vertex| vertex.normal.iter().zip(first)
+            .any(|(actual, expected)| (actual - expected).abs() > 0.000001)) {
+            return Err(GalError::unsupported_feature("flat item face has inconsistent copied normals"));
+        }
+    }
+    let front_face = transformed_front_face(model_transform, &vertices, &batch.indices)?;
     Ok(GuiMeshPreparedDraw {
         stratum: batch.stratum,
         layer_index: batch.layer_index,
@@ -2049,7 +2208,7 @@ fn prepare_draw(batch: &GuiMeshBatchRequest) -> GalResult<GuiMeshPreparedDraw> {
         bounds: batch.bounds,
         gui_extent: batch.gui_extent,
         projection_extent: batch.projection_extent,
-        render_extent: batch.render_extent,
+        render_extent,
         guard_pixels: batch.guard_pixels,
         clip_mode: batch.clip_mode,
         clip_left: batch.clip_left,
@@ -2144,6 +2303,9 @@ mod tests {
 
     fn batch() -> GuiMeshBatchRequest {
         GuiMeshBatchRequest {
+            item_raster_scale: 0,
+            item_lighting: None,
+            item_foil: None,
             stratum: 420,
             layer_index: 0,
             sequence: 1,
@@ -2282,6 +2444,34 @@ mod tests {
         assert_eq!(&values[..4], &[34.0, 18.0, 0.5, 1.0]);
         assert_eq!(values.len(), 12);
         assert_eq!(&values[4..7], &[-0.933_439_2, 0.262_694_72, -0.244_300_16]);
+    }
+
+    #[test]
+    fn inventory_block_lights_match_frozen_opengl_top_face_space() {
+        let uniforms = |mode| frame_uniform_bytes([34.0, 34.0], 0.1, mode)
+            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let inventory = uniforms(GuiMeshLightingMode::InventoryBlock);
+        let upright = uniforms(GuiMeshLightingMode::Block);
+        assert_eq!(inventory[3], 1.0);
+        assert_eq!(uniforms(GuiMeshLightingMode::Flat)[3], 0.0);
+        for i in [4, 6, 8, 10] { assert_eq!(inventory[i], upright[i]); }
+        for i in [5, 9] { assert_eq!(inventory[i], -upright[i]); }
+        // Independently evaluated with Frozen's JOML matrix sequence and
+        // block/block.json GUI rotation [30,225,0], scale .625. The ordinary
+        // OpenGL atlas pose scale(k,-k,k) makes the top normal point down in
+        // GUI coordinates. Do not compare against Frozen's Vulkan PIP path.
+        let shade = |u: &[f32], n: [f32; 3]| {
+            let a = dot([u[4],u[5],u[6]], n).max(0.0);
+            let b = dot([u[8],u[9],u[10]], n).max(0.0);
+            ((a+b)*0.6+0.4).min(1.0)
+        };
+        let top = [0.0, -0.8660254, 0.5];
+        assert!((shade(&inventory, top)-1.0).abs() < 1e-6);
+        assert!((shade(&upright, top)-0.4).abs() < 1e-6);
+        let side = [0.70710677,-0.35355338,-0.6123724];
+        assert!((shade(&inventory, side)-0.4939883).abs() < 1e-6);
+        assert!(shade(&inventory, top) > shade(&inventory, side));
     }
 
     #[test]
@@ -2562,6 +2752,223 @@ mod tests {
                 panorama, item,
                 "Panorama must select a distinct material program rather than the generic item shader"
             );
+        }
+    }
+
+    #[test]
+    fn flat_mesh_native_raster_matches_frozen_cell_pose_and_fullbright_lightmap() {
+        let mut request = flat_mesh();
+        assert!(prepare_draws(&[request.clone()]).is_err());
+        assert!(request.resolve_item_lighting(None).is_err());
+        request.resolve_item_lighting(Some(flat_lightmap())).unwrap();
+        for scale in [1, 2, 3, 4] {
+            request.item_raster_scale = scale;
+            let draw = prepare_draws(&[request.clone()]).unwrap().remove(0);
+            let side = (16 * scale) as f32;
+            assert_eq!(draw.render_extent, [16 * scale; 2]);
+            assert_eq!(draw.guard_pixels, 0);
+            assert_eq!(draw.vertices[0].position, [0.0, side, -side * 0.5]);
+            assert_eq!(draw.vertices[1].position, [side, side, -side * 0.5]);
+            for vertex in draw.vertices {
+                assert_eq!(vertex.color, [252.0 / 255.0, 252.0 / 255.0, 252.0 / 255.0, 1.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn inventory_block_mesh_requires_and_refreshes_explicit_lightmap() {
+        let mut request = batch();
+        request.lighting_mode = GuiMeshLightingMode::InventoryBlock;
+        assert!(prepare_draws(&[request.clone()]).is_err());
+        assert!(request.resolve_item_lighting(None).is_err());
+        request.vertices[0].color_argb = 0x8040ff20;
+        let mut frame = flat_lightmap();
+        request.resolve_item_lighting(Some(frame)).unwrap();
+        let original = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        assert_eq!(original.vertices[0].color,
+            [(64.0/255.0)*(252.0/255.0),252.0/255.0,(32.0/255.0)*(252.0/255.0),128.0/255.0]);
+        frame.generation += 1;
+        frame.inputs.darkness_scale = 4.0;
+        request.resolve_item_lighting(Some(frame)).unwrap();
+        let changed = prepare_draws(&[request]).unwrap().remove(0);
+        assert_ne!(geometry_fingerprint(&original), geometry_fingerprint(&changed));
+        assert_eq!(original.vertices[0].normal, changed.vertices[0].normal);
+    }
+
+    #[test]
+    fn flat_mesh_frame_lighting_refreshes_cached_geometry_and_preserves_tint_alpha() {
+        let mut request = flat_mesh();
+        request.vertices[0].color_argb = 0x8040ff20;
+        let mut frame = flat_lightmap();
+        request.resolve_item_lighting(Some(frame)).unwrap();
+        let original = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        assert_eq!(original.vertices[0].color[3], 128.0 / 255.0);
+        assert_eq!(original.vertices[0].color[0], (64.0 / 255.0) * (252.0 / 255.0));
+        frame.generation += 1;
+        frame.inputs.darkness_scale = 4.0;
+        request.resolve_item_lighting(Some(frame)).unwrap();
+        let changed = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        assert_ne!(geometry_fingerprint(&original), geometry_fingerprint(&changed));
+        assert_eq!(original.vertices[0].color[3], changed.vertices[0].color[3]);
+        assert_eq!(request.item_lighting.unwrap().lightmap_generation, frame.generation);
+    }
+
+    #[test]
+    fn flat_mesh_native_foil_uses_the_same_depth_without_lightmap_modulation() {
+        let mut base = flat_mesh();
+        base.resolve_item_lighting(Some(flat_lightmap())).unwrap();
+        let mut foil = base.clone();
+        foil.layer_index = 1;
+        foil.material_mode = GuiMeshMaterialMode::Glint;
+        foil.alpha_cutoff = 0.1;
+        foil.item_lighting = None;
+        foil.item_foil = Some(GuiItemFoil { clock_millis: 0, speed: 0.0, strength: 0.5 });
+        let draws = prepare_draws(&[base, foil]).unwrap();
+        for (base, foil) in draws[0].vertices.iter().zip(&draws[1].vertices) {
+            assert_eq!(base.position, foil.position);
+            assert_eq!(foil.color, [0.5, 0.5, 0.5, 1.0]);
+        }
+        assert_eq!(gui_mesh_raster_state(GuiMeshMaterialMode::Glint).2, Some(CompareOp::Equal));
+    }
+
+    #[test]
+    fn flat_mesh_rejects_conflicting_layout_unbounded_scale_and_unadmitted_geometry() {
+        let mut source = flat_mesh();
+        source.resolve_item_lighting(Some(flat_lightmap())).unwrap();
+        let mut invalid = source.clone(); invalid.render_extent = [32, 32];
+        assert!(prepare_draws(&[invalid]).is_err());
+        let mut invalid = source.clone(); invalid.guard_pixels = 1;
+        assert!(prepare_draws(&[invalid]).is_err());
+        let mut invalid = source.clone(); invalid.item_raster_scale = u32::MAX;
+        assert!(prepare_draws(&[invalid]).is_err());
+        let mut invalid = source.clone(); invalid.model_transform[12] += 0.25;
+        assert!(prepare_draws(&[invalid]).is_err());
+        let mut invalid = source.clone(); invalid.vertices[0].normal_packed = 0x00007f00;
+        assert!(prepare_draws(&[invalid]).is_err());
+        let mut invalid = source; invalid.lighting_mode = GuiMeshLightingMode::Block;
+        assert!(prepare_draws(&[invalid]).is_err());
+    }
+
+    fn flat_mesh() -> GuiMeshBatchRequest {
+        let mut request = batch();
+        request.item_raster_scale = 2;
+        request.render_extent = [0, 0];
+        request.guard_pixels = 0;
+        request.lighting_mode = GuiMeshLightingMode::Flat;
+        request.model_transform = super::super::gui_item_raster::GuiItemModelTransform::default().0;
+        request
+    }
+
+    #[test]
+    fn flat_item_normals_use_inverse_transpose_not_position_or_direction_transform() {
+        let matrix = [
+            0.0, -2.0, 0.0, 0.0,
+            -4.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 8.0, 0.0,
+            16.0, 16.0, 0.0, 1.0,
+        ];
+        assert_eq!(transform_flat_item_normal(matrix, [1.0,0.0,0.0]).unwrap(), [0.0,-1.0,0.0]);
+        assert_eq!(transform_flat_item_normal(matrix, [0.0,1.0,0.0]).unwrap(), [-1.0,0.0,0.0]);
+        assert_eq!(transform_flat_item_normal(matrix, [0.0,0.0,-1.0]).unwrap(), [0.0,0.0,-1.0]);
+        let actual = transform_flat_item_normal(matrix, [1.0,1.0,0.0]).unwrap();
+        let expected = normalize([-0.25,-0.5,0.0]).unwrap();
+        for axis in 0..3 { assert!((actual[axis]-expected[axis]).abs()<0.000001); }
+        let mut singular = matrix; singular[10] = 0.0;
+        assert!(transform_flat_item_normal(singular, [0.0,0.0,1.0]).is_err());
+    }
+
+    #[test]
+    fn flat_mesh_accepts_copied_back_and_edge_faces_without_discarding_geometry() {
+        let faces = [
+            ([[0.0,1.0,0.45],[1.0,1.0,0.45],[1.0,0.0,0.45],[0.0,0.0,0.45]], 0x00810000),
+            ([[1.0,1.0,0.55],[1.0,0.0,0.55],[1.0,0.0,0.45],[1.0,1.0,0.45]], 0x0000007f),
+            ([[0.0,1.0,0.45],[0.0,0.0,0.45],[0.0,0.0,0.55],[0.0,1.0,0.55]], 0x00000081),
+            ([[0.0,1.0,0.45],[0.0,1.0,0.55],[1.0,1.0,0.55],[1.0,1.0,0.45]], 0x00007f00),
+            ([[0.0,0.0,0.55],[0.0,0.0,0.45],[1.0,0.0,0.45],[1.0,0.0,0.55]], 0x00008100),
+        ];
+        for (positions, normal_packed) in faces {
+            let mut request = flat_mesh();
+            request.resolve_item_lighting(Some(flat_lightmap())).unwrap();
+            let template = request.vertices[0];
+            request.vertices = positions.into_iter().map(|position| GuiMeshVertex {
+                position, normal_packed, ..template
+            }).collect();
+            request.indices = vec![0,1,2,2,3,0];
+            let output = prepare_draws(&[request.clone()]).unwrap();
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].vertices.len(), 4);
+            assert_eq!(output[0].indices, request.indices);
+            assert_eq!(output[0].front_face, super::super::resources::FrontFace::CounterClockwise);
+        }
+    }
+
+    fn flat_lightmap() -> super::super::shader_pack::lightmap::VanillaLightmapFrame {
+        use super::super::shader_pack::lightmap::{VanillaLightmapFrame, VanillaLightmapInputs};
+        VanillaLightmapFrame { generation: 7, inputs: VanillaLightmapInputs {
+            ambient_light_factor: 0.0, sky_factor: 1.0, block_factor: 1.5,
+            night_vision_factor: 0.0, darkness_scale: 0.0, darken_world_factor: 0.0,
+            brightness_factor: 0.0, sky_light_color: [1.0; 3], ambient_color: [1.0; 3],
+        } }
+    }
+
+    #[test]
+    fn semantic_item_foil_animation_and_strength_invalidate_prepared_geometry() {
+        let mut request = batch();
+        request.material_mode = GuiMeshMaterialMode::Glint;
+        request.lighting_mode = GuiMeshLightingMode::Flat;
+        request.alpha_cutoff = 0.1;
+        request.item_foil = Some(GuiItemFoil { clock_millis: 0, speed: 0.5, strength: 0.5 });
+        let original = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        request.item_foil.as_mut().unwrap().clock_millis = 12_345;
+        let animated = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        assert_ne!(geometry_fingerprint(&original), geometry_fingerprint(&animated));
+        request.item_foil.as_mut().unwrap().strength = 0.25;
+        let dimmed = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        assert_ne!(geometry_fingerprint(&animated), geometry_fingerprint(&dimmed));
+        assert_eq!(original.vertices[0].position, dimmed.vertices[0].position);
+        request.item_foil.as_mut().unwrap().speed = 0.0;
+        let stopped = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        request.item_foil.as_mut().unwrap().clock_millis = 555_555;
+        let later = prepare_draws(&[request]).unwrap().remove(0);
+        assert_eq!(geometry_fingerprint(&stopped), geometry_fingerprint(&later));
+    }
+
+    #[test]
+    fn semantic_item_foil_prepares_original_uvs_and_unquantized_strength() {
+        let mut request = batch();
+        request.material_mode = GuiMeshMaterialMode::Glint;
+        request.lighting_mode = GuiMeshLightingMode::Flat;
+        request.alpha_cutoff = 0.1;
+        request.item_foil = Some(GuiItemFoil { clock_millis: 12_345, speed: 0.5, strength: 0.5 });
+        for vertex in &mut request.vertices {
+            vertex.atlas_uv = [0.25, 0.75];
+            // These must not drive the semantic foil's UVs or strength.
+            vertex.local_uv = [0.9, 0.1];
+            vertex.color_argb = 0x11223344;
+        }
+        let draw = prepare_draws(&[request.clone()]).unwrap().remove(0);
+        for vertex in draw.vertices {
+            assert!((vertex.local_uv[0] - 0.478817225).abs() <= 0.000002);
+            assert!((vertex.local_uv[1] - 6.902142525).abs() <= 0.000002);
+            assert_eq!(vertex.color, [0.5, 0.5, 0.5, 1.0]);
+        }
+        request.material_mode = GuiMeshMaterialMode::Opaque;
+        assert!(prepare_draws(&[request]).is_err());
+    }
+
+    #[test]
+    fn item_glint_strength_modulates_rgb_without_changing_texture_alpha() {
+        let mut request=batch();
+        request.material_mode=GuiMeshMaterialMode::Glint;
+        request.lighting_mode=GuiMeshLightingMode::Flat;
+        request.alpha_cutoff=0.1;
+        for strength in [0u32,128,255] {
+            for vertex in &mut request.vertices {vertex.color_argb=(strength<<24)|0x00ffffff;}
+            let draw=prepare_draws(&[request.clone()]).unwrap().remove(0);
+            for vertex in draw.vertices {
+                assert_eq!([strength as f32/255.0;3],vertex.color[..3]);
+                assert_eq!(1.0,vertex.color[3],"GlintAlpha affects RGB, not alpha-test coverage");
+            }
         }
     }
 

@@ -209,8 +209,16 @@ class RustGalGuiRendererTest {
 			"src/main/java/net/vulkanic/gui/RustGalGuiItemRenderer.java"
 		));
 		assertTrue(source.contains("layer.foilType() == ItemStackRenderState.FoilType.STANDARD"));
-		assertTrue(source.contains("RustGalGuiRawImageAssets.stage(quad.asset())"),
-			"flat-item base and glint quads must stage their copied assets after request admission");
+		assertTrue(source.contains("quad.source().stage()"),
+			"flat-item quads must stage their explicitly typed texture source");
+		assertTrue(source.contains("new GuiItemTextureSource.Raw(glint)"),
+			"glint must remain an explicit copied image source");
+		String textureSource = java.nio.file.Files.readString(java.nio.file.Path.of(
+			"src/main/java/net/vulkanic/gui/GuiItemTextureSource.java"));
+		assertTrue(textureSource.contains("RustGalGuiRawImageAssets.stage(asset)"),
+			"typed raw sources must still publish copied pixels");
+		assertTrue(textureSource.contains("RustGalFrameCoordinator.stageGuiAtlasReference(region)"),
+			"atlas sources must publish declarations, not fabricated copied images");
 		assertTrue(source.contains("source.atlasU0()"));
 		assertTrue(source.contains("ENCHANTED_GLINT_ITEM"));
 		assertTrue(source.contains("specialFoilQuad"));

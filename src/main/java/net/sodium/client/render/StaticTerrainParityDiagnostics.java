@@ -142,6 +142,10 @@ public final class StaticTerrainParityDiagnostics {
             Integer.getInteger("mattmc.dev.staticTerrainParityDiagnostics.maxTransformTraceEvents", 8)
     );
     private static final long APPEARANCE_TRACE_SECTION = parseAppearanceTraceSection();
+    private static final int APPEARANCE_MAX_SAMPLES = appearanceSampleLimit(Integer.getInteger(
+            "mattmc.dev.staticTerrainParityDiagnostics.appearanceMaxSamples", MAX_SAMPLES));
+    private static final AtomicInteger CAPTURE_APPEARANCE_TRACE_EVENTS = new AtomicInteger();
+    static int appearanceSampleLimit(int requested) { return Math.max(0, Math.min(4096, requested)); }
     private static final int[] APPEARANCE_TRACE_BLOCK = parseAppearanceTraceBlock();
     /**
      * Optional bounded receipt for particular compact ABGR values in one
@@ -203,6 +207,7 @@ public final class StaticTerrainParityDiagnostics {
     private static volatile CaptureCoverageSnapshot latestRustSourceCutoutCoverage;
     /** Immutable identities from the most recently encoded Rust terrain submission. */
     private static volatile List<RustExecutionIdentity> latestRustExecutionCoverage = List.of();
+    private static volatile long latestRustExecutionBackendFrameId;
 
     private StaticTerrainParityDiagnostics() {
     }
@@ -354,6 +359,10 @@ public final class StaticTerrainParityDiagnostics {
 		recordSourceVisibility(output);
         recordSourceMesh(output, DefaultTerrainRenderPasses.SOLID, "solid");
         recordSourceMesh(output, DefaultTerrainRenderPasses.CUTOUT, "cutout");
+        // Only the explicitly selected section gains a translucent CPU receipt.
+        if (output.render.getPosition().asLong() == APPEARANCE_TRACE_SECTION) {
+            recordSourceMesh(output, DefaultTerrainRenderPasses.TRANSLUCENT, "translucent");
+        }
     }
 
 	/** Records immutable build visibility only when explicitly selected. */
@@ -1074,6 +1083,7 @@ public final class StaticTerrainParityDiagnostics {
             return;
         }
         latestRustExecutionCoverage = List.copyOf(snapshot);
+        latestRustExecutionBackendFrameId = backendFrameId;
         writeRustWholeFrameExecutionCoverage(
                 latestRustExecutionCoverage,
                 backendFrameId,
@@ -1095,6 +1105,16 @@ public final class StaticTerrainParityDiagnostics {
                 renderedFrameIndex,
                 "rust-vulkan-executed-capture-ready-coverage"
         );
+    }
+
+    /** Exact captured-frame evidence, never a relabelled preceding submission. */
+    public static void recordRustFinalOutputCaptureCoverage(long renderedFrameIndex, long backendFrameId) {
+        if (!ENABLED || latestRustExecutionCoverage.isEmpty()) return;
+        if (renderedFrameIndex <= 0L || backendFrameId <= 0L || latestRustExecutionBackendFrameId != backendFrameId) {
+            throw new IllegalStateException("Rust final-output capture lacks exact-frame terrain execution evidence");
+        }
+        recordRustSourceCaptureCoverage(renderedFrameIndex);
+        recordRustExecutionCaptureCoverage(renderedFrameIndex);
     }
 
     private static void writeRustWholeFrameExecutionCoverage(
@@ -1311,6 +1331,15 @@ public final class StaticTerrainParityDiagnostics {
      * It deliberately records semantic vertex payloads, never renderer objects or handles.
      */
     public static void recordAppearanceSourceProbe(String stage, String layer) {
+        recordAppearanceSourceProbe(stage, layer, false);
+    }
+
+    /** Capture-bound observation of the latest completed CPU mesh, not GPU state. */
+    public static void recordAppearanceSourceAtCapture() {
+        recordAppearanceSourceProbe("capture-observed-source", "translucent", true);
+    }
+
+    private static void recordAppearanceSourceProbe(String stage, String layer, boolean capture) {
         if (!ENABLED || APPEARANCE_TRACE_SECTION == Long.MIN_VALUE) {
             return;
         }
@@ -1320,8 +1349,8 @@ public final class StaticTerrainParityDiagnostics {
         if (source == null || coverage == null) {
             return;
         }
-        int eventIndex = APPEARANCE_TRACE_EVENTS.incrementAndGet();
-        if (eventIndex > 8) {
+        int eventIndex = (capture ? CAPTURE_APPEARANCE_TRACE_EVENTS : APPEARANCE_TRACE_EVENTS).incrementAndGet();
+        if (eventIndex > (capture ? 4 : 8)) {
             return;
         }
         try {
@@ -1338,6 +1367,8 @@ public final class StaticTerrainParityDiagnostics {
             appendField(json, "meshGeneration", coverage.meshGeneration()).append(", ");
             appendField(json, "gameTime", Minecraft.getInstance().level == null ? -1L : Minecraft.getInstance().level.getGameTime()).append(", ");
             appendField(json, "vertexStride", source.vertexStride()).append(", ");
+            appendField(json, "vertexCount", coverage.vertexCount()).append(", ");
+            appendField(json, "samplesComplete", source.samples().length == coverage.vertexCount()).append(", ");
             appendField(json, "separateAo", source.separateAo() ? 1 : 0).append(", ");
             appendField(json, "materialIdentity", coverage.materialIdentity()).append(", ");
             appendField(json, "textureIdentity", coverage.textureIdentity()).append(", ");
@@ -2045,7 +2076,7 @@ public final class StaticTerrainParityDiagnostics {
         for (int i = 0; i + 1 < segments.length; i += 2) {
             vertices += Math.max(0, segments[i]);
         }
-        int limit = Math.min(Math.min(vertices, vertexCapacity), MAX_SAMPLES);
+        int limit = Math.min(Math.min(vertices, vertexCapacity), APPEARANCE_MAX_SAMPLES);
         AppearanceSample[] samples = new AppearanceSample[limit];
         boolean separateAo = usesSeparateAo();
         int segment = 0;

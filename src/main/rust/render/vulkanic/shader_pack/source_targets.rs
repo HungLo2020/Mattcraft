@@ -1738,6 +1738,7 @@ impl ShaderPackColorFramePlan {
                 TextureUsageState::TransferDst,
             )));
             operations.push(CommandOp::CopyTexture(TextureImageCopyRegion {
+                row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
                 src_texture: target.current_texture,
                 src_mip: 0,
                 src_layer: 0,
@@ -1947,6 +1948,7 @@ impl ShaderPackColorFramePlan {
                 TextureUsageState::TransferDst,
             )));
             operations.push(CommandOp::CopyTexture(TextureImageCopyRegion {
+                row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
                 src_texture: target.current_texture,
                 src_mip: 0,
                 src_layer: 0,

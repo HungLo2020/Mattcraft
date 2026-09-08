@@ -1,7 +1,6 @@
 package net.minecraft.worldedit.pattern;
 
 import net.minecraft.core.Direction;
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.block.Blocks;
@@ -21,7 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BlockPatternParserTest {
     @BeforeAll
     static void bootstrapMinecraft() {
-        SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+        SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 

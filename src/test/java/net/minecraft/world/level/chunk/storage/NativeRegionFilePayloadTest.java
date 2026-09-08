@@ -1,6 +1,5 @@
 package net.minecraft.world.level.chunk.storage;
 
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
@@ -41,7 +40,7 @@ class NativeRegionFilePayloadTest {
 
 	@BeforeAll
 	static void bootstrapMinecraft() {
-		SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+		SharedConstants.tryDetectVersion();
 		Bootstrap.bootStrap();
 	}
 

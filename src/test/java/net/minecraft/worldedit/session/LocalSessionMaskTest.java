@@ -1,6 +1,5 @@
 package net.minecraft.worldedit.session;
 
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.block.Blocks;
@@ -15,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 class LocalSessionMaskTest {
     @BeforeAll
     static void bootstrapMinecraft() {
-        SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+        SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 

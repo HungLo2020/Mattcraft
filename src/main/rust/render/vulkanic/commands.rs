@@ -79,11 +79,20 @@ pub struct BufferImageCopyRegion {
     pub extent: Extent3d,
 }
 
+/// Ordering of rows within the destination copy rectangle. This is data
+/// transformation, not an implicit framebuffer or shader coordinate convention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureRowOrder {
+    Preserve,
+    Reverse,
+}
+
 /// One explicit texture-to-texture copy. Source and destination subresources
 /// are named independently so a frontend can retain immutable depth/history
 /// snapshots without exposing an API-specific image copy primitive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextureImageCopyRegion {
+    pub row_order: TextureRowOrder,
     pub src_texture: Handle,
     pub src_mip: u32,
     pub src_layer: u32,

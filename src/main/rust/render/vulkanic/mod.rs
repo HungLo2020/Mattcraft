@@ -12,6 +12,11 @@ pub mod ffi;
 pub mod frame;
 pub mod gal;
 pub mod gui_frontend;
+// Explicit same-context atlas references; private until native GUI sampling is wired.
+mod gui_atlas_reference;
+mod item_foil;
+mod gui_item_material;
+mod gui_item_raster;
 /// Private semantic tiled-GUI lowering; not yet a frame/FFI-admitted route.
 mod gui_tiling;
 /// Backend-neutral GUI mesh semantics. This is not an FFI-admitted route
@@ -24,6 +29,7 @@ pub mod shader_pack;
 pub mod sync;
 pub mod terrain;
 pub mod world_primitive_frontend;
+mod texture_sampling;
 
 /// Maximum viewport axis admitted by semantic frame and GUI submissions.
 /// Keeping this finite prevents hostile FFI dimensions from driving unbounded

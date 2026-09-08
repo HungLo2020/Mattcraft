@@ -1,7 +1,6 @@
 package net.vulkanic.world;
 
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
@@ -15,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class RustGalWorldEntityIdentityTest {
 	@BeforeAll
 	static void bootstrap() {
-		SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+		SharedConstants.tryDetectVersion();
 		Bootstrap.bootStrap();
 	}
 

@@ -2487,11 +2487,11 @@ pub(super) fn color_blend_attachment(
             .color_write_mask(vk::ColorComponentFlags::RGBA),
         BlendMode::Glint => vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::DST_COLOR)
-            .dst_color_blend_factor(vk::BlendFactor::SRC_COLOR)
+            .src_color_blend_factor(vk::BlendFactor::SRC_COLOR)
+            .dst_color_blend_factor(vk::BlendFactor::ONE)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA),
         BlendMode::Vignette => vk::PipelineColorBlendAttachmentState::default()

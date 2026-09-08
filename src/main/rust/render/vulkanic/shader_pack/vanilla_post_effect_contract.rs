@@ -520,6 +520,41 @@ impl VanillaPostEffectContract {
             })
             .collect()
     }
+
+    /// Resolve imports for the copied programmable graph. Bundled identity
+    /// comparisons retain their raw-source contract; compilation uses this
+    /// stage-local expansion over the same immutable resource generation.
+    pub fn expanded_shader_sources_from_source(
+        &self,
+        source: &ShaderPackSource,
+    ) -> GalResult<Vec<VanillaPostEffectShaderSource>> {
+        self.passes.iter().map(|pass| {
+            let expand = |identity: &str, extension: &str| -> GalResult<Vec<u8>> {
+                let bytes = resolve_shader_source(source, identity, extension)?;
+                let contents = std::str::from_utf8(&bytes)
+                    .map_err(|_| GalError::invalid_argument("post-effect source is not UTF-8"))?;
+                let (namespace, path) = identity.split_once(':').unwrap_or(("minecraft", identity));
+                let snapshot_namespace = self.effect_name.split_once(':')
+                    .map_or("minecraft", |(namespace, _)| namespace);
+                if !super::vanilla_sources::qualified(source)? && namespace != snapshot_namespace {
+                    return Err(GalError::unsupported_feature(
+                        "cross-namespace post-effect stage requires a namespace-qualified source snapshot"));
+                }
+                let direct = format!("{path}.{extension}");
+                let program = format!("program/{path}.{extension}");
+                let resolved = if !super::vanilla_sources::qualified(source)?
+                    && source.get(&direct).is_none() && source.get(&program).is_some() {
+                    &program
+                } else { &direct };
+                super::vanilla_imports::expand(source, namespace, resolved, contents)
+                    .map(String::into_bytes)
+            };
+            Ok(VanillaPostEffectShaderSource {
+                vertex_shader: expand(&pass.vertex_shader, "vsh")?,
+                fragment_shader: expand(&pass.fragment_shader, "fsh")?,
+            })
+        }).collect()
+    }
 }
 
 fn resolve_shader_source(
@@ -527,6 +562,13 @@ fn resolve_shader_source(
     identity: &str,
     extension: &str,
 ) -> GalResult<Vec<u8>> {
+    if super::vanilla_sources::qualified(source)? {
+        let (namespace, path) = identity.split_once(':').unwrap_or(("minecraft", identity));
+        let key = super::vanilla_sources::key(namespace, &format!("{path}.{extension}"))?;
+        return source.get(&key).map(|contents| contents.as_bytes().to_vec())
+            .ok_or_else(|| GalError::unsupported_feature(format!(
+                "copied vanilla shader '{identity}.{extension}' is missing from its qualified source snapshot")));
+    }
     let path = identity.split_once(':').map_or(identity, |(_, path)| path);
     let candidates = [
         format!("{path}.{extension}"),

@@ -10,7 +10,7 @@ use super::resources::VulkanObjects;
 use super::trace;
 use crate::render::vulkanic::commands::{
     AttachmentLoadOp, AttachmentStoreOp, BufferImageCopyRegion, CommandOp, TextureImageCopyRegion,
-    TextureUsageState, ValidatedSubmissionBatch,
+    TextureRowOrder, TextureUsageState, ValidatedSubmissionBatch,
 };
 use crate::render::vulkanic::error::{GalError, GalResult};
 use crate::render::vulkanic::handles::{Handle, HandleKind};
@@ -1134,15 +1134,31 @@ impl SubmissionLowerer {
                     let _zone = trace::Zone::new("vulkan.lowering.copy-texture");
                     let source = objects.texture(region.src_texture)?;
                     let destination = objects.texture(region.dst_texture)?;
-                    let copy = texture_image_copy(region, source.aspect, destination.aspect);
-                    self.context.device.cmd_copy_image(
+                    if region.row_order == TextureRowOrder::Reverse {
+                        let source_features = self.context.instance
+                            .get_physical_device_format_properties(self.context.physical_device, source.format)
+                            .optimal_tiling_features;
+                        let destination_features = self.context.instance
+                            .get_physical_device_format_properties(self.context.physical_device, destination.format)
+                            .optimal_tiling_features;
+                        validate_row_reversal_format_features(source_features, destination_features)?;
+                        let blit = texture_row_reversal_blit(region, source.aspect, destination.aspect)?;
+                        self.context.device.cmd_blit_image(
+                            command_buffer, source.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            destination.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[blit], vk::Filter::NEAREST,
+                        );
+                    } else {
+                        let copy = texture_image_copy(region, source.aspect, destination.aspect);
+                        self.context.device.cmd_copy_image(
                         command_buffer,
                         source.image,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         destination.image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[copy],
-                    );
+                        );
+                    }
                 }
                 CommandOp::CopyFrameTargetToTexture { src, dst, extent } => {
                     let _zone = trace::Zone::new("vulkan.lowering.copy-frame-target");
@@ -1938,6 +1954,35 @@ mod timestamp_tests {
     }
 
     #[test]
+    fn row_reversal_checks_format_support_and_only_reverses_destination_y() {
+        use crate::render::vulkanic::commands::TextureOrigin3d;
+        use crate::render::vulkanic::resources::Extent3d;
+        let src = vk::FormatFeatureFlags::BLIT_SRC;
+        let dst = vk::FormatFeatureFlags::BLIT_DST;
+        validate_row_reversal_format_features(src, dst).unwrap();
+        assert!(validate_row_reversal_format_features(vk::FormatFeatureFlags::empty(), dst).is_err());
+        assert!(validate_row_reversal_format_features(src, vk::FormatFeatureFlags::empty()).is_err());
+        let mut region = TextureImageCopyRegion {
+            row_order: TextureRowOrder::Reverse,
+            src_texture: Handle::new(HandleKind::Texture, 1, 1).unwrap(),
+            src_mip: 1, src_layer: 2, src_origin: TextureOrigin3d { x: 3, y: 5, z: 0 },
+            dst_texture: Handle::new(HandleKind::Texture, 2, 1).unwrap(),
+            dst_mip: 2, dst_layer: 3, dst_origin: TextureOrigin3d { x: 7, y: 11, z: 0 },
+            extent: Extent3d { width: 13, height: 17, depth: 1 },
+        };
+        let blit = texture_row_reversal_blit(&region, vk::ImageAspectFlags::COLOR, vk::ImageAspectFlags::COLOR).unwrap();
+        let coordinates = |offsets: [vk::Offset3D; 2]| offsets.map(|p| (p.x, p.y, p.z));
+        assert_eq!([(3, 5, 0), (16, 22, 1)], coordinates(blit.src_offsets));
+        assert_eq!([(7, 28, 0), (20, 11, 1)], coordinates(blit.dst_offsets));
+        assert_eq!((1, 2), (blit.src_subresource.mip_level, blit.src_subresource.base_array_layer));
+        assert_eq!((2, 3), (blit.dst_subresource.mip_level, blit.dst_subresource.base_array_layer));
+        let combined = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+        assert!(texture_row_reversal_blit(&region, combined, combined).is_err());
+        region.dst_origin.y = i32::MAX as u32;
+        assert!(texture_row_reversal_blit(&region, vk::ImageAspectFlags::COLOR, vk::ImageAspectFlags::COLOR).is_err());
+    }
+
+    #[test]
     fn texture_image_copy_preserves_independent_depth_subresources() {
         use crate::render::vulkanic::commands::{TextureImageCopyRegion, TextureOrigin3d};
         use crate::render::vulkanic::handles::{Handle, HandleKind};
@@ -1945,6 +1990,7 @@ mod timestamp_tests {
 
         let copy = texture_image_copy(
             &TextureImageCopyRegion {
+                row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
                 src_texture: Handle::new(HandleKind::Texture, 1, 1).unwrap(),
                 src_mip: 1,
                 src_layer: 0,
@@ -2398,6 +2444,63 @@ fn buffer_image_copy(
             height: region.extent.height,
             depth: region.extent.depth,
         })
+}
+
+fn validate_row_reversal_format_features(
+    source: vk::FormatFeatureFlags,
+    destination: vk::FormatFeatureFlags,
+) -> GalResult<()> {
+    if !source.contains(vk::FormatFeatureFlags::BLIT_SRC)
+        || !destination.contains(vk::FormatFeatureFlags::BLIT_DST)
+    {
+        return Err(GalError::unsupported_feature(
+            "texture row reversal requires Vulkan format blit source/destination support",
+        ));
+    }
+    Ok(())
+}
+
+fn texture_row_reversal_blit(
+    region: &TextureImageCopyRegion,
+    src_aspect: vk::ImageAspectFlags,
+    dst_aspect: vk::ImageAspectFlags,
+) -> GalResult<vk::ImageBlit> {
+    // A blit region addresses exactly one aspect; combined depth/stencil needs
+    // separate regions and is deliberately not admitted here.
+    if src_aspect != dst_aspect || src_aspect.as_raw().count_ones() != 1 {
+        return Err(GalError::unsupported_feature(
+            "texture row reversal requires one matching image aspect",
+        ));
+    }
+    let offset = |origin: crate::render::vulkanic::commands::TextureOrigin3d,
+                  end: bool| -> GalResult<vk::Offset3D> {
+        let component = |start: u32, size: u32| -> GalResult<i32> {
+            let value = start.checked_add(if end { size } else { 0 })
+                .ok_or_else(|| GalError::backend("row reversal offset overflows"))?;
+            i32::try_from(value).map_err(|_| GalError::backend("row reversal offset exceeds i32"))
+        };
+        Ok(vk::Offset3D {
+            x: component(origin.x, region.extent.width)?,
+            y: component(origin.y, region.extent.height)?,
+            z: component(origin.z, region.extent.depth)?,
+        })
+    };
+    let src_offsets = [offset(region.src_origin, false)?, offset(region.src_origin, true)?];
+    let mut dst_offsets = [offset(region.dst_origin, false)?, offset(region.dst_origin, true)?];
+    let y = dst_offsets[0].y;
+    dst_offsets[0].y = dst_offsets[1].y;
+    dst_offsets[1].y = y;
+    Ok(vk::ImageBlit::default()
+        .src_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: src_aspect, mip_level: region.src_mip,
+            base_array_layer: region.src_layer, layer_count: 1,
+        })
+        .src_offsets(src_offsets)
+        .dst_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: dst_aspect, mip_level: region.dst_mip,
+            base_array_layer: region.dst_layer, layer_count: 1,
+        })
+        .dst_offsets(dst_offsets))
 }
 
 fn texture_image_copy(

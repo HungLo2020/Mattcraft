@@ -8,6 +8,20 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class TranslucentMeshRasterSemanticsTest {
     @Test
+    void itemPipelineCarriesBlendPlusCutoutInsteadOfTerrainTranslucency() throws Exception {
+        net.minecraft.SharedConstants.tryDetectVersion();
+        net.minecraft.server.Bootstrap.bootStrap();
+        Method extract = RustGalWorldPrimitiveRenderer.class.getDeclaredMethod("modelMeshRenderSemantics", RenderType.class);
+        extract.setAccessible(true);
+        Object semantics = extract.invoke(null, RenderType.itemEntityTranslucentCull(
+            ResourceLocation.withDefaultNamespace("textures/block/stone.png")));
+        assertEquals(RustGalWorldPrimitiveRenderer.MATERIAL_MODE_TRANSLUCENT_CUTOUT, field(semantics, "materialMode"));
+        assertEquals(RustGalWorldPrimitiveRenderer.MATERIAL_ID_TRANSLUCENT_CUTOUT_TEXTURED, field(semantics, "materialId"));
+        assertEquals(RustGalWorldPrimitiveRenderer.DEPTH_POLICY_TEST_WRITE, field(semantics, "depthPolicy"));
+        assertEquals(RustGalWorldPrimitiveRenderer.CULL_BACK, field(semantics, "cullPolicy"));
+    }
+
+    @Test
     void itemCullingAndEntityDoubleSidednessRemainDistinct() throws Exception {
         net.minecraft.SharedConstants.tryDetectVersion();
         net.minecraft.server.Bootstrap.bootStrap();

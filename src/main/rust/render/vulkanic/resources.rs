@@ -354,7 +354,7 @@ pub enum BlendMode {
     /// Additive overlay tint: `out.rgb = src.rgb * src.a + dst.rgb`, `out.a = src.a`.
     /// This is the backend-neutral semantic used by forcefield-style world overlays.
     Overlay = 6,
-    /// Vanilla item glint: `out.rgb = src.rgb * dst.rgb + dst.rgb * src.rgb`.
+    /// Vanilla glint: `out.rgb = src.rgb * src.rgb + dst.rgb`, `out.a = dst.a`.
     Glint = 7,
     /// Vignette compositing: `out = dst * (1 - src.rgb)`.
     Vignette = 8,
@@ -462,6 +462,7 @@ pub enum BackendFeature {
     RenderDocCapture = 19,
     TracyZones = 20,
     Texture3d = 21,
+    TextureRowReversal = 22,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -487,6 +488,7 @@ pub struct BackendFeatureFlags {
     pub renderdoc_capture: bool,
     pub tracy_zones: bool,
     pub texture_3d: bool,
+    pub texture_row_reversal: bool,
 }
 
 impl BackendFeatureFlags {
@@ -513,6 +515,7 @@ impl BackendFeatureFlags {
             BackendFeature::RenderDocCapture => self.renderdoc_capture,
             BackendFeature::TracyZones => self.tracy_zones,
             BackendFeature::Texture3d => self.texture_3d,
+            BackendFeature::TextureRowReversal => self.texture_row_reversal,
         }
     }
 }

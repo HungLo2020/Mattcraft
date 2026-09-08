@@ -26,8 +26,15 @@ pub(in crate::render::chunk::meshing) fn fluid_side_exposed(
     dx: i32,
     dy: i32,
     dz: i32,
-    _height: f32,
+    height: f32,
 ) -> bool {
+    // A partial-height fluid does not touch the ceiling's lower face. Match
+    // Shapes.blockOccludes' boundary test (double precision, epsilon 1e-7)
+    // before considering the neighbor's full-occlusion shape. Side and bottom
+    // faces still touch their cell boundaries and keep the normal test below.
+    if dy == 1 && (f64::from(height) - 1.0).abs() > 1.0e-7 {
+        return true;
+    }
     neighborhood_state_id(block, dx, dy, dz)
         .and_then(|id| state_by_id(states, id))
         .map(|state| {

@@ -34,7 +34,9 @@ class ItemAtlasBindingTest {
         var name = ResourceLocation.withDefaultNamespace("audit/animated-item");
         try (var contents = new SpriteContents(name, new FrameSize(4, 4), new NativeImage(4, 8, true),
             Optional.of(new AnimationMetadataSection(Optional.empty(), Optional.of(4), Optional.of(4), 2, true)), List.of());
-             var resource = new AtlasAnimationResource(new net.minecraft.client.renderer.texture.SemanticAtlasAnimationSource(
+             var resource = new AtlasAnimationResource(TextureAtlas.LOCATION_BLOCKS,
+                 RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_TERRAIN_BLOCK_ATLAS,
+                 new net.minecraft.client.renderer.texture.SemanticAtlasAnimationSource(
                  77, 16, 16, 1, List.of(new net.minecraft.client.renderer.texture.SemanticAtlasAnimationSource.Sprite(
                      11, name, 4, 8, contents.semanticAnimationSource().orElseThrow()))))) {
             var sprite = new Sprite(contents);

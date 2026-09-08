@@ -18,9 +18,11 @@ class AtlasAnimationTickDeliveryTest {
         var uses = visibility();
         var queue = new AtlasAnimationTickDelivery(17, 23, 0);
         assertFalse(queue.lastQueuedTickNamedSpriteForDiagnostics(1));
+        assertEquals(-1, queue.lastNonemptyTickNamingSpriteForDiagnostics(1));
         uses.recordUse(ATLAS, name(1));
         queue.enqueue(1, true, uses);
         assertTrue(queue.lastQueuedTickNamedSpriteForDiagnostics(1));
+        assertEquals(1, queue.lastNonemptyTickNamingSpriteForDiagnostics(1));
         assertFalse(queue.lastQueuedTickNamedSpriteForDiagnostics(2));
         assertThrows(IllegalArgumentException.class, () -> queue.enqueue(3, true, uses));
         assertTrue(queue.lastQueuedTickNamedSpriteForDiagnostics(1));
@@ -32,17 +34,21 @@ class AtlasAnimationTickDeliveryTest {
         assertEquals(0, queue.pendingCount());
         queue.enqueue(2, true, uses);
         assertFalse(queue.lastQueuedTickNamedSpriteForDiagnostics(1));
+        assertEquals(1, queue.lastNonemptyTickNamingSpriteForDiagnostics(1));
         uses.recordUse(ATLAS, name(2));
         queue.enqueue(3, true, uses);
         assertTrue(queue.lastQueuedTickNamedSpriteForDiagnostics(2));
+        assertEquals(-1, queue.lastNonemptyTickNamingSpriteForDiagnostics(1));
+        assertEquals(3, queue.lastNonemptyTickNamingSpriteForDiagnostics(2));
         queue.discard();
         assertFalse(queue.lastQueuedTickNamedSpriteForDiagnostics(2));
+        assertEquals(-1, queue.lastNonemptyTickNamingSpriteForDiagnostics(2));
     }
     private static AtlasAnimationVisibility visibility() {
         var pixels = new SpriteContents.SemanticAnimationSource(1, 1, 1, false,
             List.of(new SpriteContents.SemanticAnimationFrame(0, 1)),
             List.of(new SpriteContents.SemanticAnimationMip(1, 1, new byte[4])));
-        return new AtlasAnimationVisibility(new SemanticAtlasAnimationSource(7, 2, 1, 1, List.of(
+        return new AtlasAnimationVisibility(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS, new SemanticAtlasAnimationSource(7, 2, 1, 1, List.of(
             new SemanticAtlasAnimationSource.Sprite(1, name(1), 0, 0, pixels),
             new SemanticAtlasAnimationSource.Sprite(2, name(2), 1, 0, pixels))));
     }
@@ -123,7 +129,7 @@ class AtlasAnimationTickDeliveryTest {
         for (int id = 1; id <= 16384; id++) {
             sprites.add(new SemanticAtlasAnimationSource.Sprite(id, name(id), id - 1, 0, pixels));
         }
-        var uses = new AtlasAnimationVisibility(new SemanticAtlasAnimationSource(7, 16384, 1, 1, sprites));
+        var uses = new AtlasAnimationVisibility(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS, new SemanticAtlasAnimationSource(7, 16384, 1, 1, sprites));
         var queue = new AtlasAnimationTickDelivery(17, 23, 0);
         for (int tick = 1; tick <= 64; tick++) {
             for (var sprite : sprites) uses.recordUse(ATLAS, sprite.name());

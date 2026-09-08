@@ -38,12 +38,25 @@ pub(crate) struct PreparedAtlasTick {
 }
 
 impl PreparedAtlasTick {
+    pub(crate) fn texture_id(&self) -> u32 { self.texture_id }
     pub(crate) fn patches(&self) -> &[SpriteAtlasPatch] {
         &self.patches
     }
 }
 
 impl OwnedAtlasAnimationUpdate {
+    pub(crate) fn source_metadata_counts(&self) -> GalResult<(usize, usize)> {
+        self.sprites.iter().try_fold((0usize, 0usize), |(frames, mips), sprite| {
+            let invalid = || GalError::invalid_argument("animation metadata count overflow");
+            Ok((frames.checked_add(sprite.clock.frames.len()).ok_or_else(invalid)?,
+                mips.checked_add(sprite.sheets.len()).ok_or_else(invalid)?))
+        })
+    }
+    pub(crate) fn source_payload_bytes(&self) -> GalResult<usize> {
+        self.sprites.iter().flat_map(|sprite| &sprite.sheets).try_fold(0usize, |total, sheet|
+            total.checked_add(sheet.rgba.len())
+                .ok_or_else(|| GalError::invalid_argument("animation source byte count overflow")))
+    }
     pub(crate) fn prepare_tick(
         &self,
         width: u32,
@@ -137,11 +150,7 @@ impl OwnedAtlasAnimationUpdate {
     pub(crate) fn commit_tick(&mut self, prepared: PreparedAtlasTick) -> GalResult<()> {
         self.validate_commit(&prepared)?;
         for (sprite, (_, step)) in self.sprites.iter_mut().zip(prepared.steps) {
-            (
-                sprite.clock.frame,
-                sprite.clock.subframe,
-                sprite.clock.last_tick,
-            ) = step.next;
+            sprite.clock.apply_accepted_step(step);
         }
         Ok(())
     }
@@ -289,6 +298,9 @@ pub(crate) struct SpriteAnimationClock {
     frame: usize,
     subframe: u32,
     last_tick: u64,
+    // Observation of pixels, not another clock. Invisible ticks must not
+    // relabel the last accepted upload with a later simulation phase.
+    retained_pixel_state: (usize, u32, u64),
 }
 
 /// An uncommitted clock transition. Retains only the immutable timeline, not
@@ -311,6 +323,11 @@ impl SpriteAnimationClock {
     /// Observation only: declared frame position, sheet frame, subframe and accepted tick.
     pub(crate) fn diagnostic_state(&self) -> (usize, u32, u32, u64) {
         (self.frame, self.frames[self.frame].index, self.subframe, self.last_tick)
+    }
+
+    pub(crate) fn diagnostic_retained_pixel_state(&self) -> (usize, u32, u32, u64) {
+        let (frame, subframe, tick) = self.retained_pixel_state;
+        (frame, self.frames[frame].index, subframe, tick)
     }
 
     pub(crate) fn declared_frame_count(&self) -> usize {
@@ -340,6 +357,7 @@ impl SpriteAnimationClock {
             frame: 0,
             subframe: 0,
             last_tick: initial_tick,
+            retained_pixel_state: (0, 0, initial_tick),
         })
     }
 
@@ -418,8 +436,15 @@ impl SpriteAnimationClock {
                 "stale or foreign sprite clock transaction",
             ));
         }
-        (self.frame, self.subframe, self.last_tick) = prepared.next;
+        self.apply_accepted_step(prepared);
         Ok(())
+    }
+
+    fn apply_accepted_step(&mut self, prepared: PreparedSpriteTick) {
+        if prepared.update.is_some() {
+            self.retained_pixel_state = prepared.next;
+        }
+        (self.frame, self.subframe, self.last_tick) = prepared.next;
     }
 
     fn can_commit(&self, prepared: &PreparedSpriteTick) -> bool {
@@ -712,6 +737,35 @@ fn invalid() -> GalError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_pixel_phase_changes_only_when_an_upload_transition_is_committed() {
+        let mut atlas = two_sprite_atlas();
+        let visible = std::collections::BTreeSet::from([1]);
+        assert_eq!(atlas.sprites[0].clock.diagnostic_retained_pixel_state(), (0, 0, 0, 0));
+        let rejected = atlas.prepare_tick(2, 1, 1, 1, &visible, true).unwrap();
+        drop(rejected);
+        assert_eq!(atlas.sprites[0].clock.diagnostic_retained_pixel_state(), (0, 0, 0, 0));
+        let accepted = atlas.prepare_tick(2, 1, 1, 1, &visible, true).unwrap();
+        atlas.commit_tick(accepted).unwrap();
+        assert_eq!(atlas.sprites[0].clock.diagnostic_retained_pixel_state(), (0, 0, 1, 1));
+        assert_eq!(atlas.sprites[1].clock.diagnostic_retained_pixel_state(), (0, 0, 0, 0));
+        let invisible = atlas.prepare_tick(2, 1, 1, 2, &Default::default(), true).unwrap();
+        atlas.commit_tick(invisible).unwrap();
+        assert_eq!(atlas.sprites[0].clock.diagnostic_state(), (1, 1, 0, 2));
+        assert_eq!(atlas.sprites[0].clock.diagnostic_retained_pixel_state(), (0, 0, 1, 1));
+        let mut other = two_sprite_atlas();
+        let foreign = other.prepare_tick(2, 1, 1, 1, &visible, true).unwrap();
+        assert!(atlas.commit_tick(foreign).is_err());
+        assert_eq!(atlas.sprites[0].clock.diagnostic_retained_pixel_state(), (0, 0, 1, 1));
+        // The single-clock transaction path follows the same acceptance rule.
+        let clock = &mut other.sprites[0].clock;
+        let step = clock.prepare_tick(1, true, true).unwrap();
+        clock.commit_tick(step).unwrap();
+        assert_eq!(clock.diagnostic_retained_pixel_state(), (0, 0, 1, 1));
+        clock.tick(2, false, true).unwrap();
+        assert_eq!(clock.diagnostic_retained_pixel_state(), (0, 0, 1, 1));
+    }
 
     fn two_sprite_atlas() -> OwnedAtlasAnimationUpdate {
         OwnedAtlasAnimationUpdate {

@@ -241,7 +241,9 @@ class NativeMeshingProductionContractTest {
         String ffi = source("src/main/rust/render/vulkanic/ffi/gui.rs");
         assertTrue(coordinator.contains("MAX_RUST_GUI_AFFINE_QUADS = 65_536"));
         assertTrue(coordinator.contains("GUI affine-quad capacity exceeded"));
-        assertTrue(ffi.contains("GUI_MAX_AFFINE_QUADS: usize = 65_536"));
+        String frontend = source("src/main/rust/render/vulkanic/gui_frontend.rs");
+        assertTrue(ffi.contains("GUI_MAX_AFFINE_QUADS: usize = super::super::gui_frontend::GUI_MAX_EXPANDED_AFFINE_QUADS"));
+        assertTrue(frontend.contains("GUI_MAX_EXPANDED_AFFINE_QUADS: usize = 65_536"));
         assertTrue(ffi.contains("quads.len() > GUI_MAX_AFFINE_QUADS"));
     }
 
@@ -1177,8 +1179,11 @@ class NativeMeshingProductionContractTest {
 
         assertTrue(diagnostics.contains("maxVisibleListEvents"));
         assertTrue(diagnostics.contains("boolean writeEvent = eventIndex <= MAX_VISIBLE_LIST_EVENTS"));
-        assertTrue(diagnostics.indexOf("latestSolidGameTime = gameTime;")
-                < diagnostics.indexOf("if (!writeEvent)"));
+        int readinessUpdate = diagnostics.indexOf("latestSolidGameTime = gameTime;");
+        int receiptBudgetReturn = diagnostics.indexOf("if (!writeEvent && !writeReadyEvent)");
+        assertTrue(readinessUpdate >= 0);
+        assertTrue(receiptBudgetReturn > readinessUpdate);
+        assertTrue(diagnostics.contains("READY_VISIBLE_LIST_EVENTS.incrementAndGet() <= MAX_READY_VISIBLE_LIST_EVENTS"));
     }
 
     @Test
@@ -3320,7 +3325,8 @@ class NativeMeshingProductionContractTest {
     void rustWholeFrameDoesNotSilentlyDropJavaPostEffects() throws IOException {
         String gameRenderer = source("src/main/java/net/minecraft/client/renderer/GameRenderer.java");
         assertTrue(gameRenderer.contains("this.effectActive && this.postEffectId != null"));
-        assertTrue(gameRenderer.contains("Rust whole-frame Vulkan post effect is unavailable"));
+        String ffi = source("src/main/rust/render/vulkanic/ffi/world.rs");
+        assertTrue(ffi.contains(".validate_post_effect_request_with_globals(&post_effect_id, world_frame.engine_globals)?;"));
         assertTrue(gameRenderer.contains("Java GUI blur post-process is unavailable while Rust owns whole-frame Vulkan"));
     }
 
@@ -3387,15 +3393,14 @@ class NativeMeshingProductionContractTest {
     }
 
     @Test
-    void endermanInvertPostEffectUsesExplicitRustInvertBlend() throws IOException {
+    void endermanInvertPostEffectUsesCopiedRustResourceGraph() throws IOException {
         String gameRenderer = source("src/main/java/net/minecraft/client/renderer/GameRenderer.java");
-        String gui = source("src/main/java/net/vulkanic/gui/RustGalGuiRenderer.java");
-        String rust = source("src/main/rust/render/vulkanic/gui_frontend.rs");
-		assertTrue(gameRenderer.contains("rustSemanticPostEffect"));
-        assertTrue(gameRenderer.contains("enqueuePostEffectInvert"));
-        assertTrue(gui.contains("POST_EFFECT_INVERT"));
-        assertTrue(rust.contains("GUI_POST_EFFECT_INVERT_ID"));
-        assertTrue(rust.contains("group(true)"));
+        String rust = source("src/main/rust/render/vulkanic/world_primitive_frontend.rs");
+        assertTrue(gameRenderer.contains("this.postEffectId.toString()"));
+        assertFalse(gameRenderer.contains("enqueuePostEffectInvert"));
+        assertTrue(rust.contains("self.custom_post_effect_sources_with_globals(identity, globals)"));
+        assertFalse(rust.contains("let invert_requested ="));
+        assertTrue(rust.contains("append_custom_post_effect_with_external_targets"));
     }
 
     @Test

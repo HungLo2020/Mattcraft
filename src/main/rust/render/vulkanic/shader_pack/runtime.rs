@@ -6443,6 +6443,7 @@ impl ShaderPackRuntimeExecutor {
             ));
         }
         let full_copy = |src_texture, dst_texture| TextureImageCopyRegion {
+            row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
             src_texture,
             src_mip: 0,
             src_layer: 0,
@@ -7403,6 +7404,7 @@ impl ShaderPackRuntimeExecutor {
                 TextureUsageState::TransferDst,
             )));
             ops.push(CommandOp::CopyTexture(TextureImageCopyRegion {
+                row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
                 src_texture: targets.depth_texture, src_mip: 0, src_layer: 0,
                 src_origin: TextureOrigin3d { x: 0, y: 0, z: 0 },
                 dst_texture: capture.depth_texture, dst_mip: 0, dst_layer: 0,

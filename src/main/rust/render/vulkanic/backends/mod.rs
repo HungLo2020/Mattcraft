@@ -228,6 +228,7 @@ pub(super) fn vulkan_capabilities() -> BackendCapabilities {
             renderdoc_capture: true,
             tracy_zones: true,
             texture_3d: true,
+            texture_row_reversal: true,
         },
         limits: BackendLimits {
             max_buffer_size: 256 * 1024 * 1024,
@@ -280,6 +281,7 @@ pub(super) fn opengl_capabilities() -> BackendCapabilities {
             renderdoc_capture: true,
             tracy_zones: true,
             texture_3d: true,
+            texture_row_reversal: false,
         },
         limits: BackendLimits {
             max_buffer_size: 64 * 1024 * 1024,

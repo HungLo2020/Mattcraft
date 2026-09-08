@@ -1229,6 +1229,7 @@ mod tests {
 
     fn frame_with_instances(instances: Vec<WorldMeshInstanceRequest>) -> WorldPrimitiveFrame {
         WorldPrimitiveFrame {
+            engine_globals: None,
             frame_id: 1,
             correlation_id: 1,
             viewport_width: 128,
@@ -1344,6 +1345,7 @@ mod tests {
         frontend.mesh_assets.insert(
             19,
             super::MeshAssetStore {
+                translucent_order: Default::default(),
                 mesh_generation: 1,
                 index_generation: 1,
                 vertex_layout_version: 0,
@@ -1826,6 +1828,7 @@ mod tests {
         frontend.mesh_assets.insert(
             23,
             super::super::MeshAssetStore {
+                translucent_order: Default::default(),
                 mesh_generation: asset.mesh_generation,
                 index_generation: 1,
                 vertex_layout_version: asset.vertex_layout_version,
@@ -1858,6 +1861,7 @@ mod tests {
 
     fn test_mesh_instance(mesh_key: u64) -> WorldMeshInstanceRequest {
         WorldMeshInstanceRequest {
+            item_foil: None,
             stratum: WORLD_STRATUM_ENTITY_MESH,
             mesh_key,
             mesh_generation: 1,

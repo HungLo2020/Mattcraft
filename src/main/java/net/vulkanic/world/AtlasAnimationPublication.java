@@ -12,18 +12,14 @@ final class AtlasAnimationPublication {
     private long stagedGeneration;
 
     AtlasAnimationPublication(VulkanicGalBridge.WorldMeshTextureAssetRecord texture,
-        SemanticAtlasAnimationSource source) {
-        this(texture, new AtlasAnimationResource(source));
-    }
-
-    AtlasAnimationPublication(VulkanicGalBridge.WorldMeshTextureAssetRecord texture,
         AtlasAnimationResource resource) {
         this.texture = java.util.Objects.requireNonNull(texture);
         this.resource = java.util.Objects.requireNonNull(resource);
         this.source = resource.source();
-        if (texture.textureId() != RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_TERRAIN_BLOCK_ATLAS
-            || source.generation() <= 0 || source.mipCount() != texture.mipPngBytes().size() + 1) {
-            throw new IllegalArgumentException("Incoherent terrain animation publication");
+        if (texture.textureId() != resource.semanticTextureId()
+            || source.generation() <= 0 || source.mipCount() != texture.mipPngBytes().size() + 1
+            || source.mipCount() != texture.requestedMipLevels()) {
+            throw new IllegalArgumentException("Incoherent atlas animation publication");
         }
     }
 
@@ -41,6 +37,9 @@ final class AtlasAnimationPublication {
     }
 
     boolean pending() { return pendingGeneration != 0; }
+    int textureId() { return texture.textureId(); }
+    boolean owns(AtlasAnimationResource candidate) { return resource == candidate; }
+    SemanticAtlasAnimationSource source() { return source; }
     long stagedGeneration() { return stagedGeneration; }
     int spriteCount() { return source.sprites().size(); }
     int pendingTickCount() { return resource.pendingTickCount(); }

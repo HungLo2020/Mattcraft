@@ -55,6 +55,14 @@ public final class NativeStaticBlockModelRegistry {
     public static final int STATE_FLAG_CAN_OCCLUDE = 1 << 7;
     public static final int STATE_FLAG_BLOCKS_MOTION = 1 << 8;
     public static final int STATE_FLAG_MODEL_FACE_CULLABLE = 1 << 9;
+    public static final int STATE_FLAG_FLUID_OVERLAY_TRANSPARENT = 1 << 10;
+
+    public static int fluidOverlayFlags(BlockState state) {
+        // Copy the declared resource property used by the ordinary fluid
+        // producer. Occlusion is independent and cannot stand in for it.
+        return FluidRenderHandlerRegistry.INSTANCE.isBlockTransparent(state.getBlock())
+            ? STATE_FLAG_FLUID_OVERLAY_TRANSPARENT : 0;
+    }
 
     private static final int TINT_NONE = 0;
     private static final int TINT_GRASS = 1;
@@ -175,35 +183,30 @@ public final class NativeStaticBlockModelRegistry {
     }
 
     public static List<TextureAtlasSprite> getNativeFluidSprites(int emittedSpriteMask) {
-        return getNativeFluidSprites(emittedSpriteMask, true);
-    }
-
-    public static List<TextureAtlasSprite> getNativeFluidSprites(int emittedSpriteMask, boolean includeUnsupportedFluids) {
-        if (emittedSpriteMask == 0) {
-            return List.of();
-        }
-
-        ArrayList<TextureAtlasSprite> tracked = new ArrayList<>(3);
-        addFluidSprite(tracked, emittedSpriteMask, FLUID_SPRITE_WATER_STILL, "minecraft:block/water_still");
-        addFluidSprite(tracked, emittedSpriteMask, FLUID_SPRITE_WATER_FLOW, "minecraft:block/water_flow");
-        addFluidSprite(tracked, emittedSpriteMask, FLUID_SPRITE_WATER_OVERLAY, "minecraft:block/water_overlay");
-        if (includeUnsupportedFluids) {
-            addFluidSprite(tracked, emittedSpriteMask, FLUID_SPRITE_LAVA_STILL, "minecraft:block/lava_still");
-            addFluidSprite(tracked, emittedSpriteMask, FLUID_SPRITE_LAVA_FLOW, "minecraft:block/lava_flow");
+        if (emittedSpriteMask == 0) return List.of();
+        ArrayList<TextureAtlasSprite> tracked = new ArrayList<>(5);
+        for (String name : nativeFluidSpriteNames(emittedSpriteMask)) {
+            TextureAtlasSprite sprite = blockSprite(name);
+            if (sprite != null && !tracked.contains(sprite)) tracked.add(sprite);
         }
         return tracked;
     }
 
-    private static void addFluidSprite(List<TextureAtlasSprite> tracked, int emittedSpriteMask, int flag,
-            String spriteId) {
-        if ((emittedSpriteMask & flag) == 0) {
-            return;
-        }
+    /** Immutable usage semantics; renderer capability must not hide emitted resources. */
+    static List<String> nativeFluidSpriteNames(int emittedSpriteMask) {
+        if (emittedSpriteMask == 0) return List.of();
+        ArrayList<String> names = new ArrayList<>(5);
+        addFluidSpriteName(names, emittedSpriteMask, FLUID_SPRITE_WATER_STILL, "minecraft:block/water_still");
+        addFluidSpriteName(names, emittedSpriteMask, FLUID_SPRITE_WATER_FLOW, "minecraft:block/water_flow");
+        addFluidSpriteName(names, emittedSpriteMask, FLUID_SPRITE_WATER_OVERLAY, "minecraft:block/water_overlay");
+        addFluidSpriteName(names, emittedSpriteMask, FLUID_SPRITE_LAVA_STILL, "minecraft:block/lava_still");
+        addFluidSpriteName(names, emittedSpriteMask, FLUID_SPRITE_LAVA_FLOW, "minecraft:block/lava_flow");
+        return List.copyOf(names);
+    }
 
-        TextureAtlasSprite sprite = blockSprite(spriteId);
-        if (sprite != null && !tracked.contains(sprite)) {
-            tracked.add(sprite);
-        }
+    private static void addFluidSpriteName(List<String> tracked, int emittedSpriteMask, int flag,
+            String spriteId) {
+        if ((emittedSpriteMask & flag) != 0) tracked.add(spriteId);
     }
 
     private static int registerState(BlockState state, BlockStateModel model) {
@@ -238,7 +241,7 @@ public final class NativeStaticBlockModelRegistry {
 			fluidBlockId = semanticFluidStateId(fluidState);
         }
 
-        int flags = 0;
+        int flags = fluidOverlayFlags(state);
         if (state.isAir()) {
             flags |= STATE_FLAG_AIR;
         }
@@ -501,6 +504,18 @@ public final class NativeStaticBlockModelRegistry {
         return MISSING_ID;
     }
 
+    static int materialBitsForPass(Material material, int selectedPassId) {
+        // The immutable native snapshot must carry the same alpha predicate
+        // as Frozen's selected pass. Binary-alpha translucent sprites become
+        // cutout; carrying ZERO here would turn transparent texels opaque.
+        if (material == DefaultMaterials.TRANSLUCENT && selectedPassId == passId(DefaultTerrainRenderPasses.CUTOUT)) {
+            return net.sodium.client.render.chunk.terrain.material.parameters.MaterialParameters.pack(
+                net.sodium.client.render.chunk.terrain.material.parameters.AlphaCutoffParameter.ONE_TENTH,
+                material.mipped);
+        }
+        return material.bits();
+    }
+
     private static int downgradedPassId(BakedQuad quad, Material material) {
         TerrainRenderPass pass = material.pass;
         TextureAtlasSprite sprite = quad.sprite();
@@ -710,7 +725,7 @@ public final class NativeStaticBlockModelRegistry {
         }
         if (block == Blocks.OAK_LEAVES || block == Blocks.JUNGLE_LEAVES || block == Blocks.ACACIA_LEAVES
                 || block == Blocks.DARK_OAK_LEAVES || block == Blocks.VINE || block == Blocks.MANGROVE_LEAVES
-                || block == Blocks.LEAF_LITTER || block == Blocks.AZALEA_LEAVES
+                || block == Blocks.AZALEA_LEAVES
                 || block == Blocks.FLOWERING_AZALEA_LEAVES || block == Blocks.CHERRY_LEAVES
                 || block == Blocks.PALE_OAK_LEAVES) {
             return TINT_FOLIAGE;
@@ -735,7 +750,11 @@ public final class NativeStaticBlockModelRegistry {
         // semantic tint is therefore the unmodified texture color, represented by
         // the explicit constant/no-tint state rather than a Java model fallback.
         if (block == Blocks.ATTACHED_MELON_STEM || block == Blocks.ATTACHED_PUMPKIN_STEM
-                || block == Blocks.LILY_PAD || block == Blocks.BAMBOO || block == Blocks.POTTED_BAMBOO) {
+                || block == Blocks.LILY_PAD || block == Blocks.BAMBOO || block == Blocks.POTTED_BAMBOO
+                || block == Blocks.LEAF_LITTER) {
+            // Leaf litter uses the authored per-block dry-foliage sample.
+            // Frozen's VanillaAdapter repeats it at all vertices; it does not
+            // use the neighbouring-vertex blend of the green foliage provider.
             return TINT_CONSTANT;
         }
         return TINT_NONE;
@@ -831,7 +850,7 @@ public final class NativeStaticBlockModelRegistry {
             float x3, float y3, float z3, int color3, float u3, float v3, int light3) {
         static CachedQuad from(BakedQuad quad, net.minecraft.core.Direction cullFace, Material material, int passId,
                 boolean hasAo) {
-            return new CachedQuad(material.bits(), passId, cullFace == null ? -1 : cullFace.get3DDataValue(),
+            return new CachedQuad(materialBitsForPass(material, passId), passId, cullFace == null ? -1 : cullFace.get3DDataValue(),
                     quad.getNormalFace().ordinal(), quad.getFaceNormal(), quad.hasShade(),
                     quad.getFlags(), quad.getLightFace().get3DDataValue(), quad.getTintIndex(), hasAo,
                     quad.getX(0), quad.getY(0), quad.getZ(0), quad.getColor(0), quad.getTexU(0), quad.getTexV(0), quad.getLight(0),

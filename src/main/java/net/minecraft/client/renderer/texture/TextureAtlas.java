@@ -138,10 +138,16 @@ public class TextureAtlas extends AbstractTexture implements Dumpable, Tickable,
 
 			this.sprites = List.copyOf(list);
 			this.animatedTextures = List.copyOf(list2);
-			if (rustWholeFrame && LOCATION_BLOCKS.equals(this.location)) {
+			if (rustWholeFrame && (LOCATION_BLOCKS.equals(this.location)
+				|| LOCATION_PARTICLES.equals(this.location)
+					&& net.vulkanic.world.AtlasAnimationResource.privateTickDeliveryEnabled())) {
 				// The incarnation starts with atlas upload, before any resource lookup
 				// or world publication can lose its semantic sprite-use events.
-				var resource = new net.vulkanic.world.AtlasAnimationResource(this.semanticAnimationSource());
+				var resource = new net.vulkanic.world.AtlasAnimationResource(this.location,
+					LOCATION_BLOCKS.equals(this.location)
+						? net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_TERRAIN_BLOCK_ATLAS
+						: net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_PARTICLE_ATLAS,
+					this.semanticAnimationSource());
 				for (var declaration : resource.source().sprites()) {
 					this.texturesByName.get(declaration.name()).bindSemanticAnimationResource(resource);
 				}

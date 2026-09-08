@@ -7,6 +7,11 @@ import net.minecraft.client.Minecraft;
 public final class GraphicsAuditResourceReload {
     private static final boolean ENABLED = "true".equalsIgnoreCase(System.getenv("MATTMC_CAPTURE_MENU_RELOAD"));
     private static final Sequence ACTIVE = new Sequence();
+    private static final boolean WORLD_ENABLED =
+        Boolean.getBoolean("mattmc.dev.deterministicCameraCapture.resourceReload");
+    private static final WorldSequence WORLD = new WorldSequence();
+    private static java.util.List<String> selectedBefore = java.util.List.of();
+    private static java.util.List<String> selectedAtCapture = java.util.List.of();
     private static CompletableFuture<Void> reload;
     private static int observedFrames;
     public static void observe(Minecraft minecraft) {
@@ -18,6 +23,75 @@ public final class GraphicsAuditResourceReload {
             + " titleFadeReady=" + net.minecraft.client.gui.screens.TitleScreen.graphicsAuditTitleScreenFadeComplete());
     }
     private GraphicsAuditResourceReload() {}
+
+    /** Separate from menu reloads; no renderer state or backend identity is consulted. */
+    public static final class WorldSequence {
+        private CompletableFuture<Void> future;
+        private long lastFrame = Long.MIN_VALUE;
+        private int presentations;
+        public boolean afterPresentation(long frame, boolean overlay,
+                java.util.function.Supplier<CompletableFuture<Void>> beginReload) {
+            if (future == null) {
+                future = java.util.Objects.requireNonNull(beginReload.get());
+                lastFrame = frame;
+                return false;
+            }
+            if (future.isDone()) future.join();
+            if (!future.isDone() || overlay) {
+                presentations = 0;
+                lastFrame = frame;
+                return false;
+            }
+            if (frame > lastFrame) {
+                presentations = Math.min(2, presentations + 1);
+                lastFrame = frame;
+            }
+            return presentations >= 2;
+        }
+        public com.google.gson.JsonObject receipt() {
+            var state = new com.google.gson.JsonObject();
+            state.addProperty("schema", "normal-world-resource-reload-v1");
+            state.addProperty("requested", future != null);
+            state.addProperty("futureComplete", future != null && future.isDone()
+                && !future.isCompletedExceptionally() && !future.isCancelled());
+            state.addProperty("complete", presentations >= 2);
+            state.addProperty("presentations", presentations);
+            return state;
+        }
+    }
+
+    public static boolean prepareWorldCapture(Minecraft minecraft, long frame) {
+        if (!WORLD_ENABLED) return true;
+        boolean ready = WORLD.afterPresentation(frame, minecraft.getOverlay() != null, () -> {
+            var repository = minecraft.getResourcePackRepository();
+            selectedBefore = java.util.List.copyOf(repository.getSelectedIds());
+            String remove = System.getProperty("mattmc.dev.deterministicCameraCapture.reloadRemovePack", "");
+            if (!remove.isEmpty()) repository.setSelected(withoutSelectedPack(selectedBefore, remove));
+            return minecraft.reloadResourcePacks();
+        });
+        selectedAtCapture = java.util.List.copyOf(minecraft.getResourcePackRepository().getSelectedIds());
+        return ready;
+    }
+
+    public static java.util.List<String> withoutSelectedPack(java.util.List<String> selected, String remove) {
+        if (remove.isEmpty() || !selected.contains(remove))
+            throw new IllegalArgumentException("reload fixture pack is not selected: " + remove);
+        var remaining = selected.stream().filter(pack -> !pack.equals(remove)).toList();
+        if (remaining.isEmpty()) throw new IllegalArgumentException("reload fixture requires a remaining pack");
+        return remaining;
+    }
+
+    public static String worldReceipt() {
+        if (!WORLD_ENABLED) return "null";
+        var receipt = WORLD.receipt();
+        var before = new com.google.gson.JsonArray();
+        selectedBefore.forEach(before::add);
+        var after = new com.google.gson.JsonArray();
+        selectedAtCapture.forEach(after::add);
+        receipt.add("selectedBefore", before);
+        receipt.add("selectedAtCapture", after);
+        return receipt.toString();
+    }
 
     public static final class Sequence {
         public enum Action { RELOAD, WAIT, CAPTURE }

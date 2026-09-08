@@ -45,6 +45,7 @@ pub(super) const STATE_FLAG_LIGHT_BLOCK: i32 = 1 << 5;
 pub(super) const STATE_FLAG_CAN_OCCLUDE: i32 = 1 << 7;
 pub(super) const STATE_FLAG_BLOCKS_MOTION: i32 = 1 << 8;
 pub(super) const STATE_FLAG_MODEL_FACE_CULLABLE: i32 = 1 << 9;
+pub(super) const STATE_FLAG_FLUID_OVERLAY_TRANSPARENT: i32 = 1 << 10;
 pub(super) const MODEL_QUAD_FLAG_PARTIAL: i32 = 1;
 pub(super) const MODEL_QUAD_FLAG_PARALLEL: i32 = 1 << 1;
 pub(super) const MODEL_QUAD_FLAG_ALIGNED: i32 = 1 << 2;

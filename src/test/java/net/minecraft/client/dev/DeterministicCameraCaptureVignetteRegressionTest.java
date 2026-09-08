@@ -9,6 +9,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DeterministicCameraCaptureVignetteRegressionTest {
 	@Test
+	void finalOutputCaptureRequiresThePresentedTerrainSubmissionRatherThanThePreviousFrame() throws Exception {
+		String coordinator = Files.readString(Path.of("src/main/java/net/vulkanic/gui/RustGalFrameCoordinator.java"));
+		int present = coordinator.indexOf("bridge.presentFrame(frameId, correlationId, submissionId)");
+		int execution = coordinator.indexOf("RustGalTerrainRenderer.recordExecutedStaticTerrainInstances(", present);
+		int capture = coordinator.indexOf("writeWholeFrameAttachmentCorrelation(", present);
+		assertTrue(present >= 0 && execution > present && capture > execution);
+		String source = Files.readString(Path.of("src/main/java/net/minecraft/client/dev/DeterministicCameraCapture.java"));
+		int method = source.indexOf("private static boolean captureWholeFrameFinalOutput()");
+		int evidence = source.indexOf("recordRustFinalOutputCaptureCoverage(", method);
+		assertTrue(evidence > method && evidence < source.indexOf("Files.copy(source, currentScreenshotPath", method));
+		String diagnostics = Files.readString(Path.of("src/main/java/net/sodium/client/render/StaticTerrainParityDiagnostics.java"));
+		assertTrue(diagnostics.contains("latestRustExecutionBackendFrameId != backendFrameId"));
+	}
+
+	@Test
 	void captureCompletionDoesNotTruncateTheIndependentFrameSampleWindow() throws Exception {
 		String capture = Files.readString(Path.of("src/main/java/net/minecraft/client/dev/DeterministicCameraCapture.java"));
 		String benchmark = Files.readString(Path.of("src/main/java/net/minecraft/client/dev/GraphicsFrameBenchmark.java"));

@@ -144,7 +144,10 @@ public final class GuiItemMeshSemanticCollector {
 			for (GuiItemMeshQuad quad : quads) {
 				glintQuads.add(glintQuad(quad, glint.assetId()));
 			}
-			output.add(new GuiItemMeshLayer(MaterialMode.GLINT, false, modelTransform, glintQuads));
+			output.add(new GuiItemMeshLayer(MaterialMode.GLINT, false, modelTransform, glintQuads,
+				new net.vulkanic.bridge.VulkanicGalBridge.StandardItemFoilRecord(Util.getMillis(),
+					Minecraft.getInstance().options.glintSpeed().get(),
+					Minecraft.getInstance().options.glintStrength().get().floatValue())));
 		} else if (layer.foilType() == ItemStackRenderState.FoilType.SPECIAL) {
 			RustGalGuiRawImageAssets.Asset glint = RustGalGuiRawImageAssets.resolve(ItemRenderer.ENCHANTED_GLINT_ITEM);
 			List<GuiItemMeshQuad> glintQuads = new ArrayList<>(quads.size());
@@ -178,30 +181,13 @@ public final class GuiItemMeshSemanticCollector {
 		return new Vector3f((byte)(packed & 0xff) / 127.0F, (byte)((packed >>> 8) & 0xff) / 127.0F, (byte)((packed >>> 16) & 0xff) / 127.0F);
 	}
 
-	/** Copies vanilla's time-varying GLINT texture matrix into semantic UVs. */
+	/** Copies the original geometry/UVs; native material preparation owns foil math. */
 	private static GuiItemMeshQuad glintQuad(GuiItemMeshQuad source, long glintAssetId) {
-		long ticks = (long)(Util.getMillis() * Minecraft.getInstance().options.glintSpeed().get() * 8.0);
-		float g = (float)(ticks % 110000L) / 110000.0F;
-		float h = (float)(ticks % 30000L) / 30000.0F;
-		float angle = (float)(Math.PI / 18.0);
-		float scale = 8.0F;
-		float cos = (float)Math.cos(angle) * scale;
-		float sin = (float)Math.sin(angle) * scale;
-		float[] atlasUvs = source.atlasUvs();
-		float[] glintUvs = new float[8];
-		for (int vertex = 0; vertex < 4; vertex++) {
-			float u = atlasUvs[vertex * 2];
-			float v = atlasUvs[vertex * 2 + 1];
-			glintUvs[vertex * 2] = cos * u - sin * v - g;
-			glintUvs[vertex * 2 + 1] = sin * u + cos * v + h;
-		}
-		int strength = Mth.clamp((int)Math.round(Minecraft.getInstance().options.glintStrength().get() * 255.0F), 0, 255);
 		int[] colors = new int[] {
-			ARGB.color(strength, 255, 255, 255), ARGB.color(strength, 255, 255, 255),
-			ARGB.color(strength, 255, 255, 255), ARGB.color(strength, 255, 255, 255)
+			0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff
 		};
-		return new GuiItemMeshQuad(glintAssetId, "minecraft:glint", source.positions(), glintUvs,
-			glintUvs, colors, source.packedNormals(), source.lightFace(), false);
+		return new GuiItemMeshQuad(glintAssetId, "minecraft:glint", source.positions(), source.atlasUvs(),
+			source.localUvs(), colors, source.packedNormals(), source.lightFace(), false);
 	}
 
 	private static MaterialMode materialMode(RenderType renderType) {
@@ -364,8 +350,13 @@ public final class GuiItemMeshSemanticCollector {
 		}
 	}
 
-	public record GuiItemMeshLayer(MaterialMode materialMode, boolean blockLight, float[] modelTransform, List<GuiItemMeshQuad> quads) {
+	public record GuiItemMeshLayer(MaterialMode materialMode, boolean blockLight, float[] modelTransform, List<GuiItemMeshQuad> quads,
+		net.vulkanic.bridge.VulkanicGalBridge.StandardItemFoilRecord itemFoil) {
+		public GuiItemMeshLayer(MaterialMode materialMode, boolean blockLight, float[] modelTransform, List<GuiItemMeshQuad> quads) {
+			this(materialMode, blockLight, modelTransform, quads, null);
+		}
 		public GuiItemMeshLayer {
+			if (itemFoil != null && materialMode != MaterialMode.GLINT) throw new IllegalArgumentException("foil requires glint layer");
 			modelTransform = checkedCopy(modelTransform, 16, "GUI item model transform");
 			quads = List.copyOf(quads);
 		}

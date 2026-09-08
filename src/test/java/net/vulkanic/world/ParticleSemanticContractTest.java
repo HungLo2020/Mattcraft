@@ -14,6 +14,45 @@ final class ParticleSemanticContractTest {
 		net.minecraft.server.Bootstrap.bootStrap();
 	}
 	@Test
+	void signedAndZeroParticleSizesPreserveVanillaGeometry() throws Exception {
+		var validate = RustGalWorldPrimitiveRenderer.class.getDeclaredMethod("validateParticleQuadSemantics",
+			net.minecraft.resources.ResourceLocation.class, float.class, float.class, float.class,
+			float.class, float.class, float.class, float.class, float.class,
+			float.class, float.class, float.class, float.class);
+		validate.setAccessible(true);
+		var vertices = RustGalWorldPrimitiveRenderer.class.getDeclaredMethod("billboardVertices",
+			org.joml.Quaternionf.class, float.class, float.class, float.class, float.class, float[].class);
+		vertices.setAccessible(true);
+		String property = net.vulkanic.bridge.RustGalVulkanWholeFrameMode.propertyName();
+		String previous = System.getProperty(property);
+		try {
+			System.setProperty(property, "true");
+			for (float size : new float[] {0.25F, 0F, -0.0F, -0.012F, -0.25F}) {
+				validate.invoke(null, null, 1F, 2F, 3F, 0F, 0F, 0F, 1F, size, 0F, 1F, 0F, 1F);
+				var state = new net.minecraft.client.renderer.state.QuadParticleRenderState();
+				state.add(net.minecraft.client.particle.SingleQuadParticle.Layer.OPAQUE,
+					1, 2, 3, 0, 0, 0, 1, size, 0, 1, 0, 1, -1, 240);
+				float[] result = new float[12];
+				vertices.invoke(null, new org.joml.Quaternionf(), 1F, 2F, 3F, size, result);
+				// Frozen's ordinary quad corners are scaled with the signed size,
+				// never clamped, discarded, or replaced by its absolute value.
+				org.junit.jupiter.api.Assertions.assertArrayEquals(new float[] {
+					1 + size, 2 - size, 3, 1 + size, 2 + size, 3,
+					1 - size, 2 + size, 3, 1 - size, 2 - size, 3}, result, 1e-7F);
+			}
+			for (float size : new float[] {Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY}) {
+				org.junit.jupiter.api.Assertions.assertThrows(java.lang.reflect.InvocationTargetException.class,
+					() -> validate.invoke(null, null, 1F, 2F, 3F, 0F, 0F, 0F, 1F, size, 0F, 1F, 0F, 1F));
+				var state = new net.minecraft.client.renderer.state.QuadParticleRenderState();
+				org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+					() -> state.add(net.minecraft.client.particle.SingleQuadParticle.Layer.OPAQUE,
+						1, 2, 3, 0, 0, 0, 1, size, 0, 1, 0, 1, -1, 240));
+			}
+		} finally {
+			if (previous == null) System.clearProperty(property); else System.setProperty(property, previous);
+		}
+	}
+	@Test
 	void terrainParticleAtlasBindingPreservesAtlasRatherThanSpriteLocalCoordinates() throws Exception {
 		String source = Files.readString(Path.of("src/main/java/net/minecraft/client/particle/TerrainParticle.java"));
 		int enqueue = source.indexOf("boolean enqueueRustGal(");

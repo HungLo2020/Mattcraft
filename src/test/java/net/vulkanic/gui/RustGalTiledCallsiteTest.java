@@ -115,7 +115,7 @@ class RustGalTiledCallsiteTest {
         System.setProperty("net.bytebuddy.experimental", "true");
         System.setProperty(property, "true");
         try {
-            net.minecraft.SharedConstants.setVersion(net.minecraft.DetectedVersion.BUILT_IN);
+            net.minecraft.SharedConstants.tryDetectVersion();
             net.minecraft.server.Bootstrap.bootStrap();
             Minecraft minecraft = mock(Minecraft.class);
             when(minecraft.getAtlasManager()).thenReturn(mock(AtlasManager.class));

@@ -1,7 +1,5 @@
 package net.vulkanic.gui;
 
-import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
@@ -11,7 +9,6 @@ import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import javax.imageio.ImageIO;
 import net.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
@@ -22,6 +19,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceProvider;
 import net.minecraft.util.ARGB;
+import net.minecraft.util.PngInfo;
 import net.vulkanic.bridge.VulkanicGalBridge;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.system.MemoryUtil;
@@ -571,25 +569,23 @@ public final class RustGalGuiRawImageAssets {
 	}
 
 	@Nullable
-	private static Asset decode(ResourceLocation resourceId, byte[] encoded, int maximumPixels) {
+	static Asset decode(ResourceLocation resourceId, byte[] encoded, int maximumPixels) {
 		try {
-			BufferedImage image = ImageIO.read(new ByteArrayInputStream(encoded));
-			if (image == null || image.getWidth() <= 0 || image.getHeight() <= 0
-				|| (long)image.getWidth() * image.getHeight() > maximumPixels) {
+			PngInfo info = PngInfo.fromBytes(encoded);
+			if (info.width() <= 0 || info.height() <= 0
+				|| (long)info.width() * info.height() > maximumPixels) {
 				return null;
 			}
-			byte[] pixels = new byte[Math.multiplyExact(Math.multiplyExact(image.getWidth(), image.getHeight()), 4)];
-			for (int y = 0; y < image.getHeight(); y++) {
-				for (int x = 0; x < image.getWidth(); x++) {
-					int argb = image.getRGB(x, y);
-					int offset = (y * image.getWidth() + x) * 4;
-					pixels[offset] = (byte)ARGB.red(argb);
-					pixels[offset + 1] = (byte)ARGB.green(argb);
-					pixels[offset + 2] = (byte)ARGB.blue(argb);
-					pixels[offset + 3] = (byte)ARGB.alpha(argb);
-				}
+			// Use the same CPU PNG decoding as vanilla sprite loading. AWT's
+			// getRGB converts grayscale samples through a color space (e.g. 128
+			// becomes 188), changing the material before Rust ever sees it.
+			// This copies bytes only: no Java GPU object or rendering operation.
+			try (NativeImage image = NativeImage.read(encoded)) {
+				if (image.getWidth() != info.width() || image.getHeight() != info.height()) return null;
+				byte[] pixels = new byte[Math.multiplyExact(Math.multiplyExact(image.getWidth(), image.getHeight()), 4)];
+				MemoryUtil.memByteBuffer(image.getPointer(), pixels.length).get(pixels);
+				return new Asset(assetId(resourceId.toString()), resourceId.toString(), image.getWidth(), image.getHeight(), pixels);
 			}
-			return new Asset(assetId(resourceId.toString()), resourceId.toString(), image.getWidth(), image.getHeight(), pixels);
 		} catch (IOException | ArithmeticException error) {
 			return null;
 		}
@@ -644,7 +640,7 @@ public final class RustGalGuiRawImageAssets {
 		return total;
 	}
 
-	private static long assetId(String identity) {
+	static long assetId(String identity) {
 		synchronized (LOCK) {
 		long hash = 0xcbf29ce484222325L;
 		for (int i = 0; i < identity.length(); i++) {

@@ -22,7 +22,7 @@ class AtlasAnimationVisibilityTest {
 
     @Test
     void resourceUsesAccumulateAcrossFramesAndDetachAtTickBoundary() {
-        var visibility = new AtlasAnimationVisibility(source(sprite(5, "block/water"), sprite(2, "block/lava")));
+        var visibility = new AtlasAnimationVisibility(ATLAS, source(sprite(5, "block/water"), sprite(2, "block/lava")));
         assertFalse(visibility.recordUse(name("textures/atlas/particles.png"), name("block/water")), "foreign atlas must not activate an identically named sprite");
         assertTrue(visibility.recordUse(ATLAS, name("block/water")));
         assertFalse(visibility.recordUse(ATLAS, name("block/water")), "duplicate layers/frames must not duplicate an ID");
@@ -38,15 +38,15 @@ class AtlasAnimationVisibilityTest {
 
     @Test
     void replacementStartsEmptyAndAmbiguousResourceIdentitiesReject() {
-        var old = new AtlasAnimationVisibility(source(sprite(1, "block/water")));
+        var old = new AtlasAnimationVisibility(ATLAS, source(sprite(1, "block/water")));
         old.recordUse(ATLAS, name("block/water"));
-        var replacement = new AtlasAnimationVisibility(source(sprite(9, "block/water")));
+        var replacement = new AtlasAnimationVisibility(ATLAS, source(sprite(9, "block/water")));
         assertArrayEquals(new int[0], replacement.takeUses());
         replacement.recordUse(ATLAS, name("block/water"));
         assertArrayEquals(new int[]{9}, replacement.takeUses());
-        assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationVisibility(
+        assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationVisibility(ATLAS,
             source(sprite(1, "block/water"), sprite(1, "block/lava"))));
-        assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationVisibility(
+        assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationVisibility(ATLAS,
             source(sprite(1, "block/water"), sprite(2, "block/water"))));
     }
 }

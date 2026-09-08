@@ -18,9 +18,9 @@ fn mark_renderable_fluid_sprite<S: NativeFluidFaceSink>(
     still: bool,
     overlay: bool,
 ) {
-    if state.fluid_type == FLUID_WATER {
-        sink.mark_fluid_sprite(fluid_sprite_mask(state.fluid_type, still, overlay));
-    }
+    // Usage is geometry semantics, not backend admission. Every emitted
+    // supported fluid face must declare the sprite it actually samples.
+    sink.mark_fluid_sprite(fluid_sprite_mask(state.fluid_type, still, overlay));
 }
 
 pub(in crate::render::chunk::meshing) unsafe fn emit_native_section_fluid_faces(
@@ -138,7 +138,7 @@ pub(in crate::render::chunk::meshing) fn native_section_fluid_faces_to_sink<
             .add_optional_stage(PROFILE_FLUID_CORNER_HEIGHT_USE, corner_started);
         heights
     };
-    let cull_down = cull_down || !fluid_side_exposed(block, states, 0, 0, -1, 0.8888889);
+    let cull_down = cull_down || !fluid_side_exposed(block, states, 0, -1, 0, 0.8888889);
     let lighting_tint_started = profile_start(profile_fluid_substages);
     let color = argb_to_abgr(native_tint_color(block, state, true));
     let light = get_emissive_lightmap(block.light_words[13]);

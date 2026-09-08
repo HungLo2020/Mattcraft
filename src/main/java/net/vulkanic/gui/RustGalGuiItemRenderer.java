@@ -865,31 +865,103 @@ public final class RustGalGuiItemRenderer {
 			return List.of();
 		}
 		List<FlatQuad> quads = new ArrayList<>();
+		if (Boolean.getBoolean("mattmc.dev.rustGalGuiItemFoil")
+			&& Boolean.getBoolean("mattmc.dev.rustGalGuiAtlasItems")) {
+			boolean[] foil = {false};
+			item.itemStackRenderState().forEachSemanticLayer(layer -> {
+				if (layer.foilType() != ItemStackRenderState.FoilType.NONE) foil[0] = true;
+			});
+			if (foil[0]) return tryEnqueueNativeFlatFoil(item, guiWidth, guiHeight, dynamicLayerOrder);
+		}
 		String[] rejected = new String[1];
+		List<VulkanicGalBridge.GuiItemRasterLayerRecord> rasterLayers = new ArrayList<>();
+		float[] rasterPlane = {Float.NaN};
 		item.itemStackRenderState().forEachSemanticLayer(layer -> {
 			if (rejected[0] != null) {
 				return;
 			}
+			int first = quads.size();
 			rejected[0] = appendSupportedLayer(item, layer, quads);
+			if (rejected[0] == null) {
+				for (FlatQuad quad : quads.subList(first, quads.size())) {
+					if (!(quad.source() instanceof GuiItemTextureSource.Atlas)) continue;
+					var geometry = boundedItemRasterGeometry(quad.localX0(), quad.localY0(),
+						quad.localX1(), quad.localY1(), quad.localX3(), quad.localY3());
+					try {
+						if (geometry == null) throw new IllegalArgumentException("unbounded geometry");
+						rasterLayers.add(new VulkanicGalBridge.GuiItemRasterLayerRecord(quad.source().assetId(),
+							quad.colorArgb(), flatItemMaterial(layer.renderType().pipeline()), geometry,
+							quad.u0(), quad.v0(), quad.u1(), quad.v1(), layer.modelTransform()));
+					} catch (IllegalArgumentException invalid) {
+						rejected[0] = "private-item-raster-invalid-layer";
+						return;
+					}
+				}
+				if (rasterLayers.size() > 64) { rejected[0] = "private-item-raster-layer-bound"; return; }
+				if (quads.size() > first && quads.get(first).source() instanceof GuiItemTextureSource.Atlas) {
+					for (BakedQuad face : layer.quads()) {
+						if (face.direction() != net.minecraft.core.Direction.SOUTH) continue;
+						BakedQuadView view = (BakedQuadView)(Object)face;
+						for (int vertex = 0; vertex < 4; vertex++) {
+							float z = view.getZ(vertex);
+							if (!Float.isFinite(z) || (!Float.isNaN(rasterPlane[0]) && z != rasterPlane[0])) {
+								rejected[0] = "private-item-raster-noncoplanar-layers";
+								return;
+							}
+							rasterPlane[0] = z;
+						}
+					}
+				}
+			}
 		});
 		if (rejected[0] != null || quads.isEmpty()) {
 			recordDiagnostic(rejected[0] == null ? "empty-flat-geometry" : rejected[0]);
 			return List.of();
 		}
 
+		boolean atlasItem = !rasterLayers.isEmpty();
+		if (atlasItem) {
+			if (rasterLayers.size() != quads.size()) {
+				recordDiagnostic("private-item-raster-mixed-source-layers");
+				return List.of();
+			}
+			// Only admitted item draws publish use. Rust selects and uploads the
+			// animation frame; this callsite supplies no Java ticker/GPU state.
+			item.itemStackRenderState().forEachSemanticLayer(layer -> {
+				for (BakedQuad face : layer.quads()) {
+					if (face.direction() == net.minecraft.core.Direction.SOUTH) {
+						TextureAtlasSprite sprite = ((BakedQuadView)(Object)face).getSprite();
+						net.vulkanic.world.RustGalWorldPrimitiveRenderer.recordAtlasSpriteUse(
+							sprite.semanticAnimationResource(), sprite.atlasLocation(), sprite.contents().name());
+					}
+				}
+			});
+		}
 		List<RustGalGuiElementRenderState> elements = new ArrayList<>(quads.size());
 		long startedNanos = System.nanoTime();
 		int requestLayerOrder = dynamicLayerOrder == null ? GuiRenderStratum.GUI_ITEM.order()
 			: RustGalGuiRenderer.dynamicLayerOrder(dynamicLayerOrder);
-		for (FlatQuad quad : quads) {
+		for (FlatQuad quad : atlasItem ? List.of(quads.getFirst()) : quads) {
+			// Composite the whole item cell; the separate authored local corners
+			// determine which part of that cell Rust rasterizes.
+			float[] p0 = atlasItem ? guiPoint(item, 0, 1) : new float[] {quad.x0(),quad.y0()};
+			float[] p1 = atlasItem ? guiPoint(item, 1, 1) : new float[] {quad.x1(),quad.y1()};
+			float[] p3 = atlasItem ? guiPoint(item, 0, 0) : new float[] {quad.x3(),quad.y3()};
 			VulkanicGalBridge.GuiAffineQuadRecord request = new VulkanicGalBridge.GuiAffineQuadRecord(
 				requestLayerOrder,
-				quad.asset().assetId(),
-				quad.x0(), quad.y0(), quad.x1(), quad.y1(), quad.x3(), quad.y3(),
+				quad.source().assetId(),
+				p0[0], p0[1], p1[0], p1[1], p3[0], p3[1],
 				0.0F,
 				quad.u0(), quad.v0(), quad.u1(), quad.v1(),
 				quad.colorArgb(), guiWidth, guiHeight
 			);
+			if (quad.source() instanceof GuiItemTextureSource.Atlas) {
+				request = request.withMaterialMode(rasterLayers.getFirst().materialMode())
+					.withItemRasterScale(Minecraft.getInstance().getWindow().getGuiScale())
+					.withItemRasterGeometry(boundedItemRasterGeometry(quad.localX0(), quad.localY0(),
+						quad.localX1(), quad.localY1(), quad.localX3(), quad.localY3()));
+				request = request.withItemRasterLayers(rasterLayers);
+			}
 			if (quad.clipWidth() != 0 || quad.clipHeight() != 0) {
 				request = request.withClip(quad.clipLeft(), quad.clipTop(), quad.clipWidth(), quad.clipHeight());
 			}
@@ -898,7 +970,8 @@ public final class RustGalGuiItemRenderer {
 				: RustGalFrameCoordinator.enqueueGuiAffineQuadRequest(
 					request, RustGalGuiRenderer.dynamicLayerId(dynamicLayerOrder),
 					requestLayerOrder, startedNanos);
-			RustGalGuiRawImageAssets.stage(quad.asset());
+			if (atlasItem) quads.forEach(layer -> layer.source().stage());
+			else quad.source().stage();
 			int left = Math.max(0, (int)Math.floor(Math.min(request.x0(), Math.min(request.x1(), request.x3()))));
 			int top = Math.max(0, (int)Math.floor(Math.min(request.y0(), Math.min(request.y1(), request.y3()))));
 			int right = Math.min(guiWidth, (int)Math.ceil(Math.max(request.x0(), Math.max(request.x1(), request.x3()))));
@@ -967,13 +1040,14 @@ public final class RustGalGuiItemRenderer {
 				batches.add(new VulkanicGalBridge.GuiMeshBatchRecord(
 					requestLayerOrder, batchLayerIndex++,
 					guiMaterialMode(layer.materialMode()),
-					layer.blockLight() ? 2 : 1, quad.assetId(), 0L,
+					// Ordinary inventory light space; Rust owns the light vectors.
+					layer.blockLight() ? VulkanicGalBridge.GUI_MESH_LIGHTING_INVENTORY_BLOCK : 1, quad.assetId(), 0L,
 					(layer.materialMode() == GuiItemMeshSemanticCollector.MaterialMode.CUTOUT
 						|| layer.materialMode() == GuiItemMeshSemanticCollector.MaterialMode.GLINT) ? 0.1F : 0.0F,
 					layer.modelTransform(), mesh.guiPose(), mesh.left(), mesh.top(), mesh.right(), mesh.bottom(),
 					guiWidth, guiHeight, mesh.renderWidth(), mesh.renderHeight(), mesh.guardPixels(),
 					vertices, List.of(0, 1, 2, 2, 3, 0)
-				));
+				).withItemFoil(layer.itemFoil()));
 			}
 		}
 		if (batches.isEmpty()) return List.of();
@@ -989,6 +1063,47 @@ public final class RustGalGuiItemRenderer {
 			token, GuiRenderStratum.GUI_ITEM, "minecraft.gui.item.standard3d", -1, -1.0F, GuiFillDirection.NONE,
 			mesh.left(), mesh.top(), mesh.right() - mesh.left(), mesh.bottom() - mesh.top(), guiWidth, guiHeight
 		));
+	}
+
+	private static List<RustGalGuiElementRenderState> tryEnqueueNativeFlatFoil(
+		GuiItemRenderState item, int guiWidth, int guiHeight, @Nullable Integer dynamicLayerOrder) {
+		int order = dynamicLayerOrder == null ? GuiRenderStratum.GUI_ITEM.order() : RustGalGuiRenderer.dynamicLayerOrder(dynamicLayerOrder);
+		GuiFlatItemMeshCollector.Snapshot snapshot;
+		try {
+			var options = Minecraft.getInstance().options;
+			snapshot = GuiFlatItemMeshCollector.collect(item, guiWidth, guiHeight,
+				Minecraft.getInstance().getWindow().getGuiScale(), order,
+				new VulkanicGalBridge.StandardItemFoilRecord(net.minecraft.Util.getMillis(), options.glintSpeed().get(), options.glintStrength().get().floatValue()));
+		} catch (IllegalArgumentException | IllegalStateException rejection) {
+			recordDiagnostic("flat-mesh-rejected:" + rejection.getMessage());
+			return List.of();
+		}
+		long startedNanos = System.nanoTime();
+		var token = dynamicLayerOrder == null
+			? RustGalFrameCoordinator.enqueueGuiMeshItemRequest(snapshot.batches(), GuiRenderStratum.GUI_ITEM, startedNanos)
+			: RustGalFrameCoordinator.enqueueGuiMeshItemRequest(snapshot.batches(), RustGalGuiRenderer.dynamicLayerId(dynamicLayerOrder), order, startedNanos);
+		snapshot.sources().forEach(GuiItemTextureSource::stage);
+		for (var batch : snapshot.batches()) {
+			var foil = batch.itemFoil();
+			if (foil != null) {
+				net.minecraft.client.dev.GraphicsAuditGuiFoilTiming.observeSemanticClock(
+					item.x(), item.y(), foil.clockMillis(), foil.speed(), foil.strength());
+				// Every face in this immutable item snapshot uses the same
+				// supplied foil payload; observe the item once, not each face.
+				break;
+			}
+		}
+		item.itemStackRenderState().forEachSemanticLayer(layer -> {
+			for (BakedQuad face : layer.quads()) {
+				net.minecraft.client.dev.GraphicsAuditGuiFoilSource.record(face);
+				var sprite = ((BakedQuadView)(Object)face).getSprite();
+				net.vulkanic.world.RustGalWorldPrimitiveRenderer.recordAtlasSpriteUse(
+					sprite.semanticAnimationResource(), sprite.atlasLocation(), sprite.contents().name());
+			}
+		});
+		recordDiagnostic("flat-mesh-accepted-layers=" + snapshot.batches().size());
+		return List.of(new RustGalGuiElementRenderState(token, GuiRenderStratum.GUI_ITEM, "minecraft.gui.item.flat-foil",
+			-1, -1.0F, GuiFillDirection.NONE, item.x(), item.y(), 16, 16, guiWidth, guiHeight));
 	}
 
 	private static int guiMaterialMode(GuiItemMeshSemanticCollector.MaterialMode mode) {
@@ -1011,7 +1126,10 @@ public final class RustGalGuiItemRenderer {
 	) {
 		if (layer.hasSpecialRenderer()) return "special-renderer";
 		if (layer.usesBlockLight()) return "block-light";
-		if (!layer.identityTransform()) return "non-identity-transform";
+		boolean atlasItems = Boolean.getBoolean("mattmc.dev.rustGalGuiAtlasItems")
+			&& net.vulkanic.world.WorldRenderRoutePolicy.currentMaterialRoute().usesRustWholeFrameVulkan();
+		if (!layer.identityTransform() && !(atlasItems && Boolean.getBoolean("mattmc.dev.rustGalGuiItemTransforms")))
+			return "non-identity-transform";
 		if (layer.foilType() == ItemStackRenderState.FoilType.SPECIAL) {
 			RustGalGuiRawImageAssets.Asset glint = RustGalGuiRawImageAssets.resolve(ItemRenderer.ENCHANTED_GLINT_ITEM);
 			if (glint == null) return "glint-texture-unavailable";
@@ -1019,15 +1137,18 @@ public final class RustGalGuiItemRenderer {
 		if (layer.renderType() == null || layer.quads().isEmpty()) return "empty-or-missing-render-type";
 		if (!supportedGuiRenderType(layer.renderType())) return "render-type";
 
-		BakedQuad selected = null;
+		if (atlasItems && layer.foilType() != ItemStackRenderState.FoilType.NONE) return "private-item-raster-foil-unavailable";
+		List<BakedQuad> selected = new ArrayList<>();
 		for (BakedQuad candidate : layer.quads()) {
 			if (candidate.direction() == net.minecraft.core.Direction.SOUTH) {
-				if (selected != null) return "multiple-front-quads";
-				selected = candidate;
+				if (!atlasItems && !selected.isEmpty()) return "multiple-front-quads";
+				if (selected.size() == 64) return "private-item-raster-layer-bound";
+				selected.add(candidate);
 			}
 		}
-		if (selected == null) return "missing-front-quad";
-		FlatQuad quad = copyFlatQuad(item, selected, layer.tintLayers());
+		if (selected.isEmpty()) return "missing-front-quad";
+		for (BakedQuad face : selected) {
+		FlatQuad quad = copyFlatQuad(item, face, layer.tintLayers());
 		if (quad == null) return "non-planar-or-nonuniform-quad";
 		output.add(quad);
 		if (layer.foilType() == ItemStackRenderState.FoilType.STANDARD) {
@@ -1037,6 +1158,7 @@ public final class RustGalGuiItemRenderer {
 		} else if (layer.foilType() == ItemStackRenderState.FoilType.SPECIAL) {
 			RustGalGuiRawImageAssets.Asset glint = RustGalGuiRawImageAssets.resolve(ItemRenderer.ENCHANTED_GLINT_ITEM);
 			output.add(specialFoilQuad(quad, glint));
+		}
 		}
 		return null;
 	}
@@ -1050,7 +1172,7 @@ public final class RustGalGuiItemRenderer {
 		float u3 = -source.localX3() * scale;
 		float v3 = -source.localY3() * scale;
 		int strength = Mth.clamp((int)Math.round(Minecraft.getInstance().options.glintStrength().get() * 255.0F), 0, 255);
-		return new FlatQuad(glint, source.x0(), source.y0(), source.x1(), source.y1(), source.x3(), source.y3(),
+		return new FlatQuad(new GuiItemTextureSource.Raw(glint), source.x0(), source.y0(), source.x1(), source.y1(), source.x3(), source.y3(),
 			u0, v0, u1, v1, ARGB.color(strength, 255, 255, 255), source.clipLeft(), source.clipTop(),
 			source.clipWidth(), source.clipHeight(), u0, v0, u1, v1,
 			source.localX0(), source.localY0(), source.localX1(), source.localY1(), source.localX3(), source.localY3());
@@ -1069,26 +1191,42 @@ public final class RustGalGuiItemRenderer {
 		float glintU1 = cos * source.atlasU1() - sin * source.atlasV1() - g;
 		float glintV1 = sin * source.atlasU1() + cos * source.atlasV1() + h;
 		int strength = Mth.clamp((int)Math.round(Minecraft.getInstance().options.glintStrength().get() * 255.0F), 0, 255);
-		return new FlatQuad(glint, source.x0(), source.y0(), source.x1(), source.y1(), source.x3(), source.y3(),
+		return new FlatQuad(new GuiItemTextureSource.Raw(glint), source.x0(), source.y0(), source.x1(), source.y1(), source.x3(), source.y3(),
 			glintU0, glintV0, glintU1, glintV1, ARGB.color(strength, 255, 255, 255),
 			source.clipLeft(), source.clipTop(), source.clipWidth(), source.clipHeight(),
 			glintU0, glintV0, glintU1, glintV1,
 			source.localX0(), source.localY0(), source.localX1(), source.localY1(), source.localX3(), source.localY3());
 	}
 
-	private static boolean supportedGuiRenderType(RenderType renderType) {
-		String name = renderType.toString();
-		return name.contains("item") || name.contains("cutout") || name.contains("solid");
+	static boolean supportedGuiRenderType(RenderType renderType) {
+		return renderType != null && flatItemMaterial(renderType.pipeline()) != 0;
+	}
+
+	static int flatItemMaterial(net.blaze3d.pipeline.RenderPipeline pipeline) {
+		if (pipeline == net.minecraft.client.renderer.RenderPipelines.ITEM_ENTITY_TRANSLUCENT_CULL) return 1;
+		if (pipeline == net.minecraft.client.renderer.RenderPipelines.ENTITY_CUTOUT) return 2;
+		return 0;
 	}
 
 	private static FlatQuad copyFlatQuad(GuiItemRenderState item, BakedQuad bakedQuad, int[] tintLayers) {
 		if (!(bakedQuad instanceof BakedQuadView quad)) return null;
 		TextureAtlasSprite sprite = quad.getSprite();
 		if (sprite == null || sprite.contents().name() == null) return null;
-		RustGalGuiRawImageAssets.Asset asset = sprite.contents().isAnimated()
-			? RustGalGuiRawImageAssets.resolveAnimatedSprite(sprite)
-			: RustGalGuiRawImageAssets.resolve(sprite.contents().name());
-		if (asset == null) return null;
+		GuiItemTextureSource source;
+		if (Boolean.getBoolean("mattmc.dev.rustGalGuiAtlasItems")
+			&& net.vulkanic.world.WorldRenderRoutePolicy.currentMaterialRoute().usesRustWholeFrameVulkan()) {
+			var region = net.vulkanic.world.RustGalTerrainRenderer.requireGuiAtlasSpritePayload(sprite);
+			long assetId = RustGalGuiRawImageAssets.assetId("gui-atlas-region:" + sprite.atlasLocation()
+				+ ":" + sprite.contents().name());
+			source = new GuiItemTextureSource.Atlas(new GuiAtlasRegion(assetId, region.texture(),
+				region.atlasWidth(), region.atlasHeight(), region.x(), region.y(), region.width(), region.height()));
+		} else {
+			RustGalGuiRawImageAssets.Asset asset = sprite.contents().isAnimated()
+				? RustGalGuiRawImageAssets.resolveAnimatedSprite(sprite)
+				: RustGalGuiRawImageAssets.resolve(sprite.contents().name());
+			if (asset == null) return null;
+			source = new GuiItemTextureSource.Raw(asset);
+		}
 		int tint = itemTint(bakedQuad, tintLayers);
 		int color = shadedColor(quad.getColor(0), tint);
 		for (int index = 1; index < 4; index++) {
@@ -1098,11 +1236,28 @@ public final class RustGalGuiItemRenderer {
 		int origin = findUvVertex(quad, sprite, true, true);
 		int axisU = findUvVertex(quad, sprite, false, true);
 		int axisV = findUvVertex(quad, sprite, true, false);
-		if (origin < 0 || axisU < 0 || axisV < 0) return null;
+		if (origin < 0 || axisU < 0 || axisV < 0 || origin == axisU || origin == axisV || axisU == axisV) return null;
+		int diagonal = 6 - origin - axisU - axisV;
+		// The explicit affine primitive reconstructs its fourth corner. Never
+		// silently change a baked trapezoid or skewed UV mapping into that shape.
+		if (!affineFourthCorner(quad.getX(origin),quad.getY(origin),quad.getX(axisU),quad.getY(axisU),
+			quad.getX(diagonal),quad.getY(diagonal),quad.getX(axisV),quad.getY(axisV))
+			|| quad.getTexV(axisU) != quad.getTexV(origin)
+			|| quad.getTexU(axisV) != quad.getTexU(origin)
+			|| quad.getTexU(diagonal) != quad.getTexU(axisU)
+			|| quad.getTexV(diagonal) != quad.getTexV(axisV)) return null;
 		float u0 = localU(sprite, quad.getTexU(origin));
 		float v0 = localV(sprite, quad.getTexV(origin));
 		float u1 = localU(sprite, quad.getTexU(axisU));
 		float v1 = localV(sprite, quad.getTexV(axisV));
+		if (source instanceof GuiItemTextureSource.Atlas) {
+			u0 = itemLocalUv(quad.getTexU(origin),sprite.getU0(),sprite.getU1());
+			v0 = itemLocalUv(quad.getTexV(origin),sprite.getV0(),sprite.getV1());
+			u1 = itemLocalUv(quad.getTexU(axisU),sprite.getU0(),sprite.getU1());
+			v1 = itemLocalUv(quad.getTexV(axisV),sprite.getV0(),sprite.getV1());
+			if (!Float.isFinite(u0) || !Float.isFinite(v0) || !Float.isFinite(u1) || !Float.isFinite(v1)
+				|| u0 < 0 || v0 < 0 || u1 > 1 || v1 > 1) return null;
+		}
 		float atlasU0 = quad.getTexU(origin);
 		float atlasV0 = quad.getTexV(origin);
 		float atlasU1 = quad.getTexU(axisU);
@@ -1113,15 +1268,49 @@ public final class RustGalGuiItemRenderer {
 		float[] p1 = guiPoint(item, quad.getX(axisU), quad.getY(axisU));
 		float[] p3 = guiPoint(item, quad.getX(axisV), quad.getY(axisV));
 		if (!finite(p0) || !finite(p1) || !finite(p3) || Math.abs(area(p0, p1, p3)) < 0.01F) return null;
+		if (Boolean.getBoolean("mattmc.dev.guiItemRasterTrace")) {
+			recordDiagnostic("affine-source sprite=" + sprite.contents().name()
+				+ " atlas=" + sprite.atlasLocation() + " region=" + sprite.getX() + "," + sprite.getY()
+				+ "," + sprite.contents().width() + "," + sprite.contents().height()
+				+ " sourceUv=" + Float.toHexString(atlasU0) + "," + Float.toHexString(atlasV0)
+				+ "," + Float.toHexString(atlasU1) + "," + Float.toHexString(atlasV1)
+				+ " localUv=" + Float.toHexString(u0) + "," + Float.toHexString(v0)
+				+ "," + Float.toHexString(u1) + "," + Float.toHexString(v1)
+				+ " points=" + java.util.Arrays.toString(p0) + java.util.Arrays.toString(p1) + java.util.Arrays.toString(p3));
+		}
 		ScreenRectangle scissor = item.scissorArea();
 		return new FlatQuad(
-			asset, p0[0], p0[1], p1[0], p1[1], p3[0], p3[1], u0, v0, u1, v1, color,
+			source, p0[0], p0[1], p1[0], p1[1], p3[0], p3[1], u0, v0, u1, v1, color,
 			scissor == null ? 0 : scissor.left(),
 			scissor == null ? 0 : scissor.top(),
 			 scissor == null ? 0 : scissor.width(),
 			 scissor == null ? 0 : scissor.height(), atlasU0, atlasV0, atlasU1, atlasV1,
 			quad.getX(origin), quad.getY(origin), quad.getX(axisU), quad.getY(axisU), quad.getX(axisV), quad.getY(axisV)
 		);
+	}
+
+	/** Copies model-local corners; no geometry is inferred from screen state. */
+	static boolean affineFourthCorner(float x0, float y0, float x1, float y1,
+		float x2, float y2, float x3, float y3) {
+		for (float value : new float[] {x0,y0,x1,y1,x2,y2,x3,y3})
+			if (!Float.isFinite(value)) return false;
+		float expectedX = x1+x3-x0, expectedY = y1+y3-y0;
+		// Baked rotations and reconstruction round in different orders. Allow
+		// only float arithmetic error, not a geometric approximation tolerance.
+		float magnitude = Math.max(1.0F, Math.max(Math.abs(expectedX),Math.abs(expectedY)));
+		return Float.isFinite(expectedX) && Float.isFinite(expectedY)
+			&& Math.abs(x2-expectedX) <= 8*Math.ulp(magnitude)
+			&& Math.abs(y2-expectedY) <= 8*Math.ulp(magnitude);
+	}
+
+	static VulkanicGalBridge.GuiItemRasterGeometryRecord boundedItemRasterGeometry(
+		float x0, float y0, float x1, float y1, float x3, float y3) {
+		try {
+			return new VulkanicGalBridge.GuiItemRasterGeometryRecord(x0*16, (1-y0)*16,
+				x1*16, (1-y1)*16, x3*16, (1-y3)*16);
+		} catch (IllegalArgumentException unsupportedGeometry) {
+			return null;
+		}
 	}
 
 	private static int findUvVertex(BakedQuadView quad, TextureAtlasSprite sprite, boolean minU, boolean minV) {
@@ -1209,6 +1398,11 @@ public final class RustGalGuiItemRenderer {
 		return ARGB.color(Mth.clamp(alpha, 0, 255), Mth.clamp(red, 0, 255), Mth.clamp(green, 0, 255), Mth.clamp(blue, 0, 255));
 	}
 
+	/** Exact semantic conversion; callers reject unsupported ranges, never clamp them. */
+	static float itemLocalUv(float coordinate, float start, float end) {
+		return (coordinate-start)/(end-start);
+	}
+
 	private static float localU(TextureAtlasSprite sprite, float atlasU) {
 		float width = sprite.getU1() - sprite.getU0();
 		return width == 0.0F ? 0.0F : Mth.clamp((atlasU - sprite.getU0()) / width, 0.0F, 1.0F);
@@ -1234,7 +1428,7 @@ public final class RustGalGuiItemRenderer {
 	}
 
 	private record FlatQuad(
-		RustGalGuiRawImageAssets.Asset asset,
+		GuiItemTextureSource source,
 		float x0, float y0, float x1, float y1, float x3, float y3,
 		float u0, float v0, float u1, float v1,
 		int colorArgb,

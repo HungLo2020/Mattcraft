@@ -9,10 +9,12 @@ import net.minecraft.resources.ResourceLocation;
 
 /** Collects immutable sprite-use semantics; does not select animation frames. */
 final class AtlasAnimationVisibility {
+    private final ResourceLocation atlas;
     private final Map<ResourceLocation, Integer> ids;
     private final TreeSet<Integer> used = new TreeSet<>();
 
-    AtlasAnimationVisibility(SemanticAtlasAnimationSource source) {
+    AtlasAnimationVisibility(ResourceLocation atlas, SemanticAtlasAnimationSource source) {
+        this.atlas = java.util.Objects.requireNonNull(atlas);
         if (source.sprites().size() > 16384) throw new IllegalArgumentException("Animation visibility bound exceeded");
         var mapping = new HashMap<ResourceLocation, Integer>();
         var uniqueIds = new HashSet<Integer>();
@@ -26,7 +28,7 @@ final class AtlasAnimationVisibility {
     }
 
     boolean recordUse(ResourceLocation atlas, ResourceLocation name) {
-        if (!net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS.equals(java.util.Objects.requireNonNull(atlas))) return false;
+        if (!this.atlas.equals(java.util.Objects.requireNonNull(atlas))) return false;
         // Uses of static sprites are valid but have no animation declaration.
         Integer id = ids.get(java.util.Objects.requireNonNull(name));
         return id != null && used.add(id);

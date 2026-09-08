@@ -2,7 +2,6 @@ package net.minecraft.worldedit.command;
 
 import com.mojang.brigadier.StringReader;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.synchronization.ArgumentTypeInfos;
@@ -31,7 +30,7 @@ class WorldEditReplacementCommandSyntaxTest {
 
     @BeforeAll
     static void bootstrapMinecraft() {
-        SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+        SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 

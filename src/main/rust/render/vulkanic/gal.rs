@@ -195,12 +195,12 @@ struct PendingDestroy {
 }
 
 #[derive(Clone, Debug)]
-struct TextureViewInfo {
-    texture: Handle,
-    format: TextureFormat,
-    extent: Extent3d,
-    range: TextureSubresourceRange,
-    usages: Vec<TextureUsage>,
+pub(super) struct TextureViewInfo {
+    pub(super) texture: Handle,
+    pub(super) format: TextureFormat,
+    pub(super) extent: Extent3d,
+    pub(super) range: TextureSubresourceRange,
+    pub(super) usages: Vec<TextureUsage>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3611,7 +3611,7 @@ impl VulkanicGal {
         }
     }
 
-    fn texture_view_info(&self, view: Handle) -> GalResult<TextureViewInfo> {
+    pub(super) fn texture_view_info(&self, view: Handle) -> GalResult<TextureViewInfo> {
         let view_record = self.texture_views.get(view)?;
         let texture_record = self.textures.get(view_record.desc.texture)?;
         Ok(TextureViewInfo {
@@ -3804,6 +3804,13 @@ impl VulkanicGal {
     }
 
     fn validate_texture_copy_region(&mut self, region: &TextureImageCopyRegion) -> GalResult<()> {
+        if region.row_order == super::commands::TextureRowOrder::Reverse
+            && !self.capabilities().supports(BackendFeature::TextureRowReversal)
+        {
+            return self.validation_error(GalError::unsupported_feature(
+                "backend does not support explicit texture row reversal",
+            ));
+        }
         if region.src_texture == region.dst_texture
             || region.extent.width == 0
             || region.extent.height == 0
@@ -3844,6 +3851,13 @@ impl VulkanicGal {
             return self.validation_error(GalError::command(
                 StatusCode::InvalidArgument,
                 "texture copy requires matching dimensions and formats",
+            ));
+        }
+        if region.row_order == super::commands::TextureRowOrder::Reverse
+            && src_dimension != TextureDimension::D2
+        {
+            return self.validation_error(GalError::unsupported_feature(
+                "texture row reversal currently requires D2 textures",
             ));
         }
         self.validate_texture_copy_box(
@@ -4179,6 +4193,21 @@ impl VulkanicGal {
     #[cfg(test)]
     pub(super) fn mock_backend(&self) -> Option<&super::backends::mock::MockBackend> {
         self.backend.as_any().downcast_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn sampler_descriptor_for_test(&self, handle: Handle) -> GalResult<&SamplerDesc> {
+        Ok(&self.samplers.get(handle)?.desc)
+    }
+
+    #[cfg(test)]
+    pub(super) fn resource_set_descriptor_for_test(&self, handle: Handle) -> GalResult<&ResourceSetDesc> {
+        Ok(&self.resource_sets.get(handle)?.desc)
+    }
+
+    #[cfg(test)]
+    pub(super) fn graphics_pipeline_descriptor_for_test(&self, handle: Handle) -> GalResult<&GraphicsPipelineDesc> {
+        Ok(&self.graphics_pipelines.get(handle)?.desc)
     }
 
     #[cfg(test)]

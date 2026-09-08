@@ -3146,6 +3146,7 @@ impl WorldLodSourceTargets {
             TextureUsageState::TransferDst,
         )));
         ops.push(CommandOp::CopyTexture(TextureImageCopyRegion {
+            row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
             src_texture: self.distant_depth_texture,
             src_mip: 0,
             src_layer: 0,
@@ -3214,6 +3215,7 @@ impl WorldLodSourceTargets {
             TextureUsageState::TransferDst,
         )));
         ops.push(CommandOp::CopyTexture(TextureImageCopyRegion {
+            row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
             src_texture: self.distant_depth_texture,
             src_mip: 0,
             src_layer: 0,
@@ -6849,6 +6851,7 @@ mod tests {
                     ..
                 }),
                 CommandOp::CopyTexture(TextureImageCopyRegion {
+                    row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
                     src_texture,
                     dst_texture,
                     extent: Extent3d { width: 320, height: 180, depth: 1 },

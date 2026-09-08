@@ -1,6 +1,5 @@
 package net.minecraft.worldedit.schematic;
 
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.Direction;
 import net.minecraft.server.Bootstrap;
@@ -27,7 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class SchematicHandlerTest {
     @BeforeAll
     static void bootstrapMinecraft() {
-        SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+        SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 

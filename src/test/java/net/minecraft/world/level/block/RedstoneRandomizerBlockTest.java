@@ -2,7 +2,6 @@ package net.minecraft.world.level.block;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.EmptyBlockGetter;
@@ -27,7 +26,7 @@ class RedstoneRandomizerBlockTest {
 
 	@BeforeAll
 	static void bootstrapMinecraft() {
-		SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+		SharedConstants.tryDetectVersion();
 		Bootstrap.bootStrap();
 	}
 

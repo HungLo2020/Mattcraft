@@ -1,4 +1,7 @@
 pub mod assets;
+pub(crate) mod vanilla_imports;
+pub(crate) mod vanilla_sources;
+pub(crate) mod engine_globals;
 pub mod cloud_contract;
 pub mod custom_uniform_policy;
 pub mod diagnostics;

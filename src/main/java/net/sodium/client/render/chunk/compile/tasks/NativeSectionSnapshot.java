@@ -184,18 +184,16 @@ final class NativeSectionSnapshot implements AutoCloseable {
         MemoryUtil.memPutInt(this.address + HEADER_ACTIVE_COUNT_OFFSET, this.activeRecordCount);
         int[] nativeQuads = this.buffers.appendCompactNativeSectionSnapshotAllPasses(this.address,
                 this.sectionIndex, collector);
-        boolean rustStaticTerrainRoute = net.vulkanic.world.WorldRenderRoutePolicy
-                .staticTerrainBuildRequiresRustWholeFrameMetadata();
-        this.addNativeFluidSprites(DefaultTerrainRenderPasses.SOLID, rustStaticTerrainRoute);
-        this.addNativeFluidSprites(DefaultTerrainRenderPasses.CUTOUT, rustStaticTerrainRoute);
-        this.addNativeFluidSprites(DefaultTerrainRenderPasses.TRANSLUCENT, rustStaticTerrainRoute);
+        this.addNativeFluidSprites(DefaultTerrainRenderPasses.SOLID);
+        this.addNativeFluidSprites(DefaultTerrainRenderPasses.CUTOUT);
+        this.addNativeFluidSprites(DefaultTerrainRenderPasses.TRANSLUCENT);
         return nativeQuads;
     }
 
-    private void addNativeFluidSprites(TerrainRenderPass pass, boolean rustStaticTerrainRoute) {
+    private void addNativeFluidSprites(TerrainRenderPass pass) {
         int emittedSpriteMask = this.buffers.nativeFluidSpriteMask(pass);
         for (var sprite : NativeStaticBlockModelRegistry.getNativeFluidSprites(
-                emittedSpriteMask, !rustStaticTerrainRoute)) {
+                emittedSpriteMask)) {
             this.buffers.get(pass).addSprite(sprite);
         }
     }
@@ -366,7 +364,7 @@ final class NativeSectionSnapshot implements AutoCloseable {
         return lightWord;
     }
 
-    private static int blockTint(LevelSlice slice, BlockState state, BlockPos pos) {
+    static int blockTint(net.minecraft.world.level.BlockAndTintGetter slice, BlockState state, BlockPos pos) {
         if (NativeMeshingDiagnostics.forceWhiteTint()) {
             return 0xFFFFFFFF;
         }
@@ -378,9 +376,11 @@ final class NativeSectionSnapshot implements AutoCloseable {
             return BiomeColors.getAverageGrassColor(slice, pos) | 0xFF000000;
         }
         if (block == Blocks.OAK_LEAVES || block == Blocks.JUNGLE_LEAVES || block == Blocks.ACACIA_LEAVES
-                || block == Blocks.DARK_OAK_LEAVES || block == Blocks.VINE || block == Blocks.MANGROVE_LEAVES
-                || block == Blocks.LEAF_LITTER) {
+                || block == Blocks.DARK_OAK_LEAVES || block == Blocks.VINE || block == Blocks.MANGROVE_LEAVES) {
             return BiomeColors.getAverageFoliageColor(slice, pos) | 0xFF000000;
+        }
+        if (block == Blocks.LEAF_LITTER) {
+            return BiomeColors.getAverageDryFoliageColor(slice, pos) | 0xFF000000;
         }
         if (block == Blocks.REDSTONE_WIRE) {
             return RedStoneWireBlock.getColorForPower(state.getValue(RedStoneWireBlock.POWER)) | 0xFF000000;

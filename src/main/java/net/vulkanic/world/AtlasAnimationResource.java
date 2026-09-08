@@ -6,6 +6,8 @@ import net.minecraft.resources.ResourceLocation;
 /** Resource-incarnation-owned semantic events, independent of native readiness. */
 public final class AtlasAnimationResource implements AutoCloseable {
     private final SemanticAtlasAnimationSource source;
+    private final int semanticTextureId;
+    private final ResourceLocation atlas;
     private final AtlasAnimationVisibility visibility;
     private final AtlasAnimationTickDelivery ticks;
     private boolean closed;
@@ -16,19 +18,27 @@ public final class AtlasAnimationResource implements AutoCloseable {
         return Boolean.getBoolean("mattmc.dev.rustGalAtlasAnimation");
     }
 
-    public AtlasAnimationResource(SemanticAtlasAnimationSource source) {
+    /** The ID names a semantic asset, never a Java or native GPU texture handle. */
+    public AtlasAnimationResource(ResourceLocation atlas, int semanticTextureId, SemanticAtlasAnimationSource source) {
+        if (semanticTextureId <= 0) throw new IllegalArgumentException("Invalid semantic atlas texture identity");
+        this.semanticTextureId = semanticTextureId;
+        this.atlas = java.util.Objects.requireNonNull(atlas);
         this.source = java.util.Objects.requireNonNull(source);
-        visibility = new AtlasAnimationVisibility(source);
-        ticks = new AtlasAnimationTickDelivery(
-            RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_TERRAIN_BLOCK_ATLAS, source.generation(), 0);
+        visibility = new AtlasAnimationVisibility(atlas, source);
+        ticks = new AtlasAnimationTickDelivery(semanticTextureId, source.generation(), 0);
     }
 
     public SemanticAtlasAnimationSource source() { return source; }
+    public int semanticTextureId() { return semanticTextureId; }
+    public ResourceLocation atlas() { return atlas; }
 
     /** Read-only capture evidence; this is not native acceptance or frame selection. */
     public synchronized long producedTickForDiagnostics() { return lastProducedTick; }
     public synchronized boolean producedTickNamedSpriteForDiagnostics(int spriteId) {
         return ticks.lastQueuedTickNamedSpriteForDiagnostics(spriteId);
+    }
+    public synchronized long lastNonemptyTickNamingSpriteForDiagnostics(int spriteId) {
+        return ticks.lastNonemptyTickNamingSpriteForDiagnostics(spriteId);
     }
 
     public synchronized boolean recordUse(ResourceLocation atlas, ResourceLocation name) {

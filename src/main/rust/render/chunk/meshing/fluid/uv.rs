@@ -38,7 +38,7 @@ pub(in crate::render::chunk::meshing) fn fluid_side_uses_overlay(
     let Some(neighbor) = state_by_id(states, neighbor_id) else {
         return false;
     };
-    (neighbor.flags & STATE_FLAG_AIR) == 0 && (neighbor.flags & STATE_FLAG_CAN_OCCLUDE) == 0
+    (neighbor.flags & STATE_FLAG_FLUID_OVERLAY_TRANSPARENT) != 0
 }
 
 pub(in crate::render::chunk::meshing) fn sprite_u(sprite: FluidSprite, value: f32) -> f32 {

@@ -2844,7 +2844,7 @@ def capture_linux_x11_window(target: str, screenshot_file: Path) -> bool:
     direct read succeeds, so a screenshot acknowledgement cannot be based on
     ImageMagick's implicit root-window fallback.
     """
-    if target == "root" or not shutil.which("xwd") or not shutil.which("magick"):
+    if target == "root" or not shutil.which("xwd"):
         return False
     raw_capture = screenshot_file.with_suffix(screenshot_file.suffix + ".xwd")
     try:
@@ -2855,13 +2855,18 @@ def capture_linux_x11_window(target: str, screenshot_file: Path) -> bool:
         ).returncode == 0
         if not captured or not raw_capture.is_file() or raw_capture.stat().st_size == 0:
             return False
-        return subprocess.run(
-            ["magick", str(raw_capture), str(screenshot_file)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0 and screenshot_file.is_file()
+        if __package__:
+            from .xwd_pixels import write_png
+        else:
+            from xwd_pixels import write_png
+        try:
+            write_png(raw_capture, screenshot_file)
+        except (ValueError, OSError):
+            return False
+        return screenshot_file.is_file()
     finally:
-        safe_unlink(raw_capture)
+        if os.environ.get("MATTMC_CAPTURE_RETAIN_XWD", "").lower() != "true":
+            safe_unlink(raw_capture)
 
 
 def linux_x11_window_is_viewable(target: str) -> bool:
@@ -3165,7 +3170,151 @@ GUI_PACK_COLORS = {
 }
 
 
+FLAT_ITEM_TINTS = (0xFF8040, 0x40FF80, 0x8040FF, 0xFFFFFF, 0x80FFFF,
+                   0xFF80FF, 0xFFFF80, 0x808080, 0x4080C0)
+FLAT_ITEM_RECTS = ((0,0,8,8), (8,0,16,8), (0,8,8,16), (8,8,16,16),
+                   (4,4,12,12), (0,4,16,12), (4,0,12,16), (2,6,10,14), (0,0,16,16))
+FLAT_ITEM_UV_COLORS = ((238,37,67), (35,212,98), (40,70,235), (235,200,30))
+FLAT_ITEM_ORIENTATIONS = (((0,0,16,16),0), ((16,0,0,16),0), ((0,16,16,0),0),
+    ((16,16,0,0),0), ((0,0,16,16),90), ((0,0,16,16),180), ((0,0,16,16),270),
+    ((16,0,0,16),90), ((0,16,16,0),90))
+
+
+def flat_item_orientation_colors(index):
+    (u0,v0,u1,v1),rotation = FLAT_ITEM_ORIENTATIONS[index]
+    colors = []
+    for x,y in ((0.25,0.25),(0.75,0.25),(0.25,0.75),(0.75,0.75)):
+        # BlockElementFace/Quadrant rotate the authored vertex UV indices.
+        for _ in range(rotation//90): x,y = y,1-x
+        u,v = u0+x*(u1-u0),v0+y*(v1-v0)
+        colors.append(FLAT_ITEM_UV_COLORS[(int(v)//8)*2+int(u)//8])
+    return colors
+
+
 def gui_resource_pack_specs(scenario: str) -> list[dict[str, object]]:
+    if scenario in ("flat-item-foil-pattern", "flat-item-foil-moving"):
+        spec, = gui_resource_pack_specs("flat-item-foil-blend")
+        return [dict(spec, name="mattmc-flat-item-foil-pattern", item_foil_pattern=True)]
+    if scenario == "flat-item-foil-generated":
+        spec, = gui_resource_pack_specs("flat-item-foil-blend")
+        return [dict(spec, name="mattmc-flat-item-foil-generated", item_generated=True)]
+    if scenario == "flat-item-foil-cutout":
+        spec, = gui_resource_pack_specs("flat-item-foil-generated")
+        return [dict(spec, name="mattmc-flat-item-foil-cutout", item_cutout=True, item_alpha_backdrop=True)]
+    if scenario == "flat-item-foil-blend":
+        spec, = gui_resource_pack_specs("flat-item-uv")
+        return [dict(spec,name="mattmc-flat-item-foil-blend",item_foil_blend=True,item_uvs=((0,0,16,16),)*9)]
+    if scenario == "flat-item-transform-replacement":
+        after, = gui_resource_pack_specs("flat-item-child-transforms")
+        before=dict(after,name="mattmc-flat-item-transform-original",item_child_transform_original=True)
+        return [dict(after,name="mattmc-flat-item-transform-next"),before]
+    if scenario == "flat-item-child-transforms":
+        spec, = gui_resource_pack_specs("flat-item-transformed-asymmetric")
+        return [dict(spec,name="mattmc-flat-item-child-transforms",item_child_transforms=True)]
+    if scenario == "flat-item-transformed-asymmetric":
+        spec, = gui_resource_pack_specs("flat-item-transformed")
+        return [dict(spec,name="mattmc-flat-item-transformed-asymmetric",item_transform_asymmetric=True)]
+    if scenario == "flat-item-transformed":
+        spec, = gui_resource_pack_specs("flat-item-layers")
+        return [dict(spec,name="mattmc-flat-item-transformed",item_transformed=True)]
+    if scenario == "flat-item-rotated":
+        spec, = gui_resource_pack_specs("flat-item-layers")
+        return [dict(spec,name="mattmc-flat-item-rotated",item_rotated=True)]
+    if scenario == "flat-item-layer-replacement":
+        before, = gui_resource_pack_specs("flat-item-layers")
+        after, = gui_resource_pack_specs("flat-item-layer-alpha")
+        return [dict(after,name="mattmc-flat-item-layer-next",item_remove_last_layer=True),before]
+    if scenario in ("flat-item-layers", "flat-item-layer-alpha"):
+        spec, = gui_resource_pack_specs("flat-item-uv")
+        return [dict(spec,name="mattmc-"+scenario,item_layers=True,item_alpha_backdrop=True,
+                     item_layer_alpha=scenario == "flat-item-layer-alpha",
+                     item_uvs=((0,0,16,16),)*9)]
+    if scenario in ("flat-item-animation", "flat-item-animation-interpolated"):
+        spec, = gui_resource_pack_specs("flat-item-uv")
+        return [dict(spec,name="mattmc-"+scenario,item_animation=True,
+                     item_interpolation=scenario.endswith("-interpolated"),
+                     item_uvs=((0,0,16,16),)*9)]
+    if scenario == "flat-item-orientation":
+        spec, = gui_resource_pack_specs("flat-item-uv")
+        return [dict(spec,name="mattmc-flat-item-orientation",
+            item_uvs=tuple(uv for uv,_ in FLAT_ITEM_ORIENTATIONS),
+            item_rotations=tuple(rotation for _,rotation in FLAT_ITEM_ORIENTATIONS))]
+    if scenario == "flat-item-uv":
+        spec, = gui_resource_pack_specs("flat-item-geometry")
+        return [dict(spec,name="mattmc-flat-item-uv",item_uvs=FLAT_ITEM_RECTS,
+                     item_rects=((0,0,16,16),)*9)]
+    if scenario == "flat-item-geometry":
+        spec, = gui_resource_pack_specs("flat-item-b")
+        return [dict(spec, name="mattmc-flat-item-geometry", item_rects=FLAT_ITEM_RECTS)]
+    if scenario == "flat-item-tint-alpha":
+        spec, = gui_resource_pack_specs("flat-item-alpha")
+        return [dict(spec, name="mattmc-flat-item-tint-alpha", item_tints=FLAT_ITEM_TINTS)]
+    if scenario == "flat-item-alpha-backed":
+        spec, = gui_resource_pack_specs("flat-item-alpha")
+        return [dict(spec, name="mattmc-flat-item-alpha-backed", item_alpha_backdrop=True)]
+    if scenario == "flat-item-alpha":
+        specs = gui_resource_pack_specs("flat-item-b")
+        return [dict(specs[0], name="mattmc-flat-item-alpha", item_alpha_steps=True)]
+    if scenario == "flat-item-replacement":
+        return gui_resource_pack_specs("flat-item-b") + gui_resource_pack_specs("flat-item-a")
+    if scenario in ("flat-item-a", "flat-item-b"):
+        size = 16 if scenario.endswith("a") else 32
+        return [{"name": "mattmc-" + scenario, "variant": scenario[-1],
+                 "sprites": tuple((f"assets/minecraft/textures/item/{name}.png", size, size)
+                                  for name in ("apple", "feather", "paper", "diamond", "iron_ingot",
+                                               "stick", "redstone", "arrow", "coal"))}]
+    if scenario == "particle-atlas-static-replacement":
+        return gui_resource_pack_specs("particle-atlas-static-b") + gui_resource_pack_specs("particle-atlas-static-a")
+    if scenario in ("particle-atlas-static-a", "particle-atlas-static-b"):
+        return [{"name": "mattmc-" + scenario, "variant": scenario[-1], "sprites": (),
+                 "particle_atlas_static": True}]
+    if scenario == "particle-atlas-animation":
+        return [{"name": "mattmc-particle-atlas-animation", "variant": "a", "sprites": (),
+                 "particle_atlas_animation": True}]
+    if scenario == "lava-mip-minification":
+        return [{"name": "mattmc-lava-mip-minification", "variant": "a", "sprites": (),
+                 "water_mip_compatible": True, "lava_mip_minification": True}]
+    if scenario in ("water-face-isolation", "water-bottom-isolation"):
+        return [{"name": "mattmc-" + scenario, "variant": "a", "sprites": (),
+                 "water_face_isolation": True, "water_bottom_isolation": scenario == "water-bottom-isolation"}]
+    if scenario == "water-mip-compatible":
+        return [{"name": "mattmc-water-mip-compatible", "variant": "a", "sprites": (),
+                 "water_mip_compatible": True}]
+    if scenario in ("post-spider-multiline-import", "post-spider-multiline-version"):
+        return [{"name": "mattmc-" + scenario, "variant": "a", "sprites": (),
+                 "post_spider_namespaced": True, "multiline_import": True,
+                 "multiline_version": scenario == "post-spider-multiline-version"}]
+    if scenario == "post-spider-namespaced":
+        return [{"name": "mattmc-post-spider-namespaced", "variant": "a", "sprites": (),
+                 "post_spider_namespaced": True}]
+    if scenario == "post-spider-dim":
+        return [{"name": "mattmc-post-spider-dim", "variant": "a", "sprites": (),
+                 "post_spider_red": 0.5}]
+    if scenario == "post-creeper-eight":
+        return [{"name": "mattmc-post-creeper-eight", "variant": "a", "sprites": (),
+                 "post_creeper_resolution": 8.0}]
+    if scenario == "post-invert-quarter":
+        return [{"name": "mattmc-post-invert-quarter", "variant": "a", "sprites": (),
+                 "post_invert_amount": 0.25}]
+    if scenario == "sky-moon-sampler-replacement":
+        # Identical texels: removing the higher-priority pack changes only sampling.
+        return [{"name": f"mattmc-sky-moon-sampler-replacement-{name}", "variant": "a",
+                 "sprites": (), "sky_moon_minification": True,
+                 "sky_sampler_metadata": {"blur": blur, "clamp": True}}
+                for name, blur in (("a", True), ("b", False))]
+    if scenario == "sky-moon-filtered":
+        return [{"name": "mattmc-sky-moon-filtered", "variant": "a", "sprites": (),
+                 "sky_moon_minification": True, "sky_sampler_metadata": {"blur": True, "clamp": True}}]
+    if scenario == "sky-moon-replacement":
+        return [{"name": f"mattmc-sky-moon-replacement-{variant}", "variant": variant,
+                 "sprites": (), "sky_moon_minification": True} for variant in ("a", "b")]
+    if scenario == "sky-moon-minification":
+        return [{"name": "mattmc-sky-moon-minification", "variant": "a",
+                 "sprites": (), "sky_moon_minification": True}]
+    if scenario == "sky-sun-minification":
+        # Reuse shared isolated pack transport, but replace only the sky asset.
+        return [{"name": "mattmc-sky-sun-minification", "variant": "a",
+                 "sprites": (), "sky_sun_minification": True}]
     base = {
         "sprites": GUI_RESOURCE_PACK_SPRITES,
         "world_border_texture": WORLD_BORDER_RESOURCE_PACK_TEXTURE,
@@ -3256,9 +3405,27 @@ def gui_resource_pack_specs(scenario: str) -> list[dict[str, object]]:
         ]
     raise SystemExit(
         "--gui-resource-pack-scenario must be one of: vanilla, pack-a, pack-b, "
-        "priority-a-b, priority-b-a, missing, malformed, unsupported, terrain-identity, "
+        "priority-a-b, priority-b-a, missing, malformed, unsupported, terrain-identity, sky-sun-minification, sky-moon-minification, "
         + ", ".join(sorted(WATER_ANIMATION_SCENARIOS))
     )
+
+
+def lava_minification_image(source):
+    """Eightfold ordinary pack image with a zero-mean one-texel mip signal.
+
+    Every 2x2 group preserves its original mean. Mip-off sampling retains the
+    signal; minification can remove it. No renderer, clock, or UV override.
+    """
+    from PIL import Image
+    source = source.convert("RGBA")
+    scaled = source.resize((source.width * 8, source.height * 8), Image.Resampling.NEAREST)
+    values = []
+    for index, pixel in enumerate(scaled.getdata()):
+        sign = 1 if ((index % scaled.width) + (index // scaled.width)) % 2 else -1
+        values.append(tuple(value + sign * min(limit, value, 255 - value)
+                            for value, limit in zip(pixel[:3], (24, 24, 8))) + (pixel[3],))
+    scaled.putdata(values)
+    return scaled
 
 
 def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
@@ -3279,8 +3446,163 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
         encoding="utf-8",
     )
     variant = str(spec["variant"])
+    if spec.get("lava_mip_minification"):
+        from PIL import Image
+        resources = Path(__file__).resolve().parents[2] / "src/main/resources/assets/minecraft/textures/block"
+        for name in ("lava_still", "lava_flow"):
+            target = pack_dir / f"assets/minecraft/textures/block/{name}.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(resources / (name + ".png")) as source:
+                lava_minification_image(source).save(target)
+            # Keep vanilla frame order and frame durations exactly unchanged.
+            target.with_name(target.name + ".mcmeta").write_bytes(
+                (resources / (name + ".png.mcmeta")).read_bytes())
+    if spec.get("water_face_isolation"):
+        # Ordinary resource-pack inputs only. Static, distinct sprite colors
+        # isolate geometry/selection from animation phase. Invisible door
+        # texels expose the water face without changing its block state/model.
+        colors = {"water_still": (255, 255, 255, 128),
+                  "water_flow": (255, 0, 0, 128),
+                  "water_overlay": (0, 255, 0, 128),
+                  "oak_door_top": (0, 0, 0, 0),
+                  "oak_door_bottom": (0, 0, 0, 0)}
+        if spec.get("water_bottom_isolation"):
+            colors["blue_stained_glass"] = (0, 0, 0, 0)
+        for name, color in colors.items():
+            target = pack_dir / f"assets/minecraft/textures/block/{name}.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            rows = (b"\0" + bytes(color) * 16) * 16
+            target.write_bytes(b"\x89PNG\r\n\x1a\n"
+                + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 6, 0, 0, 0))
+                + png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
+            # Override lower-priority animation metadata as well as pixels.
+            target.with_name(target.name + ".mcmeta").write_text("{}", encoding="utf-8")
+    if spec.get("water_mip_compatible"):
+        # Isolated vanilla-water fixture: these eight unused item sprites are
+        # the only non-16-aligned images in the bundled block/item directories.
+        # Do not alter terrain/water pixels or the renderer's mip fallback rule.
+        paths = ("item/tacz/attachments/sight_exp3", "item/tacz/attachments/scope_lpvo_1_6",
+                 "item/tacz/guns/stg44", "item/tacz/guns/m1897", "item/tacz/guns/g43",
+                 "item/tacz/guns/m1", "item/tacz/guns/mp40", "item/tacz/guns/m1a1")
+        target = pack_dir / "assets/minecraft/atlases/blocks.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"sources": [
+            {"type": "minecraft:filter", "pattern": {"namespace": "^minecraft$", "path": "^" + path + "$"}}
+            for path in paths]}), encoding="utf-8")
+    if spec.get("post_spider_namespaced"):
+        resources = Path(__file__).resolve().parents[2] / "src/main/resources/assets/minecraft"
+        definition = json.loads((resources / "post_effect/spider.json").read_text())
+        definition["passes"][-1]["fragment_shader"] = "mattmc_audit:post/spider_tint"
+        shader = (resources / "shaders/post/blit.fsh").read_text()
+        expression = "texture(InSampler, texCoord) * ColorModulate"
+        if shader.count(expression) != 1:
+            raise ValueError("namespaced fixture requires the known vanilla blit expression")
+        import_directive = "#moj_import <mattmc_tint:mattmc_namespace_tint.glsl>"
+        if spec.get("multiline_import"):
+            import_directive = "#/* first token gap\ncontinued */moj_import/* second token gap\ncontinued */<mattmc_tint:mattmc_namespace_tint.glsl>"
+        shader = shader.replace("#version 330", "#version 330\n" + import_directive, 1)
+        if spec.get("multiline_version"):
+            shader = shader.replace("#version 330", "#/* version token gap\ncontinued */version/* version number gap\ncontinued */330", 1)
+        shader = shader.replace(expression, "fixtureTint(" + expression + ")", 1)
+        entries = {
+            "assets/minecraft/post_effect/spider.json": json.dumps(definition),
+            "assets/mattmc_audit/shaders/post/spider_tint.fsh": shader,
+            "assets/mattmc_tint/shaders/include/mattmc_namespace_tint.glsl":
+                "vec4 fixtureTint(vec4 value) { return value * vec4(0.5, 1.0, 1.0, 1.0); }\n",
+            # Same path, wrong namespace and visibly different value. A
+            # resolver that erases namespaces must not pass this fixture.
+            "assets/minecraft/shaders/include/mattmc_namespace_tint.glsl":
+                "vec4 fixtureTint(vec4 value) { return value * vec4(0.125, 1.0, 1.0, 1.0); }\n",
+        }
+        for relative, contents in entries.items():
+            target = pack_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(contents, encoding="utf-8")
+    if "post_spider_red" in spec:
+        definition = json.loads((Path(__file__).resolve().parents[2] /
+            "src/main/resources/assets/minecraft/post_effect/spider.json").read_text())
+        definition["passes"][-1]["uniforms"]["BlitConfig"][0]["value"][0] = spec["post_spider_red"]
+        target = pack_dir / "assets/minecraft/post_effect/spider.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(definition), encoding="utf-8")
+    if "post_creeper_resolution" in spec:
+        definition = json.loads((Path(__file__).resolve().parents[2] /
+            "src/main/resources/assets/minecraft/post_effect/creeper.json").read_text())
+        definition["passes"][1]["uniforms"]["BitsConfig"][0]["value"] = spec["post_creeper_resolution"]
+        target = pack_dir / "assets/minecraft/post_effect/creeper.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(definition), encoding="utf-8")
+    if "post_invert_amount" in spec:
+        definition = json.loads((Path(__file__).resolve().parents[2] /
+            "src/main/resources/assets/minecraft/post_effect/invert.json").read_text())
+        definition["passes"][0]["uniforms"]["InvertConfig"][0]["value"] = spec["post_invert_amount"]
+        target = pack_dir / "assets/minecraft/post_effect/invert.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(definition), encoding="utf-8")
+    if spec.get("sky_moon_minification"):
+        target = pack_dir / "assets/minecraft/textures/environment/moon_phases.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(sky_moon_minification_png(variant))
+        if spec.get("sky_sampler_metadata") is not None:
+            target.with_suffix(".png.mcmeta").write_text(
+                json.dumps({"texture": spec["sky_sampler_metadata"]}), encoding="utf-8")
+    if spec.get("sky_sun_minification"):
+        target = pack_dir / "assets/minecraft/textures/environment/sun.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(sky_sun_minification_png())
     malformed = set(spec.get("malformed", ()))
+    if spec.get("item_foil_blend"):
+        # Constant authored glint isolates the blend contract. Animated and
+        # repeating foil coordinates require separate, nonconstant fixtures.
+        target=pack_dir/"assets/minecraft/textures/misc/enchanted_glint_item.png"
+        target.parent.mkdir(parents=True,exist_ok=True)
+        rows=(bytes([0])+bytes((32,64,96,255))*16)*16
+        if spec.get("item_foil_pattern"):
+            from gui_foil_reference import pattern_pixel
+            rows=b"".join(bytes([0])+bytes(c for x in range(16) for c in pattern_pixel(x,y)) for y in range(16))
+            target.with_suffix(".png.mcmeta").write_text(json.dumps({"texture":{"blur":True,"clamp":False}}))
+        target.write_bytes(b"\x89PNG\r\n\x1a\n"+png_chunk(b"IHDR",struct.pack(">IIBBBBB",16,16,8,6,0,0,0))
+                          +png_chunk(b"IDAT",zlib.compress(rows))+png_chunk(b"IEND",b""))
     wrong_size = set(spec.get("wrong_size", ()))
+    if "item_rects" in spec:
+        for index, ((resource_path, _, _), (left,top,right,bottom)) in enumerate(zip(spec["sprites"], spec["item_rects"], strict=True)):
+            name = Path(resource_path).stem
+            model_name = "item/mattmc_geometry/" + name
+            target = pack_dir / "assets/minecraft/models" / (model_name + ".json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({"gui_light": "front", "ambientocclusion": False,
+                "textures": {"layer0": "minecraft:item/feather" if spec.get("item_animation") and index else "minecraft:item/apple",
+                             "particle": "minecraft:item/feather" if spec.get("item_animation") and index else "minecraft:item/apple"},
+                "elements": [{"from": [left,16-bottom,7.5], "to": [right,16-top,8.5],
+                    "faces": {"south": {"uv": spec.get("item_uvs", ((0,0,16,16),)*9)[index],
+                                          "rotation": spec.get("item_rotations",(0,)*9)[index],
+                                          "texture": "#layer0"}}}]}), encoding="utf-8")
+            if spec.get("item_generated"):
+                # Ordinary resource-pack generation: vanilla supplies front,
+                # back and extrusion edges; no fixture-authored face omission.
+                target.write_text(json.dumps({"parent":"minecraft:item/generated",
+                    "textures":{"layer0":"minecraft:item/apple","particle":"minecraft:item/apple"}}),encoding="utf-8")
+            target = pack_dir / "assets/minecraft/items" / (name + ".json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({"model": {"type": "minecraft:model",
+                "model": "minecraft:" + model_name}}), encoding="utf-8")
+    if "item_tints" in spec:
+        # Ordinary resource-pack item definitions: all nine items deliberately
+        # share one model/sprite, with distinct semantic tint values. This
+        # catches raster-cache aliases without touching either renderer.
+        for (resource_path, _, _), tint in zip(spec["sprites"], spec["item_tints"], strict=True):
+            target = pack_dir / "assets/minecraft/items" / (Path(resource_path).stem + ".json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({"model": {"type": "minecraft:model",
+                "model": "minecraft:item/apple",
+                "tints": [{"type": "minecraft:constant", "value": tint}]}}), encoding="utf-8")
+    if spec.get("item_alpha_backdrop"):
+        # Separate diagnostic fixture: an authored opaque HUD texture makes
+        # the destination of alpha blending independent of terrain pixels.
+        # It is rendered normally by both backends, never an image mask.
+        target = pack_dir / "assets/minecraft/textures/gui/sprites/hud/hotbar.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(asymmetric_png(182, 22, (31,47,63,255), "b"))
     for resource_path, width, height in spec["sprites"]:  # type: ignore[index]
         target = pack_dir / resource_path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3288,8 +3610,88 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
             target.write_bytes(b"not a png")
             continue
         actual_width = width + 1 if resource_path in wrong_size else width
-        target.write_bytes(asymmetric_png(actual_width, height, GUI_PACK_COLORS[variant], variant))
+        target.write_bytes(asymmetric_png(actual_width, height, GUI_PACK_COLORS[variant], variant,
+                                         item_alpha_steps=bool(spec.get("item_alpha_steps"))))
     world_border_texture = str(spec.get("world_border_texture", ""))
+    if "item_uvs" in spec:
+        rows = bytearray()
+        animation = bool(spec.get("item_animation"))
+        height = 64 if animation else 32
+        for y in range(height):
+            rows.append(0)
+            for x in range(32):
+                quadrant = ((y%32)//16)*2+x//16
+                if y >= 32: quadrant = 3-quadrant
+                alpha = 255
+                if spec.get("item_cutout") and (x < 4 or x >= 28 or y < 4 or y >= 28
+                                               or (12 <= x < 20 and 12 <= y < 20)):
+                    alpha = 0
+                rows.extend((*FLAT_ITEM_UV_COLORS[quadrant],alpha))
+        target = pack_dir / ("assets/minecraft/textures/item/feather.png" if animation
+                             else "assets/minecraft/textures/item/apple.png")
+        target.write_bytes(b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR",struct.pack(">IIBBBBB",32,height,8,6,0,0,0))
+            + png_chunk(b"IDAT",zlib.compress(bytes(rows))) + png_chunk(b"IEND",b""))
+        if animation:
+            target.with_suffix(".png.mcmeta").write_text(json.dumps({"animation":{
+                "width":32,"height":32,"frametime":4,"interpolate":bool(spec.get("item_interpolation")),"frames":[0,1]}}),encoding="utf-8")
+            # The held first slot stays static. Only GUI-only slots use the
+            # animated feather, so hand visibility cannot conceal a missing
+            # GUI sprite-use event.
+            (pack_dir / "assets/minecraft/textures/item/apple.png").write_bytes(b"\x89PNG\r\n\x1a\n"
+                + png_chunk(b"IHDR",struct.pack(">IIBBBBB",32,32,8,6,0,0,0))
+                + png_chunk(b"IDAT",zlib.compress(bytes(rows[:32*(1+32*4)]))) + png_chunk(b"IEND",b""))
+    if spec.get("item_layers"):
+        for label,color in (("red",(255,0,0,128)),("green",(0,255,0,128))):
+            target=pack_dir/f"assets/minecraft/textures/item/mattmc_layer_{label}.png"
+            target.parent.mkdir(parents=True,exist_ok=True)
+            if spec.get("item_layer_alpha") and label == "green":
+                # Ordinary resource pixels: holes, just below/above the 0.1
+                # item alpha cutoff, and a translucent control.
+                row=b"".join(bytes((*color[:3],(0,25,26,128)[x//8])) for x in range(32))
+                rows=(bytes([0])+row)*32
+            else:
+                rows=(bytes([0])+bytes(color)*32)*32
+            target.write_bytes(b"\x89PNG\r\n\x1a\n"+png_chunk(b"IHDR",struct.pack(">IIBBBBB",32,32,8,6,0,0,0))
+                              +png_chunk(b"IDAT",zlib.compress(rows))+png_chunk(b"IEND",b""))
+        for index,(resource_path,_,_) in enumerate(spec["sprites"]):
+            if index == 0: continue  # opaque, static held-item control
+            name=Path(resource_path).stem
+            colors=("red","green") if index%2 or spec.get("item_layer_alpha") else ("green","red")
+            tints=[{"type":"minecraft:constant","value":value} for value in (0xffffff,0x808080 if index>=5 else 0xffffff)]
+            elements=[]
+            children=[]
+            for layer,color in enumerate(colors):
+                if spec.get("item_remove_last_layer") and index == 8 and layer == 1: continue
+                left,top,right,bottom=(4,4,12,12) if layer==1 and index>=3 and not spec.get("item_layer_alpha") else (0,0,16,16)
+                if spec.get("item_rotated"): left,top,right,bottom=4,4,12,12
+                if spec.get("item_transform_asymmetric"):
+                    left,top,right,bottom=(0,0,16,8) if layer==0 else (4,4,12,12)
+                element={"from":[left,16-bottom,7.5],"to":[right,16-top,8.5],
+                         "faces":{"south":{"uv":[0,0,16,16],"texture":"#layer"+str(layer),"tintindex":layer}}}
+                if spec.get("item_rotated"):
+                    element["rotation"]={"origin":[8,8,8],"axis":"z","angle":45,"rescale":False}
+                elements.append(element)
+                child_name=f"item/mattmc_layers/{name}_{layer}"
+                model={"gui_light":"front","ambientocclusion":False,
+                       "textures":{"layer"+str(layer):"minecraft:item/mattmc_layer_"+color,
+                                   "particle":"minecraft:item/apple"},"elements":[element]}
+                if spec.get("item_transformed"):
+                    model["display"]={"gui":{"rotation":[0,0,90],"translation":[2,0,0],"scale":[0.5,0.5,1]}}
+                if spec.get("item_child_transforms") and not spec.get("item_child_transform_original") and layer == 1:
+                    model["display"]={"gui":{"rotation":[0,0,0],"translation":[-2,0,0],"scale":[0.5,0.5,1]}}
+                target=pack_dir/"assets/minecraft/models"/(child_name+".json")
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_text(json.dumps(model),encoding="utf-8")
+                children.append({"type":"minecraft:model","model":"minecraft:"+child_name,"tints":tints})
+            if index%2 and not spec.get("item_child_transforms"):
+                model["elements"]=elements
+                model["textures"].update({"layer0":"minecraft:item/mattmc_layer_"+colors[0]})
+                target.write_text(json.dumps(model),encoding="utf-8")
+                definition=children[-1]
+            else:
+                definition={"type":"minecraft:composite","models":children}
+            (pack_dir/"assets/minecraft/items"/(name+".json")).write_text(json.dumps({"model":definition}),encoding="utf-8")
     if world_border_texture:
         target = pack_dir / world_border_texture
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3319,6 +3721,17 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
         target = pack_dir / str(resource_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(asymmetric_png(16, 16, tuple(color), "identity"))
+    if spec.get("particle_atlas_animation"):
+        target = pack_dir / "assets/minecraft/textures/particle/flame.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(particle_atlas_animation_png())
+        target.with_suffix(".png.mcmeta").write_text(json.dumps({"animation": {
+            "width": 16, "height": 16, "frametime": 8, "frames": [0, 1], "interpolate": True
+        }}), encoding="utf-8")
+    if spec.get("particle_atlas_static"):
+        target = pack_dir / "assets/minecraft/textures/particle/flame.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(particle_atlas_animation_png(static_variant=str(spec["variant"])))
     water_animation = str(spec.get("water_animation", "default"))
     for water_texture in spec.get("water_textures", ()):  # type: ignore[assignment]
         resource_path = str(water_texture)
@@ -3334,7 +3747,75 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
         (target.parent / f"{target.name}.mcmeta").write_text(json.dumps(mcmeta, separators=(",", ":")), encoding="utf-8")
 
 
-def asymmetric_png(width: int, height: int, base: tuple[int, int, int, int], variant: str) -> bytes:
+def particle_atlas_animation_png(static_variant: str | None = None) -> bytes:
+    """Opaque two-frame pack input with asymmetric rows/columns; ordinary mcmeta drives it."""
+    if static_variant not in (None, "a", "b"):
+        raise ValueError("unsupported static particle variant")
+    height = 32 if static_variant is None else 16
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(16):
+            base = (190, 30, 20) if y < 16 and static_variant != "b" else (20, 150, 190)
+            rows.extend((base[0] + x, base[1] + y % 16, base[2] + (x + y) % 8, 255))
+    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 16, height, 8, 6, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(bytes(rows))) + png_chunk(b"IEND", b""))
+
+
+def sky_moon_minification_png(variant: str = "a") -> bytes:
+    """Eight distinct phase cells: base-level detail and non-symmetric UV witnesses."""
+    width, height = 1024, 512
+    if variant not in ("a", "b"):
+        raise ValueError("unsupported moon fixture variant")
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            phase = (y // 256) * 4 + x // 256
+            u, v = x % 256, y % 256
+            if 48 <= u < 80 and 48 <= v < 96:
+                pixel = (255, 128, 96, 255)
+            elif 80 <= u < 176 and 80 <= v < 176:
+                pixel = (128 + phase * 12, 255 - phase * 9, 200 + phase * 5, 255)
+                if variant == "b":
+                    pixel = (pixel[2], pixel[0], pixel[1], pixel[3])
+            elif 48 <= u < 208 and 48 <= v < 208:
+                value = 255 if (u + v) % 2 == 0 else 0
+                pixel = (value, value, value, 255)
+            else:
+                pixel = (0, 0, 0, 0)
+            rows.extend(pixel)
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(bytes(rows)))
+            + png_chunk(b"IEND", b""))
+
+
+def sky_sun_minification_png() -> bytes:
+    """A central sun witness surrounded by texel-scale minification evidence."""
+    size = 1024
+    rows = bytearray()
+    for y in range(size):
+        rows.append(0)
+        for x in range(size):
+            if 448 <= x < 576 and 448 <= y < 576:
+                pixel = (255, 255, 255, 255)
+            elif 384 <= x < 640 and 384 <= y < 640:
+                value = 255 if (x + y) % 2 == 0 else 0
+                pixel = (value, value, value, 255)
+            else:
+                pixel = (0, 0, 0, 0)
+            rows.extend(pixel)
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(bytes(rows)))
+            + png_chunk(b"IEND", b""))
+
+
+def asymmetric_png(width: int, height: int, base: tuple[int, int, int, int], variant: str,
+                   item_alpha_steps: bool = False) -> bytes:
+    if item_alpha_steps and (width, height) != (32, 32):
+        raise ValueError("item alpha steps require the fixed 32px fixture")
     marker = (255, 255, 255, 255) if variant == "a" else (0, 0, 0, 255)
     edge = (0, 70, 255, 255) if variant == "a" else (255, 212, 0, 255)
     rows = bytearray()
@@ -3348,6 +3829,10 @@ def asymmetric_png(width: int, height: int, base: tuple[int, int, int, int], var
                 pixel = edge
             elif x == width - 1 or y == height - 1:
                 pixel = (base[0] // 2, base[1] // 2, base[2] // 2, base[3])
+            if item_alpha_steps and 4 <= y < 12:
+                for left, alpha in ((2, 0), (6, 25), (10, 26), (18, 128), (24, 255)):
+                    if left <= x < left + 4:
+                        pixel = (255, 255, 255, alpha)
             rows.extend(pixel)
     raw = zlib.compress(bytes(rows))
     return (
@@ -3862,7 +4347,8 @@ def parse_args() -> CaptureConfig:
         default=os.environ.get("MATTMC_GUI_RESOURCE_PACK_SCENARIO", ""),
         help=(
             "Generate and select diagnostic GUI resource packs in the isolated game dir. "
-            "Supported: vanilla, pack-a, pack-b, priority-a-b, priority-b-a, missing, malformed, unsupported."
+            "Supported: vanilla, pack-a, pack-b, priority-a-b, priority-b-a, missing, malformed, unsupported, "
+            "sky-sun-minification, sky-moon-minification (sky-only texture fixtures)."
         ),
     )
     parser.add_argument(

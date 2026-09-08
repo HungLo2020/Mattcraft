@@ -393,6 +393,15 @@ pub fn bundled_transparency_vulkan_shader_sources() -> GalResult<Vec<(Vec<u8>, V
 }
 
 pub(crate) fn normalize_vulkan_vertex_source(api: BackendApi, source: &[u8]) -> GalResult<Vec<u8>> {
+    normalize_vulkan_vertex_source_for_input_rows(api, source,
+        crate::render::vulkanic::commands::TextureRowOrder::Preserve)
+}
+
+/// Preserve copied shader arithmetic when attachment inputs have already
+/// been converted into the shader's original row convention explicitly.
+pub(crate) fn normalize_vulkan_vertex_source_for_input_rows(
+    api: BackendApi, source: &[u8], rows: crate::render::vulkanic::commands::TextureRowOrder,
+) -> GalResult<Vec<u8>> {
     let source = std::str::from_utf8(source).map_err(|_| {
         GalError::invalid_argument("vanilla post-effect vertex shader is not UTF-8")
     })?;
@@ -402,10 +411,13 @@ pub(crate) fn normalize_vulkan_vertex_source(api: BackendApi, source: &[u8]) -> 
     Ok(source
         .replacen(
             "#version 330",
-            "#version 450\n#define VULKANIC_GAL_ZERO_TO_ONE_CLIP_DEPTH 1\n#define VULKANIC_GAL_FLIP_FULLSCREEN_UV_Y 1",
+            if rows == crate::render::vulkanic::commands::TextureRowOrder::Preserve {
+                "#version 450\n#define VULKANIC_GAL_ZERO_TO_ONE_CLIP_DEPTH 1\n#define VULKANIC_GAL_FLIP_FULLSCREEN_UV_Y 1"
+            } else { "#version 450\n#define VULKANIC_GAL_ZERO_TO_ONE_CLIP_DEPTH 1" },
             1,
         )
-        .replacen("out vec2 texCoord;", "layout(location = 0) out vec2 texCoord;", 1)
+        .replacen("out vec2 texCoord;", "layout(location = 0) out vec2 texCoord;",
+            usize::from(source.lines().any(|line| line.trim() == "out vec2 texCoord;")))
         .replace("gl_VertexID", "gl_VertexIndex")
         // Vanilla's screenquad source assigns texture coordinates directly
         // from the fullscreen triangle. Vulkan attachment sampling has the
@@ -415,10 +427,36 @@ pub(crate) fn normalize_vulkan_vertex_source(api: BackendApi, source: &[u8]) -> 
         // frame even though all named attachments and ordering are correct.
         .replacen(
             "texCoord = uv;",
-            "texCoord = uv;\n#ifdef VULKANIC_GAL_FLIP_FULLSCREEN_UV_Y\n    texCoord.y = 1.0 - texCoord.y;\n#endif",
+            if rows == crate::render::vulkanic::commands::TextureRowOrder::Preserve {
+                "texCoord = uv;\n#ifdef VULKANIC_GAL_FLIP_FULLSCREEN_UV_Y\n    texCoord.y = 1.0 - texCoord.y;\n#endif"
+            } else { "texCoord = uv;" },
             1,
         )
         .into_bytes())
+}
+
+pub(crate) fn normalize_vulkan_vertex_source_for_pass(
+    api: BackendApi,
+    source: &[u8],
+    pass: &VanillaPostEffectPass,
+    rows: crate::render::vulkanic::commands::TextureRowOrder,
+) -> GalResult<Vec<u8>> {
+    let normalized = normalize_vulkan_vertex_source_for_input_rows(api, source, rows)?;
+    if api != BackendApi::Vulkan { return Ok(normalized); }
+    let source = std::str::from_utf8(&normalized)
+        .map_err(|_| GalError::invalid_argument("post-effect vertex shader is not UTF-8"))?;
+    Ok(bind_vulkan_uniform_blocks(source.to_owned(), pass).into_bytes())
+}
+
+fn bind_vulkan_uniform_blocks(mut source: String, pass: &VanillaPostEffectPass) -> String {
+    // The sorted semantic block inventory assigns identical descriptor slots
+    // in both stages. A block absent from one stage needs no declaration there.
+    for (block_index, block_name) in pass.uniform_values.keys().enumerate() {
+        let binding = pass.inputs.len() + block_index;
+        source = source.replacen(&format!("layout(std140) uniform {block_name}"),
+            &format!("layout(set = 0, binding = {binding}, std140) uniform {block_name}"), 1);
+    }
+    source
 }
 
 pub(crate) fn normalize_vulkan_fullscreen_source(
@@ -437,7 +475,8 @@ pub(crate) fn normalize_vulkan_fullscreen_source(
             "#version 450\n#define VULKANIC_GAL_ZERO_TO_ONE_CLIP_DEPTH 1\n#define VULKANIC_GAL_FLIP_FULLSCREEN_UV_Y 1",
             1,
         )
-        .replacen("in vec2 texCoord;", "layout(location = 0) in vec2 texCoord;", 1)
+        .replacen("in vec2 texCoord;", "layout(location = 0) in vec2 texCoord;",
+            usize::from(source.lines().any(|line| line.trim() == "in vec2 texCoord;")))
         .replacen(
             "out vec4 fragColor;",
             "layout(location = 0) out vec4 fragColor;",
@@ -457,16 +496,7 @@ pub(crate) fn normalize_vulkan_fullscreen_source(
         }
         lowered = lowered.replacen(&declaration, &explicit, 1);
     }
-    for (block_index, block_name) in pass.uniform_values.keys().enumerate() {
-        let uniform_binding = pass.inputs.len() + block_index;
-        let declaration = format!("layout(std140) uniform {block_name}");
-        let explicit =
-            format!("layout(set = 0, binding = {uniform_binding}, std140) uniform {block_name}");
-        if lowered.contains(&declaration) {
-            lowered = lowered.replacen(&declaration, &explicit, 1);
-        }
-    }
-    Ok(lowered.into_bytes())
+    Ok(bind_vulkan_uniform_blocks(lowered, pass).into_bytes())
 }
 
 /// Packs one validated uniform block according to the scalar/vector subset used

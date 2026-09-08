@@ -1159,6 +1159,7 @@ impl FabulousAttachmentSet {
             dst_queue: super::super::resources::QueueClass::Transfer,
         }));
         ops.push(CommandOp::CopyTexture(TextureImageCopyRegion {
+            row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
             src_texture: source_texture,
             src_mip: 0,
             src_layer: 0,
@@ -1271,6 +1272,7 @@ impl FabulousAttachmentSet {
             dst_queue: super::super::resources::QueueClass::Transfer,
         }));
         ops.push(CommandOp::CopyTexture(TextureImageCopyRegion {
+            row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
             src_texture: source_texture,
             src_mip: 0,
             src_layer: 0,
@@ -1809,6 +1811,7 @@ impl FabulousAttachmentSet {
                 dst_queue: super::super::resources::QueueClass::Graphics,
             }),
             CommandOp::CopyTexture(super::super::commands::TextureImageCopyRegion {
+                row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
                 src_texture: self.main.color_texture,
                 src_mip: 0,
                 src_layer: 0,
@@ -1859,6 +1862,7 @@ impl FabulousAttachmentSet {
                 dst_queue: super::super::resources::QueueClass::Graphics,
             }),
             CommandOp::CopyTexture(super::super::commands::TextureImageCopyRegion {
+                row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
                 src_texture: self.optical_hand.color_texture,
                 src_mip: 0,
                 src_layer: 0,

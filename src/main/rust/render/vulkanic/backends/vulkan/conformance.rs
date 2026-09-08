@@ -87,9 +87,26 @@ fn gui_panorama_shaders_compile_as_an_unlit_rust_owned_material() {
 /// between the world and GUI passes.
 #[test]
 fn isolated_vulkan_vignette_blend_preserves_and_darkens_loaded_color() {
+    isolated_loaded_blend(BlendMode::Vignette,[0.75,0.75,0.75,1.0],
+        ClearColor {r:0.8,g:0.8,b:0.8,a:1.0},[51,51,51,255],1);
+}
+
+#[test]
+fn isolated_vulkan_glint_blend_matches_frozen_and_preserves_destination_alpha() {
+    // Frozen Java OpenGL BlendFunction.GLINT: SRC_COLOR, ONE, ZERO, ONE.
+    // Distinct RGB and nonopaque alpha distinguish it from multiply, alpha
+    // blend, source-alpha replacement and plain additive blending.
+    // Avoid the hardware's half-intensity blend-factor rounding boundary;
+    // quarter-intensity probes retain exact byte assertions on this fixture.
+    isolated_loaded_blend(BlendMode::Glint,[0.25,0.25,0.75,0.125],
+        ClearColor {r:0.125,g:0.375,b:0.0625,a:0.375},[48,112,159,96],0);
+}
+
+fn isolated_loaded_blend(blend:BlendMode, source:[f32;4], clear:ClearColor, expected:[u8;4], tolerance:i16) {
     let backend = match VulkanBackend::new("MattMC VulkanicGAL vignette conformance") {
         Ok(backend) => backend,
         Err(error) => {
+            assert_ne!(blend,BlendMode::Glint,"Vulkan required for glint blend regression: {error}");
             eprintln!("skipping Vulkan vignette conformance: {error}");
             return;
         }
@@ -158,11 +175,8 @@ void main() { gl_Position = vec4(p[gl_VertexIndex], 0.0, 1.0); }
             label: "vignette-conformance.fragment".to_owned(),
             stage: ShaderStage::Fragment,
             code_format: ShaderCodeFormat::Glsl,
-            code: br#"#version 450
-layout(location = 0) out vec4 out_color;
-void main() { out_color = vec4(0.75, 0.75, 0.75, 1.0); }
-"#
-            .to_vec(),
+            code: format!("#version 450\nlayout(location = 0) out vec4 out_color;\nvoid main() {{ out_color = vec4({}, {}, {}, {}); }}\n",
+                source[0],source[1],source[2],source[3]).into_bytes(),
             entry_point: "main".to_owned(),
         })
         .unwrap();
@@ -175,7 +189,7 @@ void main() { out_color = vec4(0.75, 0.75, 0.75, 1.0); }
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::None,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
-            blend: BlendMode::Vignette,
+            blend,
             depth_compare: None,
             depth_write: false,
             depth_bias: None,
@@ -214,12 +228,7 @@ void main() { out_color = vec4(0.75, 0.75, 0.75, 1.0); }
                         view: color_view,
                         load_op: AttachmentLoadOp::Clear,
                         store_op: AttachmentStoreOp::Store,
-                        clear_color: Some(ClearColor {
-                            r: 0.8,
-                            g: 0.8,
-                            b: 0.8,
-                            a: 1.0,
-                        }),
+                        clear_color: Some(clear),
                     }],
                     depth_stencil: None,
                 },
@@ -282,23 +291,11 @@ void main() { out_color = vec4(0.75, 0.75, 0.75, 1.0); }
         .expect("vignette conformance must produce a readback")
         .bytes
         .clone();
-    // 0.8 * (1.0 - 0.75) = 0.2.  RGBA8 conversion allows one quantization step.
-    assert!(
-        (bytes[0] as i16 - 51).abs() <= 1,
-        "unexpected red output: {:?}",
-        bytes
-    );
-    assert!(
-        (bytes[1] as i16 - 51).abs() <= 1,
-        "unexpected green output: {:?}",
-        bytes
-    );
-    assert!(
-        (bytes[2] as i16 - 51).abs() <= 1,
-        "unexpected blue output: {:?}",
-        bytes
-    );
-    assert_eq!(255, bytes[3], "vignette must preserve opaque alpha");
+    for channel in 0..3 {
+        assert!((i16::from(bytes[channel])-i16::from(expected[channel])).abs()<=tolerance,
+            "{blend:?} channel{channel}: actual={bytes:?}, expected={expected:?}");
+    }
+    assert_eq!(expected[3],bytes[3],"{blend:?} must preserve destination alpha");
 }
 
 #[test]
@@ -1229,6 +1226,86 @@ fn prepared_lowered_terrain_program_compiles_at_the_vulkan_boundary() {
             )
         });
     }
+}
+
+#[test]
+fn model_translucent_cutout_spirv_discards_without_terrain_lod_bias() {
+    use crate::render::vulkanic::shader_pack::programs::{
+        minimal_direct_model_translucent_cutout_program,
+        minimal_direct_terrain_translucent_program,
+    };
+    let instructions = |bytes: Vec<u8>| {
+        let words = bytes.chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        let mut result = Vec::new();
+        let mut cursor = 5;
+        while cursor < words.len() {
+            let count = (words[cursor] >> 16) as usize;
+            assert!(count > 0 && cursor + count <= words.len());
+            result.push(words[cursor..cursor+count].to_vec());
+            cursor += count;
+        }
+        result
+    };
+    let compile = |source: &str| instructions(compile_glsl_for_backend_test(
+        shaderc::ShaderKind::Fragment, source, "model-alpha-contract.frag").unwrap());
+    let model_program = minimal_direct_model_translucent_cutout_program();
+    assert!(model_program.vertex.source.starts_with("#version 450\n#define VULKANIC_MODEL_TRANSLUCENT_CUTOUT 1\n"));
+    assert!(model_program.vertex.source.contains("normal = trunc(clamp(normal, vec3(-1.0), vec3(1.0)) * 127.0) / 127.0;"));
+    let vertex_source = String::from_utf8(shader_stage_code_for_backend(
+        BackendApi::Vulkan, &model_program.vertex.source)).unwrap();
+    compile_glsl_for_backend_test(shaderc::ShaderKind::Vertex,
+        &vertex_source, "model-normal-contract.vert").unwrap();
+    let model = compile(&model_program.fragment.source);
+    let terrain = compile(&minimal_direct_terrain_translucent_program().fragment.source);
+    // Vulkan 1.3 shaderc may lower discard to helper demotion rather than
+    // the older OpKill: all three discard forms suppress attachment writes.
+    // Opcodes from the bundled SPIR-V headers: Kill=252, Terminate=4416,
+    // DemoteToHelperInvocation=5380. ImplicitLod=87; optional ImageOperands
+    // begins at operand five and Bias is bit 0. Inspect compiled behavior,
+    // not dead preprocessor text.
+    let discards = |code: &Vec<Vec<u32>>| code.iter()
+        .map(|i| i[0] & 0xffff).filter(|op| matches!(op, 252 | 4416 | 5380)).collect::<Vec<_>>();
+    let model_discards = discards(&model);
+    assert!(!model_discards.is_empty());
+    assert!(discards(&terrain).is_empty());
+    eprintln!("model fragment discard opcodes: {model_discards:?}");
+    let samples = model.iter().filter(|i| i[0] & 0xffff == 87).collect::<Vec<_>>();
+    assert!(!samples.is_empty());
+    assert!(samples.iter().all(|i| i.len() == 5 || i[5] & 1 == 0));
+    assert!(terrain.iter().any(|i| i[0] & 0xffff == 87 && i.len() > 5 && i[5] & 1 != 0));
+}
+
+#[test]
+fn standard_item_foil_compiles_without_vertex_lighting_or_terrain_lod_bias() {
+    use crate::render::vulkanic::shader_pack::programs::minimal_direct_standard_item_foil_program;
+    let program = minimal_direct_standard_item_foil_program();
+    let compile = |source: &str, kind| {
+        let source = String::from_utf8(shader_stage_code_for_backend(BackendApi::Vulkan, source)).unwrap();
+        let bytes = compile_glsl_for_backend_test(kind, &source, "standard-item-foil").unwrap();
+        let words = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let mut instructions = Vec::new();
+        let mut cursor = 5;
+        while cursor < words.len() {
+            let length = (words[cursor] >> 16) as usize;
+            assert!(length > 0 && cursor + length <= words.len());
+            instructions.push(words[cursor..cursor + length].to_vec());
+            cursor += length;
+        }
+        instructions
+    };
+    let vertex = compile(&program.vertex.source, shaderc::ShaderKind::Vertex);
+    // No sample or fetch instructions: fullbright foil must not read UV2.
+    assert!(!vertex.iter().any(|i| matches!(i[0] & 0xffff, 87..=98)));
+    let fragment = compile(&program.fragment.source, shaderc::ShaderKind::Fragment);
+    assert!(fragment.iter().any(|i| matches!(i[0] & 0xffff, 252 | 4416 | 5380)));
+    let samples = fragment.iter().filter(|i| i[0] & 0xffff == 87).collect::<Vec<_>>();
+    assert_eq!(samples.len(), 1);
+    assert!(samples[0].len() == 5 || samples[0][5] & 1 == 0);
+    assert!(program.fragment.source.contains("(1.0 - fog) * v_foil_strength"));
+    assert!(program.fragment.source.contains("), color.a)"));
+    assert!(program.vertex.source.contains("binding = 4, std430"));
 }
 
 #[test]

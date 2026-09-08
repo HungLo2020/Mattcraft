@@ -6,6 +6,69 @@ use crate::render::vulkanic::gui_mesh_frontend::GUI_MESH_MAX_FRAME_PAYLOAD_BYTES
 
 const GUI_MAX_AFFINE_QUADS: usize = super::super::gui_frontend::GUI_MAX_EXPANDED_AFFINE_QUADS;
 
+pub(crate) unsafe fn decode_gui_atlas_reference_update(
+    request: *const FfiGuiAtlasReferenceUpdate, capabilities: BackendCapabilities,
+) -> GalResult<(u64, Vec<super::super::gui_atlas_reference::GuiAtlasReference>)> {
+    use super::super::gui_atlas_reference::{GuiAtlasReference, AcceptedAtlasIncarnation, MAX_GUI_ATLAS_REFERENCES};
+    let request = read_struct(request, "GUI atlas reference update")?;
+    validate_header::<FfiGuiAtlasReferenceUpdate>(request.header)?;
+    reject_unknown_feature_bits(request.negotiated_feature_bits)?;
+    if request.negotiated_feature_bits & !capability_feature_bits(capabilities) != 0 {
+        return Err(GalError::unsupported_feature("unsupported GUI atlas reference feature bits"));
+    }
+    if request.revision == 0 || request.references.count > MAX_GUI_ATLAS_REFERENCES as u64 {
+        return Err(GalError::invalid_argument("invalid GUI atlas reference revision or count"));
+    }
+    let items = read_limited_slice(request.references, true, "GUI atlas references")?;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut owned = Vec::with_capacity(items.len());
+    for item in items {
+        validate_item_size::<FfiGuiAtlasReference>(item.byte_size, "GUI atlas reference")?;
+        let reference = GuiAtlasReference { asset_id: item.asset_id,
+            atlas: AcceptedAtlasIncarnation { texture_id: item.texture_id,
+                generation: item.atlas_generation, width: item.atlas_width, height: item.atlas_height },
+            x: item.x, y: item.y, width: item.width, height: item.height };
+        reference.validate()?;
+        if !ids.insert(reference.asset_id) {
+            return Err(GalError::invalid_argument("duplicate GUI atlas reference identity"));
+        }
+        owned.push(reference);
+    }
+    Ok((request.revision, owned))
+}
+
+/// Declaration transport only. No rendering capability is admitted here.
+#[no_mangle]
+pub unsafe extern "C" fn mattmc_vulkanic_gal_gui_update_atlas_references(
+    context_id: u64, request: *const FfiGuiAtlasReferenceUpdate, status_out: *mut FfiStatusResult,
+) -> i32 {
+    with_registry_mut(|registry| {
+        let Some(context) = registry.contexts.get_mut(&context_id) else {
+            let error = GalError::ffi(StatusCode::StaleHandle, format!("unknown context id {context_id}"));
+            write_status_out(status_out, status_result_from_error(&error));
+            return error.code as i32;
+        };
+        context.ffi_calls += 1;
+        context.ffi_output_bytes = context.ffi_output_bytes.saturating_add(size_of::<FfiStatusResult>() as u64);
+        let result = decode_gui_atlas_reference_update(request, context.gal.capabilities())
+            .and_then(|(revision, references)| {
+                context.ffi_input_bytes = context.ffi_input_bytes.saturating_add(
+                    size_of::<FfiGuiAtlasReferenceUpdate>() as u64
+                        + references.len() as u64 * size_of::<FfiGuiAtlasReference>() as u64);
+                context.gui_frontend.stage_owned_atlas_references(&mut context.gal,
+                    &context.world_primitive_frontend, revision, &references)
+            });
+        match result {
+            Ok(()) => { write_status_out(status_out, status_ok(context)); StatusCode::Ok as i32 },
+            Err(error) => {
+                set_last_error(context, &error);
+                write_status_out(status_out, status_error(Some(context), &error));
+                error.code as i32
+            },
+        }
+    })
+}
+
 /// Copies ABI v29 tiled semantics with aggregate preflight before geometry
 /// expansion. Frame integration checks parent sequences across GUI families
 /// before partitioning at blur boundaries. Producer admission remains private.
@@ -226,8 +289,34 @@ fn decode_gui_affine_quads(
         ));
     }
     let mut owned = Vec::with_capacity(quads.len());
+    let mut total_layers = 0_usize;
     for quad in quads {
         validate_item_size::<FfiGuiAffineQuadRequest>(quad.byte_size, "GUI affine quad")?;
+        if quad.item_raster_layers.count > super::super::gui_item_raster::MAX_ITEM_LAYERS as u64
+            || (quad.item_raster_layers.count != 0 && quad.item_raster_scale == 0) {
+            return Err(GalError::invalid_argument("invalid bounded GUI item layers"));
+        }
+        total_layers += quad.item_raster_layers.count as usize;
+        if total_layers > super::super::gui_frontend::GUI_MAX_RAW_IMAGES {
+            return Err(GalError::invalid_argument("GUI item layer stream exceeds frame bound"));
+        }
+        let layers = unsafe { read_slice(quad.item_raster_layers,true,"GUI item layers") }?;
+        let mut item_raster_layers = Vec::with_capacity(layers.len());
+        for layer in layers {
+            validate_item_size::<FfiGuiItemRasterLayer>(layer.byte_size,"GUI item layer")?;
+            if layer.asset_id == 0 || !matches!(layer.material_mode,1|2) {
+                return Err(GalError::invalid_argument("invalid GUI item layer resource/material"));
+            }
+            let geometry = super::super::gui_item_raster::GuiItemRasterGeometry {corners:layer.corners};
+            geometry.identity()?;
+            super::super::gui_item_raster::item_uv_identity(layer.uv)?;
+            let model_transform=super::super::gui_item_raster::GuiItemModelTransform(layer.model_transform);
+            model_transform.validate()?;
+            item_raster_layers.push(super::super::gui_frontend::GuiItemRasterLayer {
+                asset_id:layer.asset_id,color_argb:layer.color_argb,geometry,uv:layer.uv,model_transform,
+                material:super::super::gui_item_material::GuiAffineMaterial::decode(layer.material_mode)?,
+            });
+        }
         if quad.asset_id == 0 || quad.gui_width != gui_width || quad.gui_height != gui_height {
             return Err(GalError::ffi(
                 StatusCode::InvalidArgument,
@@ -243,6 +332,11 @@ fn decode_gui_affine_quads(
             })
         };
         let request = GuiAffineQuadRequest {
+            item_raster_layers,
+            item_raster_scale: quad.item_raster_scale,
+            item_raster_geometry: super::super::gui_item_raster::GuiItemRasterGeometry {
+                corners: quad.item_raster_corners },
+            material: super::super::gui_item_material::GuiAffineMaterial::decode(quad.material_mode)?,
             stratum: quad.stratum,
             asset_id: quad.asset_id,
             x0: quad.x0,
@@ -348,6 +442,7 @@ pub(crate) unsafe fn decode_gui_mesh_batches(
         let lighting_mode = match batch.lighting_mode {
             1 => GuiMeshLightingMode::Flat,
             2 => GuiMeshLightingMode::Block,
+            3 => GuiMeshLightingMode::InventoryBlock,
             other => {
                 return Err(GalError::ffi(
                     StatusCode::UnknownEnum,
@@ -374,6 +469,11 @@ pub(crate) unsafe fn decode_gui_mesh_batches(
             })
             .collect();
         let request = GuiMeshBatchRequest {
+            item_raster_scale: batch.item_raster_scale,
+            item_lighting: None,
+            item_foil: super::super::item_foil::StandardItemFoil::decode(
+                batch.item_foil_mode, batch.item_foil_clock_millis,
+                batch.item_foil_speed, batch.item_foil_strength)?,
             stratum: batch.stratum,
             layer_index: batch.layer_index,
             sequence: batch.sequence,
@@ -712,10 +812,14 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_gui_submit_frame(
         let result = decode_gui_frame_submit_with_tiles(request, context.gal.capabilities())
             .and_then(
                 |(generation, frame_target, sprites, affine_quads, mesh_batches, tiled_quads)| {
+                    context.ffi_input_bytes = context.ffi_input_bytes.saturating_add(
+                        affine_quads.iter().map(|quad|quad.item_raster_layers.len() as u64
+                            * size_of::<FfiGuiItemRasterLayer>() as u64).sum::<u64>());
                     let stats = context
                         .gui_frontend
-                        .submit_frame_with_tiled_quads(
+                        .submit_frame_with_owned_atlases(
                             &mut context.gal,
+                            Some(&mut context.world_primitive_frontend),
                             generation,
                             frame_target,
                             sprites,

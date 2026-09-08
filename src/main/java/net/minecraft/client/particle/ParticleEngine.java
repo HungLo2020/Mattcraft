@@ -75,7 +75,8 @@ public class ParticleEngine {
 
 	/** Installs one capture fixture while simulation ticks are frozen; never called by gameplay. */
 	void installGraphicsAuditParticle(Particle particle) {
-		if (!GraphicsAuditTerrainParticleFixture.requested() || particle.getParticleLimit().isPresent()) {
+		if ((!GraphicsAuditTerrainParticleFixture.requested() && !GraphicsAuditAtlasParticleFixture.requested())
+			|| particle.getParticleLimit().isPresent()) {
 			throw new IllegalStateException("Unrequested or limited graphics audit particle");
 		}
 		this.particles.computeIfAbsent(particle.getGroup(), this::createParticleGroup).add(particle);
@@ -153,12 +154,16 @@ public class ParticleEngine {
 	}
 
 	public void extract(ParticlesRenderState particlesRenderState, Frustum frustum, Camera camera, float f) {
+		net.minecraft.client.dev.GraphicsAuditLavaFixture.beginParticles();
 		for (ParticleRenderType particleRenderType : RENDER_ORDER) {
 			ParticleGroup<?> particleGroup = (ParticleGroup<?>)this.particles.get(particleRenderType);
 			if (particleGroup != null && !particleGroup.isEmpty()) {
+				if (!(particleGroup instanceof QuadParticleGroup) && !(particleGroup instanceof NoRenderParticleGroup))
+					net.minecraft.client.dev.GraphicsAuditLavaFixture.unknownParticleGroup();
 				particlesRenderState.add(particleGroup.extractRenderState(frustum, camera, f));
 			}
 		}
+		net.minecraft.client.dev.GraphicsAuditLavaFixture.endParticles();
 	}
 
 	public int enqueueRustGalBlockMarkers(Camera camera, float f) {
@@ -208,9 +213,13 @@ public class ParticleEngine {
 	 */
 	public int enqueueRustGalParticles(Frustum frustum, Camera camera, float partialTick) {
 		if (!net.vulkanic.world.WorldRenderRoutePolicy.currentMaterialRoute().usesRustWholeFrameVulkan()) return 0;
+		net.minecraft.client.dev.GraphicsAuditLavaFixture.beginParticles();
 		int enqueued = 0;
 		int terrainParticles = 0;
 		for (ParticleGroup<?> particleGroup : this.particles.values()) {
+			if (!particleGroup.isEmpty() && !(particleGroup instanceof QuadParticleGroup)
+				&& !(particleGroup instanceof NoRenderParticleGroup))
+				net.minecraft.client.dev.GraphicsAuditLavaFixture.unknownParticleGroup();
 			if (particleGroup instanceof QuadParticleGroup quadParticleGroup) {
 				if (!System.getProperty("mattmc.dev.rustGalWorldMaterial.terrainParticleScenario", "").isBlank()) {
 					for (Object particle : quadParticleGroup.getAll()) {
@@ -228,6 +237,10 @@ public class ParticleEngine {
 		if (terrainParticles > 0 && Boolean.getBoolean("mattmc.dev.graphicsAuditSliceMetrics")) {
 			System.out.println("[MattMC graphics audit] TerrainParticle whole-frame collector particles=" + terrainParticles + " enqueued=" + enqueued);
 		}
+		// The optional dedicated terrain-particle fixture bypasses quad-state
+		// extraction. It cannot count as an observed clear lava capture.
+		if (terrainParticles > 0) net.minecraft.client.dev.GraphicsAuditLavaFixture.unknownParticleGroup();
+		net.minecraft.client.dev.GraphicsAuditLavaFixture.endParticles();
 		return enqueued;
 	}
 

@@ -135,9 +135,9 @@ public final class RustShaderPackSourceCollector {
 	}
 
 	/**
-	 * Returns a non-bundled active post-effect identity which needs the generic
-	 * Rust fullscreen executor. The bundled invert/creeper/spider effects have
-	 * dedicated semantic routes and must not cause a resource snapshot reload.
+	 * Returns the active identity whose copied resources feed the generic Rust
+	 * fullscreen executor. Execution admission remains Rust-owned, including
+	 * any copied graph that is still private pending validation.
 	 */
 	private static Optional<String> activeVanillaPostEffectId() {
 		try {
@@ -154,10 +154,7 @@ public final class RustShaderPackSourceCollector {
 				return Optional.empty();
 			}
 			String identity = effect.toString();
-			return switch (identity) {
-			case "minecraft:invert", "minecraft:creeper", "minecraft:spider" -> Optional.empty();
-			default -> Optional.of(identity);
-			};
+			return Optional.of(identity);
 		} catch (RuntimeException ignored) {
 			return Optional.empty();
 		}
@@ -178,13 +175,14 @@ public final class RustShaderPackSourceCollector {
 		).orElseThrow(() -> new IOException("active post-effect definition is missing: " + identity));
 		byte[] definition = readBoundedResource(effectResource, MAX_ASSET_FILE_BYTES, "post-effect definition");
 		List<VulkanicGalBridge.ShaderPackSourceFileRecord> sources = new java.util.ArrayList<>();
-		long sourceBytes = 0L;
+		byte[] format = "namespace-qualified=1\n".getBytes(StandardCharsets.UTF_8);
+		sources.add(new VulkanicGalBridge.ShaderPackSourceFileRecord("mattmc/vanilla-shader-snapshot.properties", format));
+		long sourceBytes = format.length;
 		for (var entry : manager.listResources("shaders", location -> {
 			String path = location.getPath();
-			return location.getNamespace().equals(effect.getNamespace())
-				&& (path.endsWith(".vsh") || path.endsWith(".fsh") || path.endsWith(".glsl"));
+			return path.endsWith(".vsh") || path.endsWith(".fsh") || path.endsWith(".glsl");
 		}).entrySet().stream().sorted(Map.Entry.comparingByKey()).toList()) {
-			String path = normalizeShaderSourcePath(entry.getKey().getPath());
+			String path = vanillaShaderSourcePath(entry.getKey());
 			if (sources.size() >= MAX_FILES) {
 				throw new IOException("resource-pack shader source count exceeds " + MAX_FILES);
 			}
@@ -210,6 +208,13 @@ public final class RustShaderPackSourceCollector {
 			List.copyOf(assets),
 			assetBytes
 		);
+	}
+
+	static String vanillaShaderSourcePath(ResourceLocation location) {
+		if (!location.getPath().startsWith("shaders/") || location.getNamespace().equals(".") || location.getNamespace().equals("..")) {
+			throw new IllegalArgumentException("invalid copied shader resource identity: " + location);
+		}
+		return "assets/" + location.getNamespace() + "/" + location.getPath();
 	}
 
 	/** Copies only explicit TextureInput locations from the active graph. */
@@ -468,6 +473,12 @@ public final class RustShaderPackSourceCollector {
 		Properties values = new Properties();
 		try (var input = Files.newInputStream(config)) {
 			values.load(input);
+		}
+		// Iris retains the last selected filename when shaders are switched off.
+		// That preference is not an active source pack: a vanilla post effect
+		// must collect only ResourceManager bytes, never merge the inactive pack.
+		if ("false".equals(values.getProperty("enableShaders"))) {
+			return Optional.empty();
 		}
 		String name = values.getProperty("shaderPack", "").trim();
 		return name.isEmpty() || "(internal)".equals(name) ? Optional.empty() : Optional.of(name);

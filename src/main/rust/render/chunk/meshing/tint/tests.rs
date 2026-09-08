@@ -31,6 +31,26 @@ fn native_vertex_tint_matches_frozen_fixed_point_biome_blend() {
 }
 
 #[test]
+fn copied_per_block_dry_foliage_tint_is_not_replaced_by_neighbour_blending() {
+    let dry = 0xff98_6034u32 as i32;
+    let block = NativeSectionBlockRecord {
+        tint: dry,
+        flags: 1 << 1,
+        tint_lattice: [[[0xff38_9824u32 as i32; 4]; 4]; 4],
+        ..NativeSectionBlockRecord::default()
+    };
+    let state = NativeMeshingState { tint_type: TINT_CONSTANT, ..NativeMeshingState::default() };
+    for x in [-0.5, 0.0, 0.5, 1.0, 1.5] {
+        for y in [0.0, 0.125, 1.0] {
+            for z in [-0.5, 0.0, 0.5, 1.0, 1.5] {
+                assert_eq!(native_vertex_tint_color(&block, state, x, y, z), dry);
+                assert_eq!(multiply_argb(-1, native_vertex_tint_color(&block, state, x, y, z)), dry);
+            }
+        }
+    }
+}
+
+#[test]
 fn native_color_multiplication_matches_frozen_sodium_color_mixer() {
     // Mirrors Sodium's ColorMixer.mulComponentWise: (component product +
     // 0xff) >>> 8.  Division by 255 is observably different at this boundary.

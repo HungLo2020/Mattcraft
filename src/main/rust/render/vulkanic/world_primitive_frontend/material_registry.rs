@@ -42,6 +42,19 @@ pub(crate) struct SemanticTexture {
 
 const MATERIALS: &[SemanticMaterial] = &[
     SemanticMaterial {
+        key: WORLD_MATERIAL_ID_TRANSLUCENT_CUTOUT_TEXTURED,
+        resource_location: "minecraft:material/translucent_cutout_textured",
+        mode: WORLD_MATERIAL_MODE_TRANSLUCENT_CUTOUT,
+        cutout_threshold: 0.1,
+        perspective_layer_scale: 1.0,
+        sampler: MaterialSamplerPolicy::NearestClamp,
+        mip: MaterialMipPolicy::SingleMip,
+        tint: MaterialTintChannel::VertexColor,
+        emissive: false,
+        fullbright: false,
+        legacy_keys: &[],
+    },
+    SemanticMaterial {
         key: WORLD_MATERIAL_ID_CELESTIAL,
         resource_location: "minecraft:material/celestial",
         mode: WORLD_MATERIAL_MODE_TRANSLUCENT,

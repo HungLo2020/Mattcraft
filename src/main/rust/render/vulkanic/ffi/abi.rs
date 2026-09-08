@@ -49,7 +49,26 @@ pub const FFI_ABI_V28_VERSION: u32 = 28;
 pub const FFI_ABI_V29_VERSION: u32 = 29;
 /// v30 adds typed immutable atlas animation declarations (private staging only).
 pub const FFI_ABI_V30_VERSION: u32 = 30;
-pub const FFI_ABI_VERSION: u32 = 30;
+/// v31 appends backend-neutral texture filter and address descriptors.
+pub const FFI_ABI_V31_VERSION: u32 = 31;
+/// v32 appends copied per-frame engine Globals inputs.
+pub const FFI_ABI_V32_VERSION: u32 = 32;
+/// v33 appends the explicit resource mip-level count to copied mesh textures.
+pub const FFI_ABI_V33_VERSION: u32 = 33;
+/// v34 appends an explicit affine GUI material designation.
+pub const FFI_ABI_V34_VERSION: u32 = 34;
+pub const FFI_ABI_V35_VERSION: u32 = 35;
+pub const FFI_ABI_V36_VERSION: u32 = 36;
+pub const FFI_ABI_V37_VERSION: u32 = 37;
+pub const FFI_ABI_V38_VERSION: u32 = 38;
+pub const FFI_ABI_V39_VERSION: u32 = 39;
+/// v40 appends standard GUI item foil clock/speed/strength semantics.
+pub const FFI_ABI_V40_VERSION: u32 = 40;
+/// v41 carries semantic flat-item GUI scale instead of a caller raster extent.
+pub const FFI_ABI_V41_VERSION: u32 = 41;
+/// v42 appends standard world/held item foil semantics to mesh instances.
+pub const FFI_ABI_V42_VERSION: u32 = 42;
+pub const FFI_ABI_VERSION: u32 = 42;
 pub const FFI_INITIAL_PRESENTATION_SUPPORTED: bool = false;
 pub const FFI_ABI_NAME: &str = "MattMC VulkanicGAL Java-Rust batch ABI";
 pub const FFI_MAX_LABEL_BYTES: usize = 1024;
@@ -517,6 +536,23 @@ pub struct FfiGuiAffineQuadRequest {
     pub clip_top: i32,
     pub clip_width: i32,
     pub clip_height: i32,
+    pub material_mode: u32,
+    pub item_raster_scale: u32,
+    pub item_raster_corners: [f32; 6],
+    pub item_raster_layers: FfiSlice<FfiGuiItemRasterLayer>,
+}
+
+/// ABI38: immutable item-local layers nested under one GUI presentation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FfiGuiItemRasterLayer {
+    pub byte_size: u32,
+    pub material_mode: u32,
+    pub asset_id: u64,
+    pub color_argb: u32,
+    pub corners: [f32;6],
+    pub uv: [f32;4],
+    pub model_transform: [f32;16],
 }
 
 /// ABI v29 typed tiled-GUI semantics. The producer remains diagnostic-only
@@ -584,6 +620,11 @@ pub struct FfiGuiMeshBatchRequest {
     pub clip_height: i32,
     pub vertices: FfiSlice<FfiGuiMeshVertex>,
     pub indices: FfiSlice<u32>,
+    pub item_foil_mode: u32,
+    pub item_foil_clock_millis: u64,
+    pub item_foil_speed: f64,
+    pub item_foil_strength: f32,
+    pub item_raster_scale: u32,
 }
 
 #[repr(C)]
@@ -660,6 +701,31 @@ pub struct FfiGuiRawImageUpdateRequest {
     pub header: FfiHeader,
     pub generation: u64,
     pub assets: FfiSlice<FfiGuiRawImageAssetPayload>,
+    pub negotiated_feature_bits: u64,
+}
+
+/// Immutable semantic atlas identity and region, never pixels or GPU handles.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FfiGuiAtlasReference {
+    pub byte_size: u32,
+    pub texture_id: u32,
+    pub asset_id: u64,
+    pub atlas_generation: u64,
+    pub atlas_width: u32,
+    pub atlas_height: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FfiGuiAtlasReferenceUpdate {
+    pub header: FfiHeader,
+    pub revision: u64,
+    pub references: FfiSlice<FfiGuiAtlasReference>,
     pub negotiated_feature_bits: u64,
 }
 
@@ -1063,6 +1129,13 @@ pub struct FfiWorldMeshTextureAssetPayload {
     pub reserved0: u32,
     pub animation_frames: FfiSlice<FfiWorldMeshAnimationFrameRecord>,
     pub mip_png_bytes: FfiSlice<FfiBytes>,
+    /// Zero/zero retains the producer family's existing defaults. Otherwise
+    /// filter is 1=nearest, 2=linear; address is 1=repeat, 2=clamp-to-edge.
+    /// Partial or unknown descriptors are rejected before asset publication.
+    pub sampling_filter: u32,
+    pub sampling_address: u32,
+    /// Zero retains the existing family contract; positive counts are exact.
+    pub requested_mip_levels: u32,
 }
 
 #[repr(C)]
@@ -1301,6 +1374,14 @@ pub struct FfiWorldMeshInstanceRecord {
     /// semantics. -1 is the explicit non-block-entity value; this is never an
     /// Iris map lookup or backend handle.
     pub block_entity_id: i32,
+    /// 0: explicit matrix; 1: semantic section origin/full-precision camera.
+    pub terrain_placement_mode: u32,
+    pub terrain_origin: [i32; 3],
+    pub terrain_camera: [f64; 3],
+    pub item_foil_mode: u32,
+    pub item_foil_clock_millis: u64,
+    pub item_foil_speed: f64,
+    pub item_foil_strength: f32,
 }
 
 #[repr(C)]
@@ -1602,6 +1683,14 @@ pub struct FfiWholeFrameSubmitRequest {
     pub gui_projection_width: f32,
     pub gui_projection_height: f32,
     pub gui_tiled_quads: FfiSlice<FfiGuiTiledQuadRequest>,
+    /// ABI v32: immutable engine inputs, never the Java Globals GPU buffer.
+    pub engine_globals_present: u32,
+    pub engine_screen_width: u32,
+    pub engine_screen_height: u32,
+    pub engine_game_ticks: i64,
+    pub engine_partial_tick: f32,
+    pub engine_glint_alpha: f32,
+    pub engine_menu_blur_radius: i32,
 }
 
 #[repr(C)]

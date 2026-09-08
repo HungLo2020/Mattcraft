@@ -221,6 +221,7 @@ public class GuiRenderer implements AutoCloseable {
 	 * renderer is excluded from that frame rather than drawn a second time.
 	 */
 	public void collectRustGalItemSemantics() {
+		net.minecraft.client.dev.GraphicsAuditGuiFoilTiming.beginFrame();
 		int guiWidth = Minecraft.getInstance().getWindow().getGuiScaledWidth();
 		int guiHeight = Minecraft.getInstance().getWindow().getGuiScaledHeight();
 		this.renderState.forEachItem(guiItemRenderState -> {

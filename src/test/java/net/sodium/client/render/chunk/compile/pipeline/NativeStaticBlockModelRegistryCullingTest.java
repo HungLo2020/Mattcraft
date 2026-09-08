@@ -1,6 +1,5 @@
 package net.sodium.client.render.chunk.compile.pipeline;
 
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.Direction;
 import net.minecraft.server.Bootstrap;
@@ -16,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class NativeStaticBlockModelRegistryCullingTest {
     @BeforeAll
     static void bootstrap() {
-        SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+        SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 

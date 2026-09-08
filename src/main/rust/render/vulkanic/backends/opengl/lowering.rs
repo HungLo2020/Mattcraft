@@ -819,6 +819,11 @@ impl OpenGlLowerer {
         region: &TextureImageCopyRegion,
     ) -> GalResult<()> {
         let _zone = trace::Zone::new("opengl.lowering.copy-texture");
+        if region.row_order != crate::render::vulkanic::commands::TextureRowOrder::Preserve {
+            return Err(GalError::unsupported_feature(
+                "OpenGL explicit texture row reversal is not implemented",
+            ));
+        }
         let source = objects.texture(region.src_texture)?;
         let destination = objects.texture(region.dst_texture)?;
         let src_y = gl_y_for_texture_copy(
@@ -1534,10 +1539,10 @@ fn opengl_blend_state(blend: BlendMode) -> OpenGlBlendState {
             dst_alpha: glow::ZERO,
         }),
         BlendMode::Glint => Some(OpenGlBlendFactors {
-            src_color: glow::DST_COLOR,
-            dst_color: glow::SRC_COLOR,
-            src_alpha: glow::ONE,
-            dst_alpha: glow::ZERO,
+            src_color: glow::SRC_COLOR,
+            dst_color: glow::ONE,
+            src_alpha: glow::ZERO,
+            dst_alpha: glow::ONE,
         }),
         BlendMode::Vignette => Some(OpenGlBlendFactors {
             src_color: glow::ZERO,
@@ -1744,6 +1749,18 @@ mod tests {
             gl_y_for_texture_copy_values(TextureDimension::D3, 64, 1, 5, 7).unwrap()
         );
         assert!(gl_y_for_texture_copy_values(TextureDimension::D2, 16, 0, 15, 2).is_err());
+    }
+
+    #[test]
+    fn glint_blend_matches_frozen_rgb_addition_and_preserves_destination_alpha() {
+        let state=opengl_blend_state(BlendMode::Glint);
+        assert!(state.enabled);
+        assert_eq!(glow::FUNC_ADD,state.color_op);
+        assert_eq!(glow::FUNC_ADD,state.alpha_op);
+        assert_eq!(Some(OpenGlBlendFactors {
+            src_color:glow::SRC_COLOR,dst_color:glow::ONE,
+            src_alpha:glow::ZERO,dst_alpha:glow::ONE,
+        }),state.factors);
     }
 
     #[test]

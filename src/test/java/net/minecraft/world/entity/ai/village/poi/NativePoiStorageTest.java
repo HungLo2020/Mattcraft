@@ -1,7 +1,6 @@
 package net.minecraft.world.entity.ai.village.poi;
 
 import com.mojang.serialization.DynamicOps;
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.RegistryAccess;
@@ -46,7 +45,7 @@ class NativePoiStorageTest {
 
 	@BeforeAll
 	static void bootstrapMinecraft() {
-		SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+		SharedConstants.tryDetectVersion();
 		Bootstrap.bootStrap();
 	}
 

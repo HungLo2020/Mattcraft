@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import gzip
 import os
 import re
@@ -632,6 +633,638 @@ def gameplay_artifact_for(temp: Path, mode: harness.ModeSpec, *, world: str = "O
 
 
 class GraphicsAuditHarnessTests(unittest.TestCase):
+    def test_capture_files_never_mix_retries_or_substitute_tail_for_full_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("meta_old.txt", "meta_new.txt", "shader_summary_old.txt",
+                         "shader_summary_new.txt", "latest_new.log", "latest_tail_new.log",
+                         "validation_events_old.log"):
+                (root / name).write_text(name, encoding="utf-8")
+                os.utime(root / name, (1, 1))
+            os.utime(root / "meta_new.txt", (2, 2))
+            # Older artifacts can acquire newer mtimes when copied/recovered.
+            os.utime(root / "shader_summary_old.txt", (3, 3))
+            os.utime(root / "latest_tail_new.log", (3, 3))
+            files = harness.load_capture_files(root)
+            self.assertEqual(files["shader_summary"], root / "shader_summary_new.txt")
+            self.assertEqual(files["latest_log"], root / "latest_new.log")
+            self.assertEqual(files["latest_tail"], root / "latest_tail_new.log")
+            self.assertIsNone(files["validation_events"])
+
+    def test_capture_files_use_frozen_declared_screenshot_without_guessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            declared = root / "deterministic_camera_capture_20260907-213837.json"
+            declared.write_text("{}", encoding="utf-8")
+            (root / "deterministic_camera_capture_wrong.json").write_text("{}", encoding="utf-8")
+            meta = root / "meta_20260907_213837.txt"
+            meta.write_text(f"deterministic_metadata={declared}\n", encoding="utf-8")
+            self.assertEqual(harness.load_capture_files(root)["deterministic"], declared)
+            declared.unlink()
+            self.assertIsNone(harness.load_capture_files(root)["deterministic"])
+            meta.write_text("deterministic_metadata=../outside.json\n", encoding="utf-8")
+            self.assertIsNone(harness.load_capture_files(root)["deterministic"])
+
+    def test_creeper_override_changes_only_resolution_and_rejects_bundled_output(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root / "pack",
+                capture_runner.gui_resource_pack_specs("post-creeper-eight")[0])
+            relative = "assets/minecraft/post_effect/creeper.json"
+            actual = json.loads((root / "pack" / relative).read_text())
+            expected = json.loads((Path(__file__).resolve().parents[2] / "src/main/resources" / relative).read_text())
+            expected["passes"][1]["uniforms"]["BitsConfig"][0]["value"] = 8.0
+            self.assertEqual(expected, actual)
+            self.assertEqual([relative], [str(p.relative_to(root / "pack"))
+                for p in (root / "pack" / "assets").rglob("*") if p.is_file()])
+            before = Image.new("RGB", (128, 72), (30, 100, 170))
+            before.paste((10, 20, 30), (0, 36, 128, 72))
+            before.save(root / "before.png")
+            after = Image.new("RGB", before.size, (0, 115, 0))
+            after.paste((0, 0, 0), (0, 36, 128, 72))
+            after.save(root / "after.png")
+            self.assertTrue(harness.creeper_effect_image_witness(root / "before.png", root / "after.png", resolution=8)["passed"])
+            self.assertFalse(harness.creeper_effect_image_witness(root / "before.png", root / "after.png", resolution=16)["passed"])
+        self.assertEqual(8, harness.post_effect_fixture_resolution("post-creeper-eight"))
+        self.assertEqual(8, harness.post_effect_fixture_resolution("post-creeper-eight", "file/unrelated"))
+        self.assertEqual(16, harness.post_effect_fixture_resolution("post-creeper-eight", "file/mattmc-post-creeper-eight"))
+
+    def test_creeper_witness_models_only_adjacent_boundary_texels_not_linear_or_distant_samples(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = Image.new("RGB", (128, 72))
+            # At each x=4k boundary the adjacent texels are x=4k-1
+            # (green200) and x=4k (green60). The shader independently gives
+            # green173 and38. Interior texels are deliberately different.
+            for x in range(128):
+                before.paste((0, [60, 130, 5, 200][x % 4], 0), (x, 0, x + 1, 72))
+            before.save(root / "before.png")
+            for value in (38, 173):
+                Image.new("RGB", before.size, (0, value, 0)).save(root / "after.png")
+                result = harness.creeper_effect_image_witness(root / "before.png", root / "after.png")
+                self.assertTrue(result["passed"])
+                self.assertEqual("nearest-mosaic-boundary-discrete-footprint-v1", result["sampling_model"])
+            # Neither an interpolated boundary color nor a texel two steps
+            # away is an admissible nearest sample, despite lying inside
+            # the broad numeric range of possible output colors.
+            for value in (105, 0, 115):
+                Image.new("RGB", before.size, (0, value, 0)).save(root / "after.png")
+                self.assertFalse(harness.creeper_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+
+    def test_creeper_witness_rejects_blank_unchanged_flat_and_inverted_output(self):
+        from PIL import Image, ImageOps
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = Image.new("RGB", (128, 72), (30, 80, 170))
+            before.paste((10, 20, 30), (0, 36, 128, 72))
+            before.save(root / "before.png")
+            # Independently calculated bundled two-pass output: first-pass
+            # green99/24; floor to6/16 and1/16, then saturation gives115/19.
+            expected = Image.new("RGB", before.size, (0, 115, 0))
+            expected.paste((0, 19, 0), (0, 36, 128, 72))
+            expected.save(root / "after.png")
+            self.assertTrue(harness.creeper_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+            for wrong in (before, ImageOps.flip(expected), Image.new("RGB", before.size),
+                          Image.new("RGB", before.size, (0, 115, 0))):
+                wrong.save(root / "after.png")
+                self.assertFalse(harness.creeper_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+
+    def test_invert_witness_requires_visible_inverse_not_unchanged_or_blank_output(self):
+        from PIL import Image, ImageOps
+        definition = json.loads((Path(__file__).resolve().parents[2] /
+            "src/main/resources/assets/minecraft/post_effect/invert.json").read_text())
+        self.assertEqual(0.8, definition["passes"][0]["uniforms"]["InvertConfig"][0]["value"])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = Image.new("RGB", (128, 72), (30, 80, 170))
+            before.save(root / "before.png")
+            expected = before.point([round(0.2 * value + 0.8 * (255 - value)) for value in range(256)] * 3)
+            expected.save(root / "after.png")
+            self.assertTrue(harness.invert_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+            partial = before.copy()
+            partial.paste(expected.crop((0, 0, 128, 36)), (0, 0))
+            partial.save(root / "after.png")
+            self.assertFalse(harness.invert_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+            before.save(root / "after.png")
+            self.assertFalse(harness.invert_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+            Image.new("RGB", (128, 72)).save(root / "after.png")
+            self.assertFalse(harness.invert_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+            Image.new("RGB", (64, 36)).save(root / "after.png")
+            self.assertFalse(harness.invert_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+
+    def test_post_effect_requires_control_and_real_pairs(self):
+        self.assertFalse(harness.post_effect_parity_report({"pairs": []}, "invert", None)["passed"])
+        self.assertFalse(harness.post_effect_parity_report({"pairs": [{}]}, "invert", None)["passed"])
+        self.assertTrue(harness.post_effect_parity_report({}, "", None)["passed"])
+
+    def test_post_effect_pack_removal_requires_restored_bundled_amount(self):
+        self.assertEqual(0.25, harness.post_effect_fixture_amount("post-invert-quarter"))
+        self.assertEqual(0.25, harness.post_effect_fixture_amount("post-invert-quarter", "file/unrelated"))
+        self.assertEqual(0.8, harness.post_effect_fixture_amount("post-invert-quarter", "file/mattmc-post-invert-quarter"))
+        self.assertEqual(0.8, harness.post_effect_fixture_amount(""))
+
+    def test_post_effect_override_changes_only_selected_uniform_and_has_distinct_witness(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root / "pack",
+                capture_runner.gui_resource_pack_specs("post-invert-quarter")[0])
+            relative = "assets/minecraft/post_effect/invert.json"
+            definition = json.loads((root / "pack" / relative).read_text())
+            original = json.loads((Path(__file__).resolve().parents[2] /
+                "src/main/resources" / relative).read_text())
+            original["passes"][0]["uniforms"]["InvertConfig"][0]["value"] = 0.25
+            self.assertEqual(original, definition)
+            self.assertEqual([relative], [str(p.relative_to(root / "pack"))
+                for p in (root / "pack" / "assets").rglob("*") if p.is_file()])
+            before = Image.new("RGB", (128, 72), (30, 80, 170))
+            before.save(root / "before.png")
+            before.point([round(0.75 * v + 0.25 * (255-v)) for v in range(256)] * 3).save(root / "after.png")
+            self.assertTrue(harness.invert_effect_image_witness(root / "before.png", root / "after.png", amount=0.25)["passed"])
+            self.assertFalse(harness.invert_effect_image_witness(root / "before.png", root / "after.png", amount=0.8)["passed"])
+
+    def test_post_effect_receipt_rejects_wrong_unselected_or_insufficient_setup(self):
+        pair = {"baseline_artifact": "after-b", "current_artifact": "after-c",
+                "baseline_image": "image-b", "current_image": "image-c",
+                "fixture_equivalence": {"status": "passed"}}
+        previous = {**pair, "baseline_artifact": "before-b", "current_artifact": "before-c"}
+        reference = {"success": True, "cross_repository_visual_parity": {"pairs": [previous]}}
+        valid = {"schema": "normal-post-effect-fixture-v1", "effect": "invert",
+                 "selected": True, "appliedFrames": 2}
+        for change in ({}, {"selected": False}, {"effect": "spider"},
+                       {"appliedFrames": 1}, {"appliedFrames": True}, {"schema": "unknown"}):
+            receipt = {**valid, **change}
+            with mock.patch.object(harness, "read_json", return_value=reference), \
+                 mock.patch.object(harness, "deterministic_capture_document",
+                     side_effect=lambda path: {} if str(path).startswith("before") else {"postEffectFixture": receipt}), \
+                 mock.patch.object(harness, "deterministic_visual_fixture_equivalence", return_value={"status": "passed"}), \
+                 mock.patch.object(harness, "invert_effect_image_witness", return_value={"passed": True}):
+                report = harness.post_effect_parity_report({"pairs": [pair]}, "invert", Path("control"))
+                self.assertEqual(not change, report["passed"], change)
+
+    def test_post_effect_selection_is_forwarded_equally_to_both_clients(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = harness.parse_args(["capture", "--capture-post-effect", "invert",
+                                       "--gui-resource-pack-scenario", "post-invert-quarter"])
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.postEffect=invert",
+                              shlex.split(env["JAVA_TOOL_OPTIONS"]))
+                counts = [option for option in shlex.split(env["JAVA_TOOL_OPTIONS"])
+                          if option.startswith("-Dmattmc.dev.deterministicCameraCapture.poseCount=")]
+                self.assertEqual("-Dmattmc.dev.deterministicCameraCapture.poseCount=1", counts[-1])
+
+    def test_spider_capture_cannot_claim_acceptance_without_control_and_receipts(self):
+        args = harness.parse_args(["capture", "--capture-post-effect", "spider"])
+        self.assertEqual("spider", args.capture_post_effect)
+        result = harness.post_effect_parity_report({"pairs": [{"passed": True}]}, "spider", Path("control"))
+        self.assertFalse(result["passed"])
+        self.assertEqual("post-effect-evidence-invalid", result["pairs"][0]["status"])
+
+    def test_spider_override_and_removal_are_forwarded_equally_to_both_clients(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = harness.parse_args(["capture", "--capture-post-effect", "spider",
+                "--gui-resource-pack-scenario", "post-spider-dim", "--world-resource-reload",
+                "--world-reload-remove-pack", "file/mattmc-post-spider-dim"])
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                command, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                self.assertEqual("post-spider-dim", command[command.index("--gui-resource-pack-scenario") + 1])
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.postEffect=spider", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.resourceReload=true", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.reloadRemovePack=file/mattmc-post-spider-dim", options)
+
+    def test_multiline_import_fixture_changes_only_directive_spelling(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for scenario, target in (("post-spider-namespaced", "plain"), ("post-spider-multiline-import", "multiline")):
+                capture_runner.write_gui_resource_pack(root / target, capture_runner.gui_resource_pack_specs(scenario)[0])
+            relative = "assets/mattmc_audit/shaders/post/spider_tint.fsh"
+            plain = (root / "plain" / relative).read_text()
+            multiline = (root / "multiline" / relative).read_text()
+            self.assertEqual(plain.replace("#moj_import", "#/* first token gap\ncontinued */moj_import/* second token gap\ncontinued */").replace("*/ <", "*/<"), multiline)
+            for path in (root / "plain" / "assets").rglob("*"):
+                if path.is_file() and str(path.relative_to(root / "plain")) != relative:
+                    self.assertEqual(path.read_bytes(), (root / "multiline" / path.relative_to(root / "plain")).read_bytes())
+            self.assertEqual(0.5, harness.post_effect_fixture_spider_red("post-spider-multiline-import"))
+            self.assertEqual(1.0, harness.post_effect_fixture_spider_red("post-spider-multiline-import", "file/mattmc-post-spider-multiline-import"))
+            capture_runner.write_gui_resource_pack(root / "version", capture_runner.gui_resource_pack_specs("post-spider-multiline-version")[0])
+            self.assertEqual(multiline.replace("#version 330", "#/* version token gap\ncontinued */version/* version number gap\ncontinued */330", 1), (root / "version" / relative).read_text())
+            self.assertEqual(0.5, harness.post_effect_fixture_spider_red("post-spider-multiline-version"))
+
+    def test_water_detail_gate_requires_known_open_water_camera(self):
+        doc = {"cameraType": "FIRST_PERSON", "dimension": "minecraft:overworld",
+               "window": {"width": 1280, "height": 720}, "captures": [{"poseName": "initial",
+               "position": {"x": 150.5, "y": 100.0, "z": 530.5}, "observedYaw": 105.0, "observedPitch": 10.0}]}
+        self.assertTrue(harness.water_detail_fixture_matches(doc))
+        self.assertFalse(harness.water_detail_fixture_matches({}))
+        doc["captures"][0]["observedYaw"] = 0.0
+        self.assertFalse(harness.water_detail_fixture_matches(doc))
+
+    def test_flowing_water_requires_the_exact_settled_world_receipt(self):
+        receipt = {"fixture": "single-source-flow-channel-v1", "origin": "145, 98, 530",
+                   "direction": "west", "cells": 150, "expectedLevels": list(range(8)), "complete": True}
+        self.assertTrue(harness.flowing_water_fixture_matches({"flowingWaterFixture": receipt}))
+        for key, wrong in (("complete", False), ("complete", 1), ("cells", 149), ("cells", 150.0),
+                           ("expectedLevels", [False, True, 2, 3, 4, 5, 6, 7]), ("expectedLevels", [0] * 8),
+                           ("origin", "145, 99, 534"), ("direction", "south")):
+            self.assertFalse(harness.flowing_water_fixture_matches({"flowingWaterFixture": {**receipt, key: wrong}}))
+        self.assertFalse(harness.flowing_water_fixture_matches({}))
+
+    def test_flowing_water_request_reaches_both_launchers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                    "--require-flowing-water", "--gui-resource-pack-scenario", "water-mip-compatible"])
+                args._canonical_fixture_run_source = root / "fixture"
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                self.assertIn("-Dmattmc.dev.graphicsAuditFlowingWater=true", options)
+                self.assertIn("-Dmattmc.dev.graphicsAuditWaterCycleCapture=true", options)
+                prefix = "-Dmattmc.dev.deterministicCameraCapture.poseCount="
+                self.assertEqual(prefix + "1", [value for value in options if value.startswith(prefix)][-1])
+
+    def test_flowing_surface_gate_cannot_be_diluted_by_matching_stone_or_background(self):
+        from PIL import Image
+        baseline = Image.new("RGB", (1280, 720), (80, 80, 80))
+        points = [[500 + x * 10, 420 + y * 10] for y in range(5) for x in range(3)]
+        boxes = harness.flowing_water_surface_boxes(points)
+        self.assertEqual(15, len(set(boxes)))
+        self.assertTrue(all(0 <= l < r <= 1280 and 0 <= t < b <= 720 for l, t, r, b in boxes))
+        self.assertFalse(harness.flowing_water_surface_evidence(baseline, baseline, points)["passed"])
+        for box in boxes:
+            baseline.paste((40, 60, 100), box)
+        self.assertTrue(harness.flowing_water_surface_evidence(baseline, baseline, points)["passed"])
+        for invalid in (None, [], points[:14], [[0, 0]] * 15, [[float("nan"), 5]] * 15, [[True, 5]] * 15):
+            self.assertFalse(harness.flowing_water_surface_evidence(baseline, baseline, invalid)["passed"])
+        for box in boxes:
+            wrong = baseline.copy()
+            wrong.paste((80, 80, 80), box)
+            self.assertFalse(harness.flowing_water_surface_evidence(baseline, wrong, points)["passed"])
+
+    def test_flowing_report_requires_matching_captured_projection_and_keeps_mip_gate(self):
+        from PIL import Image
+        import copy
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = Image.new("RGB", (1280, 720))
+            image.putdata([(40, 60, 100), (60, 100, 160)] * (1280 * 720 // 2))
+            for name in ("baseline", "current"):
+                image.save(root / (name + ".png"))
+            document = {"cameraType": "FIRST_PERSON", "dimension": "minecraft:overworld",
+                "window": {"width": 1280, "height": 720}, "captures": [{"poseName": "initial",
+                "position": {"x": 150.5, "y": 100.0, "z": 530.5}, "observedYaw": 105.0, "observedPitch": 10.0}],
+                "flowingWaterFixture": {"fixture": "single-source-flow-channel-v1", "origin": "145, 98, 530",
+                    "direction": "west", "cells": 150, "expectedLevels": list(range(8)), "complete": True},
+                "flowingWaterSurfaceAtCapture": [[500 + x * 10, 420 + y * 10] for y in range(5) for x in range(3)]}
+            current = copy.deepcopy(document)
+            pair = {"baseline_image": str(root / "baseline.png"), "current_image": str(root / "current.png"),
+                    "baseline_artifact": str(root / "baseline.json"), "current_artifact": str(root / "current.json"),
+                    "fixture_equivalence": {"status": "passed"}}
+            def receipt(path):
+                return current if path.name == "current.json" else document
+            def report():
+                return harness.water_detail_parity_report({"pairs": [pair]}, True, "Origin", "", 5, flowing_water=True)
+            with mock.patch.object(harness, "deterministic_capture_document", side_effect=receipt), \
+                 mock.patch.object(harness, "block_display_animation_upload_equivalence", return_value={"passed": True}) as upload:
+                self.assertTrue(report()["passed"])
+                self.assertEqual({"require_water": True, "required_mip_levels": 5, "flowing_water": True}, upload.call_args.kwargs)
+                current["flowingWaterSurfaceAtCapture"][0][0] += 1
+                self.assertFalse(report()["passed"], "same image cannot substitute for matching camera observations")
+                current = copy.deepcopy(document)
+                current.pop("flowingWaterSurfaceAtCapture")
+                self.assertFalse(report()["passed"])
+                current = copy.deepcopy(document)
+                upload.return_value = {"passed": False}
+                self.assertFalse(report()["passed"], "matching image cannot substitute for matching per-mip upload bytes")
+
+    def test_water_detail_gate_rejects_smoothing_flat_color_and_color_bias(self):
+        from PIL import Image, ImageFilter, ImageChops
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = Image.new("RGB", (1280, 720))
+            image.putdata([(40, 80, 120), (100, 160, 220)] * (1280 * 720 // 2))
+            baseline = root / "baseline.png"
+            image.save(baseline)
+            self.assertTrue(harness.water_detail_image_pair(baseline, baseline)["passed"])
+            for name, wrong in (("blur", image.filter(ImageFilter.GaussianBlur(2))),
+                                ("flat", Image.new("RGB", image.size, (70, 120, 170))),
+                                ("bias", ImageChops.add(image, Image.new("RGB", image.size, (30, 30, 30))))):
+                path = root / (name + ".png")
+                wrong.save(path)
+                self.assertFalse(harness.water_detail_image_pair(baseline, path)["passed"], name)
+            self.assertFalse(harness.water_detail_parity_report({}, True, "Origin", "")["passed"])
+
+    def test_namespaced_spider_fixture_changes_stage_identity_not_bundled_uniforms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root, capture_runner.gui_resource_pack_specs("post-spider-namespaced")[0])
+            relative = "assets/minecraft/post_effect/spider.json"
+            definition = json.loads((root / relative).read_text())
+            original = json.loads((Path(__file__).resolve().parents[2] / "src/main/resources" / relative).read_text())
+            original["passes"][-1]["fragment_shader"] = "mattmc_audit:post/spider_tint"
+            self.assertEqual(original, definition)
+            shader = (root / "assets/mattmc_audit/shaders/post/spider_tint.fsh").read_text()
+            self.assertIn("#moj_import <mattmc_tint:mattmc_namespace_tint.glsl>", shader)
+            self.assertIn("fixtureTint(texture(InSampler, texCoord) * ColorModulate)", shader)
+            right = (root / "assets/mattmc_tint/shaders/include/mattmc_namespace_tint.glsl").read_text()
+            wrong = (root / "assets/minecraft/shaders/include/mattmc_namespace_tint.glsl").read_text()
+            self.assertEqual(right.replace("0.5", "0.125"), wrong)
+            self.assertEqual(4, len([p for p in (root / "assets").rglob("*") if p.is_file()]))
+            self.assertEqual(0.5, harness.post_effect_fixture_spider_red("post-spider-namespaced"))
+            self.assertEqual(1.0, harness.post_effect_fixture_spider_red("post-spider-namespaced", "file/mattmc-post-spider-namespaced"))
+
+    def test_mixed_water_pack_keeps_one_pose_in_both_launchers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                    "--world-static-terrain-scenario", "translucent-mixed",
+                    "--gui-resource-pack-scenario", "water-face-isolation"])
+                args._canonical_fixture_run_source = root / "fixture"
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                for key, expected in (("poseCount", "1"), ("yawDelta", "0.0")):
+                    prefix = "-Dmattmc.dev.deterministicCameraCapture." + key + "="
+                    self.assertEqual(expected, [s.removeprefix(prefix) for s in options if s.startswith(prefix)][-1])
+
+    def test_water_face_isolation_is_static_texture_input_not_renderer_or_model_override(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root, capture_runner.gui_resource_pack_specs("water-face-isolation")[0])
+            colors = {"water_still": (255, 255, 255, 128), "water_flow": (255, 0, 0, 128),
+                      "water_overlay": (0, 255, 0, 128), "oak_door_top": (0, 0, 0, 0),
+                      "oak_door_bottom": (0, 0, 0, 0)}
+            expected = {"pack.mcmeta"}
+            for name, color in colors.items():
+                relative = f"assets/minecraft/textures/block/{name}.png"
+                expected.update((relative, relative + ".mcmeta"))
+                with Image.open(root / relative) as image:
+                    self.assertEqual((16, 16), image.size)
+                    self.assertEqual([(256, color)], image.getcolors())
+                self.assertEqual({}, json.loads((root / (relative + ".mcmeta")).read_text()))
+            self.assertEqual(expected, {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()})
+
+    def test_bottom_surface_gate_requires_projection_and_every_water_patch(self):
+        from PIL import Image
+        import copy
+        points = [[400 + x * 12, 400 + y * 12] for x in range(3) for y in range(3)]
+        doc = {"mixedFluidFixture": {"variant": "bottom_north", "complete": True},
+               "mixedFluidBottomSurfaceAtCapture": points}
+        image = Image.new("RGB", (1280, 720), (40, 70, 130))
+        def check(other, pixels):
+            return harness.mixed_fluid_bottom_surface_evidence(doc, other, image, pixels)
+        self.assertTrue(check(doc, image)["passed"])
+        for index in range(9):
+            wrong = image.copy()
+            wrong.paste((130, 130, 130), harness.flowing_water_surface_boxes(points, 9)[index])
+            self.assertFalse(check(doc, wrong)["passed"])
+        for bad in (None, points[:-1], [points[0]] * 9, [[float("nan"), 400]] * 9):
+            other = copy.deepcopy(doc)
+            other["mixedFluidBottomSurfaceAtCapture"] = bad
+            self.assertFalse(check(other, image)["passed"])
+        other = copy.deepcopy(doc)
+        other["mixedFluidBottomSurfaceAtCapture"][0][0] += 1
+        self.assertFalse(check(other, image)["passed"])
+        self.assertIsNone(harness.mixed_fluid_bottom_surface_evidence({}, {}, image, image))
+
+    def test_door_overlap_gate_requires_exact_fixture_and_each_local_tile(self):
+        from PIL import Image
+        import copy
+        doc = {"cameraType": "FIRST_PERSON", "dimension": "minecraft:overworld",
+               "window": {"width": 1280, "height": 720},
+               "mixedFluidFixture": {"variant": "door", "complete": True,
+                   "placement": "146,99,532/west", "cells": 64, "matchingCells": 64},
+               "captures": [{"poseName": "initial", "position": {"x": 150.5, "y": 100.0, "z": 530.5},
+                   "observedYaw": 105.0, "observedPitch": 10.0, "gameTime": 6000}]}
+        image = Image.new("RGB", (1280, 720), (40, 70, 130))
+        image.paste((80, 100, 150), (350, 400, 380, 620))
+        good = harness.mixed_fluid_door_surface_evidence(doc, doc, image, image)
+        self.assertTrue(good["passed"])
+        self.assertEqual(12, len(good["regions"]))
+        for region in good["regions"]:
+            wrong = image.copy()
+            wrong.paste((0, 0, 0), region["crop_box"])
+            self.assertFalse(harness.mixed_fluid_door_surface_evidence(doc, doc, image, wrong, 999)["passed"])
+        for key, value in (("complete", False), ("matchingCells", 63), ("placement", "other")):
+            other = copy.deepcopy(doc)
+            other["mixedFluidFixture"][key] = value
+            self.assertFalse(harness.mixed_fluid_door_surface_evidence(doc, other, image, image)["passed"])
+        for key in ("observedYaw", "observedPitch", "gameTime"):
+            other = copy.deepcopy(doc)
+            other["captures"][0][key] += 1
+            self.assertFalse(harness.mixed_fluid_door_surface_evidence(doc, other, image, image)["passed"])
+        blank = Image.new("RGB", (1280, 720))
+        self.assertFalse(harness.mixed_fluid_door_surface_evidence(doc, doc, blank, blank)["passed"])
+        self.assertIsNone(harness.mixed_fluid_door_surface_evidence({}, {}, image, image))
+
+    def test_camera_overlap_pair_requires_every_pose_and_projected_interior(self):
+        from PIL import Image
+        import copy
+        from DevUtils.Audit.test_native_terrain_order import receipts
+        captures, _ = receipts()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            docs = []
+            for side in ("frozen", "current"):
+                folder = root / side
+                folder.mkdir()
+                rows = copy.deepcopy(captures)
+                for row in rows:
+                    row.update({"requestedYaw": 105, "observedYaw": 105, "requestedPitch": 10, "observedPitch": 10,
+                                "dimension": "minecraft:overworld", "gameTime": 6000, "shaderEnabled": "false",
+                                "window": {"width": 1280, "height": 720}})
+                    image = Image.new("RGB", (1280, 720), (20, 20, 20))
+                    image.paste((90, 120, 150), (380, 380, 500, 500))
+                    row["screenshot"] = str(folder / f"{row['index']:02d}_{row['poseName']}.png")
+                    image.save(row["screenshot"])
+                    ack = {**row, "status": "captured", "cameraPoseHistory": [10, 10, 105, 105],
+                           "translucentFixtureProjection": {"fixture": "three-pane-crossing-v1", "origin": [146, 99, 532],
+                               "direction": "west", "cells": 42, "matchingCells": 42, "complete": True,
+                               "points": [[400 + x * 12, 400 + y * 12] for x in range(3) for y in range(3)]}}
+                    (folder / f"capture_request_{row['index']:02d}_{row['poseName']}.ack.json").write_text(json.dumps(ack))
+                docs.append({"staticTerrainFixtureScenario": "translucent-overlap", "captures": rows})
+            self.assertTrue(harness.translucent_camera_visual_evidence(*docs)["passed"])
+            for index in range(7):
+                path = Path(docs[1]["captures"][index]["screenshot"])
+                with Image.open(path) as source:
+                    image = source.copy()
+                wrong = image.copy()
+                wrong.paste((0, 0, 0), (398, 398, 403, 403))
+                wrong.save(path)
+                self.assertFalse(harness.translucent_camera_visual_evidence(*docs, 999)["passed"])
+                image.save(path)
+            short = copy.deepcopy(docs[1])
+            short["captures"].pop()
+            self.assertFalse(harness.translucent_camera_visual_evidence(docs[0], short)["passed"])
+            path = next((root / "current").glob("*.ack.json"))
+            original = json.loads(path.read_text())
+            for key, value in [("cameraPoseHistory", [10, 10, 100, 105]), ("renderedFrameIndex", 0),
+                               ("translucentFixtureProjection", None)]:
+                path.write_text(json.dumps({**original, key: value}))
+                self.assertFalse(harness.translucent_camera_visual_evidence(*docs)["passed"])
+            path.write_text(json.dumps(original))
+
+            for doc in docs:
+                doc["worldResourceReload"] = {"selectedAtCapture": ["vanilla", "file/mattmc-water-mip-compatible"]}
+            # A mip request is not evidence of actual allocated/bound levels.
+            self.assertFalse(harness.translucent_camera_visual_evidence(*docs)["passed"])
+            for folder in (root / "frozen", root / "current"):
+                for ack_path in folder.glob("*.ack.json"):
+                    ack = json.loads(ack_path.read_text())
+                    ack["translucentFixtureProjection"].update(atlasMipLevels=5, requestedAtlasMipLevels=5)
+                    ack["nativeTerrainOrder"] = {"textureMipLevels": 5}
+                    ack_path.write_text(json.dumps(ack))
+            evidence = harness.translucent_camera_visual_evidence(*docs)
+            self.assertTrue(evidence["passed"])
+            self.assertTrue(all(pose["atlas_mips"]["actual_levels"] == 5 for pose in evidence["poses"]))
+            for ack_path in (root / "current").glob("*.ack.json"):
+                original = json.loads(ack_path.read_text())
+                for value in (0, 1, True, None):
+                    wrong = copy.deepcopy(original)
+                    wrong["nativeTerrainOrder"]["textureMipLevels"] = value
+                    ack_path.write_text(json.dumps(wrong))
+                    self.assertFalse(harness.translucent_camera_visual_evidence(*docs)["passed"])
+                ack_path.write_text(json.dumps(original))
+
+    def test_bottom_water_pack_reveals_support_without_changing_its_model(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root, capture_runner.gui_resource_pack_specs("water-bottom-isolation")[0])
+            path = root / "assets/minecraft/textures/block/blue_stained_glass.png"
+            with Image.open(path) as image:
+                self.assertEqual([(256, (0, 0, 0, 0))], image.getcolors())
+            self.assertFalse((root / "assets/minecraft/models").exists())
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                    "--world-static-terrain-scenario", "translucent-mixed",
+                    "--gui-resource-pack-scenario", "water-bottom-isolation"])
+                args._canonical_fixture_run_source = root / "fixture"
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                for key, expected in (("poseCount", "1"), ("yawDelta", "0.0"), ("fixedY", "96.0"), ("fixedPitch", "-20.0")):
+                    prefix = "-Dmattmc.dev.deterministicCameraCapture." + key + "="
+                    self.assertEqual(expected, [s.removeprefix(prefix) for s in options if s.startswith(prefix)][-1])
+
+    def test_lava_minification_signal_preserves_means_alpha_and_source(self):
+        from PIL import Image
+        source = Image.new("RGBA", (2, 1))
+        source.putdata([(210, 113, 31, 255), (250, 4, 0, 128)])
+        before = source.tobytes()
+        result = capture_runner.lava_minification_image(source)
+        self.assertEqual((16, 8), result.size)
+        self.assertEqual(before, source.tobytes())
+        for y in range(0, result.height, 2):
+            for x in range(0, result.width, 2):
+                group = [result.getpixel((x + dx, y + dy)) for dx in (0, 1) for dy in (0, 1)]
+                self.assertEqual(source.getpixel((x // 8, 0)),
+                                 tuple(sum(p[c] for p in group) // 4 for c in range(4)))
+                self.assertNotEqual(group[0], group[1])
+
+    def test_lava_minification_pack_changes_only_lava_and_atlas_filter(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root, capture_runner.gui_resource_pack_specs("lava-mip-minification")[0])
+            assets = {p.relative_to(root).as_posix() for p in (root / "assets").rglob("*") if p.is_file()}
+            expected = {"assets/minecraft/atlases/blocks.json"}
+            for name in ("lava_still", "lava_flow"):
+                relative = f"assets/minecraft/textures/block/{name}.png"
+                expected.update((relative, relative + ".mcmeta"))
+                original = Path(__file__).resolve().parents[2] / "src/main/resources" / relative
+                self.assertEqual(original.with_name(original.name + ".mcmeta").read_bytes(),
+                                 (root / (relative + ".mcmeta")).read_bytes())
+                with Image.open(original) as source, Image.open(root / relative) as image:
+                    self.assertEqual((source.width * 8, source.height * 8), image.size)
+            self.assertEqual(expected, assets)
+
+    def test_water_mip_fixture_only_filters_eight_unused_unaligned_item_sprites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root, capture_runner.gui_resource_pack_specs("water-mip-compatible")[0])
+            assets = [p for p in (root / "assets").rglob("*") if p.is_file()]
+            self.assertEqual([root / "assets/minecraft/atlases/blocks.json"], assets)
+            definition = json.loads(assets[0].read_text())
+            self.assertEqual({"sources"}, set(definition))
+            self.assertEqual(8, len(definition["sources"]))
+            for source in definition["sources"]:
+                self.assertEqual("minecraft:filter", source["type"])
+                self.assertEqual("^minecraft$", source["pattern"]["namespace"])
+                pattern = source["pattern"]["path"]
+                self.assertTrue(pattern.startswith("^item/tacz/") and pattern.endswith("$"))
+                self.assertIsNone(re.fullmatch(pattern, "block/water_still"))
+                self.assertIsNone(re.fullmatch(pattern, "item/carrot"))
+
+    def test_spider_cpu_model_preserves_constant_color_and_known_central_lens_texel(self):
+        from PIL import Image
+        from post_effect_reference import spider_reference_image
+        constant = spider_reference_image(Image.new("RGB", (64, 64), (50, 100, 200)))
+        self.assertEqual([(4096, (50, 80, 160))], constant.getcolors())
+        source = Image.new("RGB", (64, 64))
+        source.putdata([(x * 3, y * 3, x + y) for y in range(64) for x in range(64)])
+        result = spider_reference_image(source)
+        # Bottom-center only intersects the primary lens, clear of clipping
+        # and vignette. Its UV maps to exact nearest source texel (32, 39).
+        self.assertEqual((96, 94, 57), result.getpixel((32, 48)))
+
+    def test_spider_resource_override_changes_only_red_and_wrong_value_is_rejected(self):
+        from PIL import Image
+        from post_effect_reference import spider_reference_image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root / "pack",
+                capture_runner.gui_resource_pack_specs("post-spider-dim")[0])
+            relative = "assets/minecraft/post_effect/spider.json"
+            definition = json.loads((root / "pack" / relative).read_text())
+            original = json.loads((Path(__file__).resolve().parents[2] / "src/main/resources" / relative).read_text())
+            original["passes"][-1]["uniforms"]["BlitConfig"][0]["value"][0] = 0.5
+            self.assertEqual(original, definition)
+            self.assertEqual([relative], [str(p.relative_to(root / "pack"))
+                for p in (root / "pack" / "assets").rglob("*") if p.is_file()])
+            source = Image.new("RGB", (64, 64), (200, 100, 200))
+            source.save(root / "before.png")
+            spider_reference_image(source, 0.5).save(root / "after.png")
+            self.assertTrue(harness.spider_effect_image_witness(root / "before.png", root / "after.png", red_multiplier=0.5)["passed"])
+            self.assertFalse(harness.spider_effect_image_witness(root / "before.png", root / "after.png", red_multiplier=1.0)["passed"])
+            self.assertEqual(0.5, harness.post_effect_fixture_spider_red("post-spider-dim"))
+            self.assertEqual(0.5, harness.post_effect_fixture_spider_red("post-spider-dim", "file/unrelated"))
+            self.assertEqual(1.0, harness.post_effect_fixture_spider_red("post-spider-dim", "file/mattmc-post-spider-dim"))
+            self.assertEqual(1.0, harness.post_effect_fixture_spider_red(""))
+
+    def test_spider_witness_rejects_missing_wrong_and_flat_effects(self):
+        from PIL import Image, ImageOps
+        from post_effect_reference import spider_reference_image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = Image.new("RGB", (96, 64))
+            source.putdata([((x * 7 + y * 3) % 256, (x * 2 + y * 9) % 256,
+                             (x * 3 + y * 5) % 256) for y in range(64) for x in range(96)])
+            source.save(root / "before.png")
+            expected = spider_reference_image(source)
+            expected.save(root / "after.png")
+            self.assertTrue(harness.spider_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+            for wrong in (source, Image.new("RGB", source.size), Image.new("RGB", source.size, (128, 128, 128)),
+                          ImageOps.flip(expected), ImageOps.invert(source)):
+                wrong.save(root / "after.png")
+                self.assertFalse(harness.spider_effect_image_witness(root / "before.png", root / "after.png")["passed"])
+
     def test_menu_metadata_scope_requires_explicit_query_evidence(self) -> None:
         scope = {"schema": "mattmc-menu-resource-scope-v2", "status": "complete",
                  "scope": "gui-font-language-atlas-stacks-with-metadata",
@@ -978,6 +1611,7 @@ class GraphicsAuditHarnessTests(unittest.TestCase):
         self.assertEqual("passed", harness.deterministic_visual_fixture_equivalence(baseline, current)["status"])
         for invalid in (None, {}, {**receipt, "matchingCells": 63}, {**receipt, "complete": False},
                         {**receipt, "fixture": "unknown"}, {**receipt, "cells": 63},
+                        {**receipt, "variant": "door"}, {**receipt, "enclosure": "minecraft:ice"},
                         {**receipt, "placement": "145,99,532/west"}):
             current["mixedFluidFixture"] = invalid
             self.assertEqual("failed", harness.deterministic_visual_fixture_equivalence(baseline, current)["status"])
@@ -1037,6 +1671,146 @@ class GraphicsAuditHarnessTests(unittest.TestCase):
             current["terrainParticleFixture"] = invalid
             self.assertTrue(mismatch())
 
+    def test_atlas_particle_fixture_requires_matching_ordinary_particle_inputs(self):
+        receipt = {"fixture": "ordinary-flame-atlas-v1", "atlas": "minecraft:textures/atlas/particles.png",
+                   "sprite": "minecraft:flame", "complete": True, "size": 0.35,
+                   "position": [1, 2, 3], "color": -1, "light": 15728880}
+        baseline = {"atlasParticleFixture": receipt}
+        current = {"atlasParticleFixture": dict(receipt)}
+        def mismatch():
+            return "atlas-particle-fixture-state" in harness.deterministic_visual_fixture_equivalence(baseline, current)["mismatches"]
+        self.assertFalse(mismatch())
+        for invalid in (None, {}, {**receipt, "complete": False}, {**receipt, "size": 0},
+                        {**receipt, "atlas": "minecraft:textures/atlas/blocks.png"},
+                        {**receipt, "sprite": "minecraft:block/magma"}, {**receipt, "light": 0},
+                        {**receipt, "position": [1,2,4]}):
+            current["atlasParticleFixture"] = invalid
+            self.assertTrue(mismatch())
+
+    def test_atlas_particle_pack_is_an_ordinary_two_frame_flame_resource(self):
+        from PIL import Image
+        args = harness.parse_args(["capture", "--gui-resource-pack-scenario", "particle-atlas-animation"])
+        self.assertEqual("particle-atlas-animation", args.gui_resource_pack_scenario)
+        specs = capture_runner.gui_resource_pack_specs("particle-atlas-animation")
+        self.assertEqual(1, len(specs))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture_runner.write_gui_resource_pack(root, specs[0])
+            sprite = root / "assets/minecraft/textures/particle/flame.png"
+            with Image.open(sprite) as image:
+                self.assertEqual((16, 32), image.size)
+                self.assertEqual((190, 30, 20, 255), image.getpixel((0, 0)))
+                self.assertEqual((20, 150, 190, 255), image.getpixel((0, 16)))
+                self.assertNotEqual(image.getpixel((1, 2)), image.getpixel((2, 1)))
+            self.assertEqual({"animation": {"width": 16, "height": 16, "frametime": 8,
+                "frames": [0, 1], "interpolate": True}}, json.loads(sprite.with_suffix(".png.mcmeta").read_text()))
+
+    def test_static_atlas_particle_inputs_are_distinct_and_cannot_admit_animation_evidence(self):
+        from PIL import Image
+        for variant, base in (("a", (190, 30, 20, 255)), ("b", (20, 150, 190, 255))):
+            scenario = "particle-atlas-static-" + variant
+            self.assertEqual(scenario, harness.parse_args(["capture", "--gui-resource-pack-scenario", scenario]).gui_resource_pack_scenario)
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                capture_runner.write_gui_resource_pack(root, capture_runner.gui_resource_pack_specs(scenario)[0])
+                sprite = root / "assets/minecraft/textures/particle/flame.png"
+                self.assertFalse(sprite.with_suffix(".png.mcmeta").exists())
+                with Image.open(sprite) as image:
+                    self.assertEqual((16, 16), image.size)
+                    self.assertEqual(base, image.getpixel((0, 0)))
+                    digest = 0xcbf29ce484222325
+                    for byte in image.convert("RGBA").tobytes():
+                        digest = ((digest ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+                receipt = {"fixture": "ordinary-static-flame-atlas-v1", "staticSourceComplete": True,
+                           "sourceRgbaFnv64": f"{digest:016x}"}
+                docs = [{"atlasParticleFixture": receipt}, {"atlasParticleFixture": dict(receipt)}]
+                self.assertTrue(harness.static_atlas_particle_source_evidence(docs)["passed"])
+                for bad in ({}, {**receipt, "staticSourceComplete": False},
+                            {**receipt, "sourceRgbaFnv64": "0000000000000000"},
+                            {**receipt, "fixture": "ordinary-flame-atlas-v1"}):
+                    self.assertFalse(harness.static_atlas_particle_source_evidence(
+                        [docs[0], {"atlasParticleFixture": bad}])["passed"])
+
+    def test_atlas_particle_local_gate_rejects_blank_or_wrong_pixels(self):
+        from PIL import Image
+        baseline = Image.new("RGB", (1280, 720))
+        for y in range(328, 392):
+            for x in range(608, 672):
+                baseline.putpixel((x, y), (190 + x % 16, 30 + y % 16, 20))
+        self.assertTrue(harness.atlas_particle_local_visual_evidence(baseline, baseline, 6)["passed"])
+        blank = Image.new("RGB", (1280, 720))
+        self.assertFalse(harness.atlas_particle_local_visual_evidence(blank, blank, 6)["passed"])
+        wrong = baseline.copy()
+        wrong.paste((20, 150, 190), (608, 328, 672, 392))
+        self.assertFalse(harness.atlas_particle_local_visual_evidence(baseline, wrong, 6)["passed"])
+        self.assertFalse(harness.atlas_particle_local_visual_evidence(baseline, baseline.resize((640, 360)), 6)["passed"])
+
+    def test_atlas_particle_transition_requires_real_matching_pixel_change(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            entries = []
+            for label, subframe in (("before", 0), ("after", 4)):
+                folder = root / label
+                folder.mkdir()
+                entries.append({"baseline_artifact": label + "-frozen", "current_artifact": label + "-current",
+                    "atlas_particle_animation": {"frozen": {"frame": 0, "subFrame": subframe},
+                                                 "native": {"frame": 1, "subframe": 3,
+                                                            "retained_frame": 0, "retained_subframe": subframe}},
+                    "atlas_particle_local": {"crop_box": [0, 0, 2, 2]},
+                    "outputs": {"baseline_copy": str(folder / "baseline.png"), "current_copy": str(folder / "current.png")}})
+                for side in ("frozen", "current"):
+                    Image.new("RGB", (2, 2), (100 + subframe * 10, 20, 30)).save(folder / (side + "_atlas_particle_crop.png"))
+            (root / harness.MANIFEST_NAME).write_text(json.dumps({"success": True,
+                "cross_repository_visual_parity": {"pairs": [entries[0]]}}))
+            visual = {"pairs": [entries[1]]}
+            with mock.patch.object(harness, "deterministic_capture_document", return_value={}), \
+                 mock.patch.object(harness, "deterministic_visual_fixture_equivalence", return_value={"status": "passed"}):
+                self.assertTrue(harness.particle_animation_transition_report(visual, root, 6)["passed"])
+                self.assertFalse(harness.particle_animation_transition_report(visual, None, 6)["passed"])
+                Image.new("RGB", (2, 2), (100, 20, 30)).save(root / "after/current_atlas_particle_crop.png")
+                self.assertFalse(harness.particle_animation_transition_report(visual, root, 6)["passed"])
+
+    def test_static_particle_replacement_rejects_stale_pixels_and_changed_fixture(self):
+        from PIL import Image
+        specs = capture_runner.gui_resource_pack_specs("particle-atlas-static-replacement")
+        self.assertEqual(["b", "a"], [s["variant"] for s in specs])
+        self.assertEqual(["mattmc-particle-atlas-static-b", "mattmc-particle-atlas-static-a"], [s["name"] for s in specs])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pairs, docs = [], {}
+            for label, digest, color in (("before", "61fe249fae9015e5", (190,30,20)),
+                                         ("after", "271789f92e86ab05", (20,150,190))):
+                directory = root / label
+                directory.mkdir()
+                receipt = {"fixture": "ordinary-static-flame-atlas-v1", "staticSourceComplete": True,
+                    "sourceRgbaFnv64": digest, "atlas": "minecraft:textures/atlas/particles.png",
+                    "sprite": "minecraft:flame", "complete": True, "size": .35,
+                    "position": [1,2,3], "color": -1, "light": 15728640}
+                docs[label] = {"atlasParticleFixture": receipt, "captures": [{"poseName": "initial",
+                    "gameTime": 6000, "requestedYaw": 105, "requestedPitch": 10,
+                    "observedYaw": 105, "observedPitch": 10,
+                    "position": {"x": 150.5, "y": 100, "z": 530.5},
+                    "window": {"width": 1280, "height": 720}}]}
+                pairs.append({"baseline_artifact": label, "current_artifact": label,
+                    "atlas_particle_static_source": {"passed": True, "receipts": [receipt, dict(receipt)]},
+                    "atlas_particle_local": {"passed": True, "crop_box": [0,0,2,2]},
+                    "outputs": {"baseline_copy": str(directory / "baseline.png"), "current_copy": str(directory / "current.png")}})
+                for side in ("frozen", "current"):
+                    Image.new("RGB", (2,2), color).save(directory / (side + "_atlas_particle_crop.png"))
+            (root / harness.MANIFEST_NAME).write_text(json.dumps({"success": True,
+                "cross_repository_visual_parity": {"pairs": [pairs[0]]}}))
+            visual = {"pairs": [pairs[1]]}
+            with mock.patch.object(harness, "deterministic_capture_document", side_effect=lambda p: docs[str(p)]):
+                result = harness.static_particle_replacement_report(visual, root, 6, True)
+                self.assertTrue(result["passed"], result)
+                self.assertFalse(harness.static_particle_replacement_report(visual, None, 6, True)["passed"])
+                docs["after"]["atlasParticleFixture"]["size"] = .4
+                self.assertFalse(harness.static_particle_replacement_report(visual, root, 6, True)["passed"])
+                docs["after"]["atlasParticleFixture"]["size"] = .35
+                Image.new("RGB", (2,2), (190,30,20)).save(root / "after/current_atlas_particle_crop.png")
+                self.assertFalse(harness.static_particle_replacement_report(visual, root, 6, True)["passed"])
+
     def test_capture_sequence_terrain_coverage_requires_every_exact_pose(self) -> None:
         import copy
         baseline, current = [], []
@@ -1071,6 +1845,17 @@ class GraphicsAuditHarnessTests(unittest.TestCase):
         self.assertIsNone(harness.native_atlas_state_at_presentation(observation + "\n" + present, 360, 23))
         self.assertIsNone(harness.native_atlas_state_at_presentation(present + "\n" + observation, 359, 23))
         self.assertIsNone(harness.native_atlas_state_at_presentation(observation + "\n" + present, 359, 24))
+        retained = observation + " retained_frame=0 retained_sheet_frame=0 retained_subframe=4 retained_tick=420"
+        self.assertEqual(420, harness.native_atlas_state_at_presentation(retained + "\n" + present, 359, 23)["retained_tick"])
+        self.assertIsNone(harness.native_atlas_state_at_presentation(retained.replace("retained_tick=420", "retained_tick=432") + "\n" + present, 359, 23))
+        self.assertIsNone(harness.native_atlas_state_at_presentation(retained.replace(" retained_frame=0", "") + "\n" + present, 359, 23))
+        self.assertIsNone(harness.native_atlas_state_at_presentation(observation + "\n" + present, 359, 23, 2))
+        other_atlas = observation.replace("texture=1", "texture=2").replace("tick=431", "tick=19")
+        for texture, tick in ((1, 431), (2, 19)):
+            selected = harness.native_atlas_state_at_presentation(
+                "\n".join((observation, other_atlas, present)), 359, 23, texture)
+            self.assertEqual(texture, selected["texture"])
+            self.assertEqual(tick, selected["tick"])
         # A selected capture re-emits one retained accepted receipt after the
         # bounded streaming trace is exhausted; never infer it from old ticks.
         selected_present = present.replace("submission=679", "submission=683")
@@ -1146,6 +1931,60 @@ class GraphicsAuditHarnessTests(unittest.TestCase):
                 doc["terrainParticleFixture"] = {"fixture": "magma-terrain-particle-v1"}
                 self.assertTrue(harness.block_display_animation_upload_equivalence(baseline, artifact)["passed"],
                                 "particle-only animation must use the same exact-present upload gate")
+                doc.pop("terrainParticleFixture")
+                for observation in (doc["blockDisplayAnimationAtCapture"], baseline["blockDisplayAnimationAtCapture"]):
+                    observation["spriteName"] = "minecraft:block/lava_still"
+                self.assertTrue(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, required_sprite="minecraft:block/lava_still")["passed"])
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, required_sprite="minecraft:block/lava_flow")["passed"])
+                baseline["blockDisplayAnimationAtCapture"]["spriteName"] = "minecraft:block/water_still"
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, required_sprite="minecraft:block/lava_still")["passed"])
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True)["passed"])
+                for observation in (doc["blockDisplayAnimationAtCapture"], baseline["blockDisplayAnimationAtCapture"]):
+                    observation["spriteName"] = "minecraft:block/water_still"
+                self.assertTrue(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True)["passed"])
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True, flowing_water=True)["passed"])
+                for observation in (doc["blockDisplayAnimationAtCapture"], baseline["blockDisplayAnimationAtCapture"]):
+                    observation["spriteName"] = "minecraft:block/water_flow"
+                self.assertTrue(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True, flowing_water=True)["passed"])
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True)["passed"])
+                for observation in (doc["blockDisplayAnimationAtCapture"], baseline["blockDisplayAnimationAtCapture"]):
+                    observation["spriteName"] = "minecraft:block/water_still"
+                for observation in (doc["blockDisplayAnimationAtCapture"], baseline["blockDisplayAnimationAtCapture"]):
+                    observation["mipLevels"] = 5
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True, required_mip_levels=5)["passed"])
+                log.write_text(log.read_text().replace("accepted_submission=677", "accepted_submission=677 mip_levels=5"))
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True, required_mip_levels=5)["passed"])
+                mip_hashes = [digest] + [f"{value:016x}" for value in range(1, 5)]
+                baseline["blockDisplayAnimationAtCapture"]["uploadedMipRgbaFnv64"] = mip_hashes.copy()
+                log.write_text(log.read_text().replace("mip_levels=5", "mip_levels=5 retained_mip_rgba_fnv64=" + ",".join(mip_hashes)))
+                self.assertTrue(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True, required_mip_levels=5)["passed"])
+                for invalid_mips in (None, mip_hashes[:1], mip_hashes[:4] + ["bad"],
+                                     mip_hashes[:3] + ["000000000000ffff"] + mip_hashes[4:]):
+                    baseline["blockDisplayAnimationAtCapture"]["uploadedMipRgbaFnv64"] = invalid_mips
+                    self.assertFalse(harness.block_display_animation_upload_equivalence(
+                        baseline, artifact, require_water=True, required_mip_levels=5)["passed"])
+                baseline["blockDisplayAnimationAtCapture"]["uploadedMipRgbaFnv64"] = mip_hashes
+                doc["blockDisplayAnimationAtCapture"]["mipLevels"] = 1
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True, required_mip_levels=5)["passed"])
+                doc["blockDisplayAnimationAtCapture"]["mipLevels"] = 5.0
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True, required_mip_levels=5)["passed"])
+                baseline["blockDisplayAnimationAtCapture"]["spriteName"] = "minecraft:block/magma"
+                self.assertFalse(harness.block_display_animation_upload_equivalence(
+                    baseline, artifact, require_water=True)["passed"])
+                doc["terrainParticleFixture"] = {"fixture": "magma-terrain-particle-v1"}
                 for invalid in (None, -1, 2172, True, "2173"):
                     baseline["blockDisplayAnimationPresentedFrame"] = invalid
                     self.assertFalse(harness.block_display_animation_upload_equivalence(baseline, artifact)["passed"])
@@ -5376,6 +6215,62 @@ else:
             self.assertEqual("-Dmattmc.dev.deterministicCameraCapture.poseCount=4", options[-2])
             self.assertEqual("-Dmattmc.dev.deterministicCameraCapture.yawDelta=35.0", options[-1])
 
+    def test_celestial_pack_keeps_the_same_single_pose_for_both_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                args = harness.parse_args(["capture", "--profile", "extended",
+                    "--mode", "current-rust-vulkan-shaders-off", "--mode", "frozen-opengl-shaders-off",
+                    "--capture-celestial", "moon", "--capture-world-time", "186000",
+                    "--gui-resource-pack-scenario", "sky-moon-replacement",
+                    "--world-resource-reload", "--world-reload-remove-pack", "file/mattmc-sky-moon-replacement-b"])
+                args._canonical_fixture_run_source = root / "fixture"
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                count = [option for option in options if option.startswith("-Dmattmc.dev.deterministicCameraCapture.poseCount=")]
+                self.assertEqual("-Dmattmc.dev.deterministicCameraCapture.poseCount=1", count[-1], name)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.resourceReload=true", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.reloadRemovePack=file/mattmc-sky-moon-replacement-b", options)
+
+    def test_water_pack_keeps_one_identical_pose_for_both_launchers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                    "--require-water-detail", "--gui-resource-pack-scenario", "water-mip-compatible"])
+                args._canonical_fixture_run_source = root / "fixture"
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                for key, expected in (("poseCount", "1"), ("yawDelta", "0.0")):
+                    prefix = "-Dmattmc.dev.deterministicCameraCapture." + key + "="
+                    self.assertEqual(prefix + expected, [value for value in options if value.startswith(prefix)][-1])
+
+    def test_lava_mip_reload_keeps_the_declared_single_pose_in_both_launchers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                for flag, sprite, scenario in (
+                        (flag, sprite, scenario)
+                        for flag, sprite in (("--require-lava-detail", "still"), ("--require-flowing-lava", "flow"))
+                        for scenario in ("water-mip-compatible", "lava-mip-minification")):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                    args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                        flag, "--gui-resource-pack-scenario", scenario, "--world-resource-reload"])
+                    args._canonical_fixture_run_source = root / "fixture"
+                    _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                        root / "capture", "settled-static", args, "capture")
+                    options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                    for key, expected in (("poseCount", "1"), ("yawDelta", "0.0")):
+                        prefix = "-Dmattmc.dev.deterministicCameraCapture." + key + "="
+                        self.assertEqual(prefix + expected, [v for v in options if v.startswith(prefix)][-1])
+                    self.assertIn("-Dmattmc.dev.graphicsAuditLavaCycleCapture=true", options)
+                    self.assertIn("-Dmattmc.dev.graphicsAuditLavaSprite=" + sprite, options)
+                    self.assertIn("-Dmattmc.dev.deterministicCameraCapture.resourceReload=true", options)
+
     def test_selected_source_falling_block_requires_correlated_moving_mesh_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -6383,6 +7278,14 @@ else:
             self.assertIn("-Dmattmc.dev.deterministicCameraCapture.metadata=", java_options)
             self.assertIn("-Dmattmc.dev.deterministicCameraCapture.selectedHotbarSlot=1", java_options)
             self.assertIn("-Dmattmc.dev.deterministicCameraCapture.hotbarItemFixture=standard-3d", java_options)
+            args.gui_resource_pack_scenario = "flat-item-foil-generated"
+            args.hotbar_item_fixture = "flat-items"
+            args.selected_hotbar_slot = 2
+            _, foil_env = harness.build_capture_command(target, mode, root / "foil-capture", "correctness", args, "capture")
+            selected = [option for option in shlex.split(foil_env["JAVA_TOOL_OPTIONS"])
+                        if option.startswith("-Dmattmc.dev.deterministicCameraCapture.selectedHotbarSlot=")]
+            self.assertTrue(selected)
+            self.assertTrue(all(option.endswith("=2") for option in selected), selected)
 
     def test_capture_runner_wraps_actual_gradle_command_for_renderdoc(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7571,16 +8474,21 @@ else:
         )
         self.assertFalse(harness.canonical_fixture_requested(ordinary, current_only))
 
-    def test_title_only_pair_does_not_clone_a_world_fixture(self) -> None:
+    def test_paired_menus_require_shared_inputs_but_unpaired_observations_do_not(self) -> None:
         paired_title = Namespace(title_screen_capture=True)
         paired_modes = [
             mode for mode in harness.MATRIX_MODES
             if mode.name in {"frozen-opengl-shaders-off", "current-rust-vulkan-shaders-off"}
         ]
-        self.assertFalse(
+        self.assertTrue(
             harness.canonical_fixture_requested(paired_title, paired_modes),
-            "a title presentation is validated by its acknowledged menu frame, not by a copied world/assets tree",
+            "an acknowledged menu frame does not prove the repositories loaded identical settings and packs",
         )
+        transition = Namespace(title_screen_transition_capture=True)
+        self.assertTrue(harness.canonical_fixture_requested(transition, paired_modes))
+        current_only = [mode for mode in paired_modes if mode.target == "current"]
+        self.assertFalse(harness.canonical_fixture_requested(paired_title, current_only))
+        self.assertFalse(harness.canonical_fixture_requested(transition, current_only))
 
     def test_model_capture_requests_shared_fixture_and_materializes_witness(self) -> None:
         args = Namespace(
@@ -7661,6 +8569,28 @@ else:
             self.assertEqual(env["MATTMC_CAPTURE_RUN_SOURCE"], str(canonical_run))
             self.assertEqual(env["MATTMC_CAPTURE_WORLD_SOURCE"], str(canonical_run / "saves" / "Origin"))
             self.assertEqual(env["MATTMC_PARITY_CAMERA_YAW"], str(harness.DEFAULT_PARITY_CAMERA["yaw"]))
+
+    def test_paired_menu_commands_pass_the_same_canonical_inputs_to_both_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            targets = {name: fake_repo(root, name) for name in ("current", "frozen")}
+            args = harness.parse_args(["capture", "--world", "Origin",
+                "--title-screen-capture", "--menu-screen", "options", "--dry-run"])
+            canonical_run = root / "canonical" / "run"
+            args._canonical_fixture_run_source = str(canonical_run)
+            args._canonical_fixture_id = "paired-menu"
+            args._canonical_fixture_source_save_hash = "shared-save"
+            modes = [mode for mode in harness.MATRIX_MODES if mode.name in {
+                "current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"}]
+            self.assertTrue(harness.canonical_fixture_requested(args, modes))
+            for mode in modes:
+                with self.subTest(mode=mode.name):
+                    _, env = harness.build_capture_command(targets[mode.target], mode,
+                        root / mode.name, "correctness", args, "capture")
+                    self.assertEqual(str(canonical_run), env["MATTMC_CAPTURE_RUN_SOURCE"])
+                    self.assertEqual("paired-menu", env["MATTMC_PARITY_FIXTURE_ID"])
+                    self.assertEqual("shared-save", env["MATTMC_PARITY_FIXTURE_SOURCE_SAVE_HASH"])
+                    self.assertEqual("options", env["MATTMC_CAPTURE_MENU_SCREEN"])
 
     def test_cloud_fixtures_use_a_cloud_layer_canonical_camera(self) -> None:
         for scenario in ("bounded", "fast"):
@@ -7756,6 +8686,23 @@ else:
             finally:
                 if process.poll() is None:
                     process.kill()
+
+    def test_repo_cleanup_excludes_the_harness_process_group(self) -> None:
+        if harness.platform_name() == "windows":
+            self.skipTest("repo process cleanup is POSIX-only")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # Same-group helpers or an invoking shell may mention the repo and
+            # runClient. Group termination would also kill the harness itself.
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)", str(root), "runClient"])
+            try:
+                self.assertEqual(os.getpgrp(), os.getpgid(process.pid))
+                self.assertNotIn(process.pid, [pid for pid, _, _ in harness.repo_processes(root)])
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
 
     def test_run_mode_timeout_marks_artifact_and_cleans_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -8431,19 +9378,33 @@ else:
         run.assert_not_called()
 
     def test_linux_window_capture_uses_direct_xwd_not_imagemagick_window_import(self) -> None:
+        from DevUtils.Audit.test_xwd_pixels import fixture
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(
             capture_runner.shutil, "which", side_effect=lambda name: f"/{name}"
         ), mock.patch.object(capture_runner.subprocess, "run") as run:
             run.return_value = type("Result", (), {"returncode": 0})()
             raw = Path(temp) / "frame.png.xwd"
-            raw.write_bytes(b"xwd")
+            raw.write_bytes(fixture())
             screenshot = Path(temp) / "frame.png"
             screenshot.write_bytes(b"png")
             self.assertTrue(capture_runner.capture_linux_x11_window("0x123", screenshot))
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(["xwd", "-silent", "-id", "0x123", "-out", str(raw)], commands[0])
-        self.assertEqual(["magick", str(raw), str(screenshot)], commands[1])
+        self.assertEqual(1, len(commands), "no image converter may reinterpret drawable RGB")
         self.assertFalse(raw.exists())
+
+    def test_linux_window_capture_retains_raw_drawable_only_when_requested(self) -> None:
+        from DevUtils.Audit.test_xwd_pixels import fixture
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {"MATTMC_CAPTURE_RETAIN_XWD": "true"}), mock.patch.object(
+            capture_runner.shutil, "which", side_effect=lambda name: f"/{name}"
+        ), mock.patch.object(capture_runner.subprocess, "run") as run:
+            run.return_value = type("Result", (), {"returncode": 0})()
+            raw = Path(temp) / "frame.png.xwd"
+            raw.write_bytes(fixture())
+            screenshot = Path(temp) / "frame.png"
+            screenshot.write_bytes(b"png")
+            self.assertTrue(capture_runner.capture_linux_x11_window("0x123", screenshot))
+            self.assertEqual(fixture(), raw.read_bytes())
 
     def test_linux_window_capture_rejects_an_unmapped_client_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(
@@ -8809,6 +9770,36 @@ else:
                 java_options.rfind("-Dmattmc.dev.deterministicCameraCapture.poseCount=7"),
                 java_options.rfind("-Dmattmc.dev.deterministicCameraCapture.poseCount=1"),
             )
+
+    def test_seven_pose_capture_budgets_every_source_and_execution_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for side, name in (("current", "current-rust-vulkan-shaders-off"),
+                               ("frozen", "frozen-opengl-shaders-off")):
+                target = fake_repo(root, side)
+                if side == "frozen":
+                    (target.root / "DevUtils/Common/capture_runner.py").unlink()
+                    (target.root / "DevUtils/Common/capture_runner.sh").write_text("#!/bin/sh\nexit 0\n")
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                for reload in (False, True):
+                    args = harness.parse_args([
+                        "capture", "--profile", "extended", "--mode", name,
+                        "--workload-profile", "settled-static",
+                        "--world-static-terrain-scenario", "translucent-overlap",
+                        *(["--world-resource-reload"] if reload else []),
+                    ])
+                    _, env = harness.build_capture_command(
+                        target, mode, root / (side + str(reload)), "settled-static", args, "capture")
+                    properties = dict(option[2:].split("=", 1) for option in
+                                      shlex.split(env["JAVA_TOOL_OPTIONS"]) if option.startswith("-D") and "=" in option)
+                    self.assertEqual("7", properties["mattmc.dev.deterministicCameraCapture.poseCount"])
+                    self.assertEqual("28", properties["mattmc.dev.staticTerrainParityDiagnostics.maxCaptureCoverageEvents"])
+                    args.gui_resource_pack_scenario = "water-mip-compatible"
+                    _, packed = harness.build_capture_command(
+                        target, mode, root / (side + str(reload) + "-pack"), "settled-static", args, "capture")
+                    options = shlex.split(packed["JAVA_TOOL_OPTIONS"])
+                    prefix = "-Dmattmc.dev.deterministicCameraCapture.poseCount="
+                    self.assertEqual(prefix + "7", [value for value in options if value.startswith(prefix)][-1])
 
     def test_rust_vulkan_moving_mesh_capture_requests_real_gameplay_attachment_dump(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -10554,6 +11545,90 @@ else:
             self.assertTrue((game_dir / "resourcepacks" / "mattmc-rust-gui-pack-b" / "assets/minecraft/textures/misc/forcefield.png").is_file())
             self.assertTrue((game_dir / "resourcepacks" / "mattmc-rust-gui-pack-b" / "assets/minecraft/textures/block/stone.png").is_file())
             self.assertTrue((game_dir / "resourcepacks" / "mattmc-rust-gui-pack-b" / "assets/minecraft/textures/block/oak_leaves.png").is_file())
+
+    def test_sky_minification_pack_is_deterministic_and_does_not_replace_terrain(self) -> None:
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = capture_runner.gui_resource_pack_specs("sky-sun-minification")[0]
+            for name in ("a", "b"):
+                capture_runner.write_gui_resource_pack(root / name, spec)
+            relative = "assets/minecraft/textures/environment/sun.png"
+            self.assertEqual((root / "a" / relative).read_bytes(), (root / "b" / relative).read_bytes())
+            self.assertEqual([relative], [str(p.relative_to(root / "a")) for p in (root / "a").rglob("*.png")])
+            with Image.open(root / "a" / relative) as source:
+                self.assertEqual((1024, 1024), source.size)
+                self.assertEqual((255, 255, 255, 255), source.getpixel((512, 512)))
+                self.assertEqual(0, source.getpixel((0, 0))[3])
+                # Adjacent texels differ sharply; synthesized mip averaging cannot
+                # reproduce this base-level sampling contract by coincidence.
+                self.assertGreater(abs(source.getpixel((400, 400))[0] - source.getpixel((401, 400))[0]), 100)
+                # The sun uses additive blending over daytime sky. Two bright
+                # checker colors can both saturate to white and hide wrong mips.
+                after_blend = [min(255, 126 + source.getpixel((x, 400))[0]) for x in (400, 401)]
+                self.assertGreater(abs(after_blend[0] - after_blend[1]), 100)
+
+    def test_moon_minification_pack_has_eight_distinct_asymmetric_phase_cells(self) -> None:
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "pack"
+            capture_runner.write_gui_resource_pack(root, capture_runner.gui_resource_pack_specs("sky-moon-minification")[0])
+            relative = "assets/minecraft/textures/environment/moon_phases.png"
+            self.assertEqual([relative], [str(p.relative_to(root)) for p in root.rglob("*.png")])
+            with Image.open(root / relative) as source:
+                self.assertEqual((1024, 512), source.size)
+                cells = [source.crop((c * 256, r * 256, (c + 1) * 256, (r + 1) * 256))
+                         for r in range(2) for c in range(4)]
+                self.assertEqual(8, len({cell.tobytes() for cell in cells}))
+                for cell in cells:
+                    self.assertNotEqual(cell.tobytes(), cell.transpose(Image.Transpose.FLIP_LEFT_RIGHT).tobytes())
+                    self.assertNotEqual(cell.tobytes(), cell.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes())
+                    self.assertGreaterEqual(min(cell.getpixel((128, 128))[:3]), 96)
+                    self.assertEqual(0, cell.getpixel((0, 0))[3])
+                    self.assertGreater(abs(cell.getpixel((190, 150))[0] - cell.getpixel((191, 150))[0]), 100)
+
+    def test_moon_replacement_packs_have_distinct_visible_phase_payloads(self) -> None:
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            specs = capture_runner.gui_resource_pack_specs("sky-moon-replacement")
+            self.assertEqual(["a", "b"], [spec["variant"] for spec in specs])
+            pixels = []
+            for spec in specs:
+                root = Path(temp) / spec["name"]
+                capture_runner.write_gui_resource_pack(root, spec)
+                relative = "assets/minecraft/textures/environment/moon_phases.png"
+                self.assertEqual([relative], [str(p.relative_to(root)) for p in root.rglob("*.png")])
+                with Image.open(root / relative) as image:
+                    pixels.append([image.getpixel((c * 256 + 128, r * 256 + 128))
+                                   for r in range(2) for c in range(4)])
+            for a, b in zip(*pixels):
+                self.assertGreater(max(abs(x - y) for x, y in zip(a[:3], b[:3])), 20)
+
+    def test_filtered_moon_pack_changes_only_sampler_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plain, filtered = root / "plain", root / "filtered"
+            capture_runner.write_gui_resource_pack(plain, capture_runner.gui_resource_pack_specs("sky-moon-minification")[0])
+            capture_runner.write_gui_resource_pack(filtered, capture_runner.gui_resource_pack_specs("sky-moon-filtered")[0])
+            relative = "assets/minecraft/textures/environment/moon_phases.png"
+            self.assertEqual((plain / relative).read_bytes(), (filtered / relative).read_bytes())
+            self.assertEqual({"texture": {"blur": True, "clamp": True}},
+                json.loads((filtered / (relative + ".mcmeta")).read_text()))
+            self.assertEqual([relative], [str(p.relative_to(filtered)) for p in filtered.rglob("*.png")])
+
+    def test_moon_sampler_replacement_changes_filter_without_changing_texels(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            specs = capture_runner.gui_resource_pack_specs("sky-moon-sampler-replacement")
+            self.assertEqual(2, len(specs))
+            payloads = []
+            for index, spec in enumerate(specs):
+                root = Path(temp) / spec["name"]
+                capture_runner.write_gui_resource_pack(root, spec)
+                relative = "assets/minecraft/textures/environment/moon_phases.png"
+                payloads.append((root / relative).read_bytes())
+                self.assertEqual({"texture": {"blur": index == 0, "clamp": True}},
+                                 json.loads((root / (relative + ".mcmeta")).read_text()))
+            self.assertEqual(payloads[0], payloads[1])
 
     def test_generated_terrain_identity_pack_keeps_each_palette_sprite_distinct(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -12307,6 +13382,19 @@ else:
         )
         self.assertEqual(20, selected["gameTime"])
 
+    def test_capture_coverage_selects_exact_pose_not_largest_draw_set(self) -> None:
+        for stage in ("java-opengl-draw-capture-ready-coverage",
+                      "rust-vulkan-enqueue-source-capture-ready-coverage"):
+            events = [{"stage": stage, "layer": "solid", "frameId": frame,
+                       "aggregate": {"records": count}} for frame, count in ((10, 2), (20, 100), (30, 3))]
+            selected = harness.latest_static_terrain_coverage_event(
+                events, stage, "solid", preferred_deterministic_frame=10)
+            self.assertEqual(10, selected["frameId"])
+            self.assertIsNone(harness.latest_static_terrain_coverage_event(
+                events, stage, "solid", preferred_deterministic_frame=11))
+            self.assertIsNone(harness.latest_static_terrain_coverage_event(
+                events + [events[0]], stage, "solid", preferred_deterministic_frame=10))
+
     def test_static_terrain_geometry_truth_rejects_duplicate_visible_section(self) -> None:
         doc = self.static_terrain_doc()
         doc["recentEvents"] = [dict(doc["recentEvents"][0]), dict(doc["recentEvents"][0])]
@@ -13619,6 +14707,66 @@ else:
 
 
 class CelestialParityTests(unittest.TestCase):
+    def test_pack_replacement_requires_matching_actual_selection_changes(self):
+        good = {"worldResourceReload": {"schema": "normal-world-resource-reload-v1",
+                "requested": True, "futureComplete": True, "complete": True, "presentations": 2,
+                "selectedBefore": ["vanilla", "file/a", "file/b"],
+                "selectedAtCapture": ["vanilla", "file/a"]}}
+        report = {"pairs": [{"baseline_artifact": "baseline.json", "current_artifact": "current.json",
+                             "comparable": True}]}
+        with mock.patch.object(harness, "deterministic_capture_document", return_value=good):
+            self.assertTrue(harness.world_resource_reload_report(report, True, "file/b")["passed"])
+        for fields in ({"selectedAtCapture": ["vanilla", "file/a", "file/b"]},
+                       {"selectedBefore": ["vanilla", "file/a"]},
+                       {"selectedAtCapture": []},
+                       {"selectedAtCapture": ["file/a", "vanilla"]},
+                       {"selectedBefore": ["other", "file/b"], "selectedAtCapture": ["other"]}):
+            bad = {"worldResourceReload": dict(good["worldResourceReload"], **fields)}
+            for documents in ([bad, good], [good, bad]):
+                with mock.patch.object(harness, "deterministic_capture_document", side_effect=documents):
+                    self.assertFalse(harness.world_resource_reload_report(report, True, "file/b")["passed"])
+        with self.assertRaisesRegex(ValueError, "requires --world-resource-reload"):
+            harness.validate_fixture_combinations(Namespace(world_reload_remove_pack="file/b"))
+
+    def test_world_reload_requires_both_completed_real_reload_receipts(self):
+        good = {"worldResourceReload": {"schema": "normal-world-resource-reload-v1",
+                "requested": True, "futureComplete": True, "complete": True,
+                "presentations": 2, "selectedBefore": ["vanilla", "file/a"],
+                "selectedAtCapture": ["vanilla", "file/a"]}}
+        pair = {"baseline_artifact": "baseline.json", "current_artifact": "current.json",
+                "comparable": True}
+        report = {"pairs": [pair]}
+        with mock.patch.object(harness, "deterministic_capture_document", return_value=good):
+            self.assertTrue(harness.world_resource_reload_report(report, True)["passed"])
+        for bad in ({}, {"worldResourceReload": {}},
+                    {"worldResourceReload": dict(good["worldResourceReload"], requested=False)},
+                    {"worldResourceReload": dict(good["worldResourceReload"], futureComplete=False)},
+                    {"worldResourceReload": dict(good["worldResourceReload"], complete=False)},
+                    {"worldResourceReload": dict(good["worldResourceReload"], presentations=1)}):
+            for documents in ([bad, good], [good, bad]):
+                with mock.patch.object(harness, "deterministic_capture_document", side_effect=documents):
+                    self.assertFalse(harness.world_resource_reload_report(report, True)["passed"])
+        self.assertFalse(harness.world_resource_reload_report({"pairs": []}, True)["passed"])
+        self.assertTrue(harness.world_resource_reload_report({}, False)["passed"])
+
+    def test_unchanged_world_reload_requires_equivalent_unchanged_pack_order(self):
+        good = {"worldResourceReload": {"schema": "normal-world-resource-reload-v1",
+                "requested": True, "futureComplete": True, "complete": True,
+                "presentations": 2, "selectedBefore": ["vanilla", "file/a"],
+                "selectedAtCapture": ["vanilla", "file/a"]}}
+        report = {"pairs": [{"baseline_artifact": "baseline.json", "current_artifact": "current.json",
+                             "comparable": True}]}
+        for fields in ({"selectedBefore": None}, {"selectedAtCapture": []},
+                       {"selectedBefore": [], "selectedAtCapture": []},
+                       {"selectedAtCapture": ["file/a", "vanilla"]},
+                       {"selectedBefore": ["vanilla", "file/b"],
+                        "selectedAtCapture": ["vanilla", "file/b"]},
+                       {"selectedBefore": [1], "selectedAtCapture": [1]}):
+            bad = {"worldResourceReload": dict(good["worldResourceReload"], **fields)}
+            for documents in ([bad, good], [good, bad]):
+                with mock.patch.object(harness, "deterministic_capture_document", side_effect=documents):
+                    self.assertFalse(harness.world_resource_reload_report(report, True)["passed"])
+
     def test_celestial_fixture_rejects_unpaired_modes_before_launch(self):
         for modes in (["frozen-opengl-shaders-off"], ["current-rust-vulkan-shaders-off"]):
             args = Namespace(capture_celestial="sun", capture_world_time=6000, mode=modes)
@@ -13777,6 +14925,1116 @@ class NightStarParityTests(unittest.TestCase):
             self.assertFalse(harness.night_star_image_pair(baseline, current)["passed"])
             self.assertFalse(harness.night_star_parity_report({}, True, 6)["passed"])
             self.assertTrue(harness.night_star_parity_report({}, False, 6)["passed"])
+
+
+class FlatItemFixtureTests(unittest.TestCase):
+    def test_pattern_foil_reference_has_frozen_matrix_goldens_and_linear_repeat_edges(self):
+        import gui_foil_reference as reference
+        self.assertEqual((64,48,80,255),reference.pattern_pixel(0,0))
+        self.assertEqual((108,90,178,255),reference.pattern_pixel(15,15))
+        self.assertEqual((64,48,80),reference.sample_pattern((1/32,1/32)))
+        self.assertEqual((118,105,129),reference.sample_pattern((0,0)))
+        self.assertEqual(reference.sample_pattern((0.25,0.375)),reference.sample_pattern((1.25,-0.625)))
+        for actual,expected in zip(reference.standard_uv((1,1)),(6.489276409,9.267646790)):
+            self.assertAlmostEqual(actual,expected,places=5)
+        source={"sprite":"minecraft:item/feather","positions":[0,1,.5,1,1,.5,1,0,.5,0,0,.5],
+                "atlasUvs":[.25,.75,.3125,.75,.3125,.8125,.25,.8125]}
+        for actual,expected in zip(reference.source_at_pixel(source,-.25,-.25,2),(0.927726388,6.256142616)):
+            self.assertAlmostEqual(actual,expected,places=5)
+        with self.assertRaises(ValueError): reference.source_at_pixel(source,100,100,2)
+        with self.assertRaises(ValueError): reference.source_evidence({"enabled":True,"complete":False,"sources":[source]})
+        with self.assertRaises(ValueError): reference.source_evidence({"enabled":True,"complete":True,"sources":[source,source]})
+
+    def test_pattern_foil_fixture_rejects_identical_missing_or_constant_foil_images(self):
+        from PIL import Image
+        from gui_foil_reference import expected_pixel, pattern_pixel
+        names=("apple","feather","paper","diamond","iron_ingot","stick","redstone","arrow","coal")
+        sources={"minecraft:item/apple":{"sprite":"minecraft:item/apple",
+            "positions":[0,1,.5,1,1,.5,1,0,.5,0,0,.5],
+            "atlasUvs":[.25,.75,.3125,.75,.3125,.8125,.25,.8125]}}
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-foil-pattern")
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            for name in names:
+                model=json.loads((root/("assets/minecraft/models/item/mattmc_geometry/"+name+".json")).read_text())
+                self.assertEqual("minecraft:item/apple",model["textures"]["layer0"])
+                self.assertEqual([0,0,16,16],model["elements"][0]["faces"]["south"]["uv"])
+            texture_path=root/"assets/minecraft/textures/misc/enchanted_glint_item.png"
+            with Image.open(texture_path) as texture:
+                self.assertEqual(pattern_pixel(15,15),texture.getpixel((15,15)))
+                self.assertGreater(len(set(texture.getdata())),100)
+            self.assertTrue(json.loads(texture_path.with_suffix(".png.mcmeta").read_text())["texture"]["blur"])
+            for mode in ("correct","missing","constant"):
+                image=Image.new("RGB",(1280,720))
+                for index,(name,box) in enumerate(zip(names,boxes)):
+                    for x in range(32):
+                        for y in range(32):
+                            base=capture_runner.FLAT_ITEM_UV_COLORS[(y>=16)*2+(x>=16)]
+                            if index and mode=="correct":
+                                color=expected_pixel(base,sources["minecraft:item/apple"],x/2,y/2,2)
+                            else:
+                                color=[min(255,round(value*252/255)+(added if index and mode=="constant" else 0))
+                                       for value,added in zip(base,(1,4,9))]
+                            image.putpixel((box[0]+x-1,box[1]+y),tuple(color))
+                path=root/(mode+".png"); image.save(path)
+                report=harness.flat_item_pack_image_pair(path,path,"foil-pattern",gui_scale=2,foil_sources=sources)
+                self.assertEqual(mode=="correct",report["passed"],mode)
+            with self.assertRaises(ValueError):
+                harness.flat_item_pack_image_pair(path,path,"foil-pattern",gui_scale=2)
+
+    def test_generated_foil_fixture_uses_vanilla_generated_model_faces(self):
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-foil-generated")
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            for name in ("apple","feather","paper","diamond","iron_ingot","stick","redstone","arrow","coal"):
+                model=json.loads((root/("assets/minecraft/models/item/mattmc_geometry/"+name+".json")).read_text())
+                self.assertEqual("minecraft:item/generated",model["parent"])
+                self.assertNotIn("elements",model)
+                self.assertEqual("minecraft:item/apple",model["textures"]["layer0"])
+
+    def test_generated_cutout_requires_visible_foil_and_unbrightened_transparent_holes(self):
+        from PIL import Image
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-foil-cutout")
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            with Image.open(root/"assets/minecraft/textures/item/apple.png") as texture:
+                for x,y in ((2,2),(16,16),(29,29)):
+                    self.assertEqual(0,texture.getpixel((x,y))[3])
+                for x,y in ((8,8),(24,8),(8,24),(24,24)):
+                    self.assertEqual(255,texture.getpixel((x,y))[3])
+            for mode in ("correct","missing-foil","foil-leaks"):
+                image=Image.new("RGB",(1280,720),(31,47,63))
+                for index,box in enumerate(boxes):
+                    for y in range(32):
+                        for x in range(32):
+                            opaque=4<=x<28 and 4<=y<28 and not(12<=x<20 and 12<=y<20)
+                            if opaque:
+                                base=capture_runner.FLAT_ITEM_UV_COLORS[(y//16)*2+x//16]
+                                rgb=[min(255,round(v*252/255)+(a if index and mode!="missing-foil" else 0))
+                                     for v,a in zip(base,(1,4,9))]
+                            else:
+                                rgb=[v+(a if index and mode=="foil-leaks" else 0) for v,a in zip((31,47,63),(1,4,9))]
+                            image.putpixel((box[0]+x-1,box[1]+y),tuple(rgb))
+                path=root/(mode+".png")
+                image.save(path)
+                row=harness.flat_item_pack_image_pair(path,path,"foil-cutout",gui_scale=2)
+                self.assertEqual(mode=="correct",row["passed"],mode)
+
+    def test_foil_blend_fixture_requires_actual_brightening_not_matching_missing_foil(self):
+        from PIL import Image
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-foil-blend")
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            with Image.open(root/"assets/minecraft/textures/misc/enchanted_glint_item.png") as texture:
+                self.assertEqual({(32,64,96,255)},set(texture.getdata()))
+            self.assertEqual(((0,0,16,16),)*9,spec["item_uvs"])
+            for foil in (True,False):
+                image=Image.new("RGB",(1280,720))
+                for index,box in enumerate(boxes):
+                    for x in range(16):
+                        for y in range(16):
+                            source=capture_runner.FLAT_ITEM_UV_COLORS[(y>=8)*2+(x>=8)]
+                            color=tuple(min(255,round(value*252/255)+(added if foil and index else 0))
+                                for value,added in zip(source,(1,4,9)))
+                            for dx in range(2):
+                                for dy in range(2):
+                                    image.putpixel((box[0]+2*x+dx-1,box[1]+2*y+dy),color)
+                path=root/"foil.png"; image.save(path)
+                report=harness.flat_item_pack_image_pair(path,path,"foil-blend",gui_scale=2)
+                self.assertEqual(foil,report["passed"])
+                self.assertEqual(36,sum(len(item["orientation_samples"]) for item in report["items"]))
+
+    def test_transform_replacement_changes_only_child_display_and_requires_ordered_native_evidence(self):
+        after,before=capture_runner.gui_resource_pack_specs("flat-item-transform-replacement")
+        self.assertEqual("mattmc-flat-item-transform-original",before["name"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root/"before",before)
+            capture_runner.write_gui_resource_pack(root/"after",after)
+            previous={p.relative_to(root/"before") for p in (root/"before").rglob("*") if p.is_file()}
+            current={p.relative_to(root/"after") for p in (root/"after").rglob("*") if p.is_file()}
+            self.assertEqual(previous,current)
+            changed=[]
+            for path in previous:
+                a=(root/"before"/path).read_bytes(); b=(root/"after"/path).read_bytes()
+                if path.as_posix()=="pack.mcmeta" or a==b: continue
+                self.assertTrue(path.as_posix().startswith("assets/minecraft/models/item/mattmc_layers/"))
+                self.assertTrue(path.stem.endswith("_1"))
+                a=json.loads(a); b=json.loads(b)
+                self.assertNotEqual(a.pop("display"),b.pop("display"))
+                self.assertEqual(a,b,"texture, geometry, tint and material must be unchanged")
+                changed.append(path)
+            self.assertEqual(8,len(changed))
+        def trace(*counts):
+            return "\n".join(f"whole-frame.gui-item-transforms layers=17 nonidentity=16 distinct={value}" for value in counts)
+        self.assertTrue(harness.gui_item_transform_replacement_evidence(trace(2,2,3,3)))
+        for log in (trace(2),trace(3),trace(3,2),trace(2,3,2),trace(2,30),trace(2,4,3),
+                    trace(2,3).replace("layers=17 ","layers=171 "),"prefix "+trace(2,3)):
+            self.assertFalse(harness.gui_item_transform_replacement_evidence(log))
+        base=["capture","--hotbar-item-fixture","flat-items","--gui-resource-pack-scenario","flat-item-transform-replacement"]
+        for extra in ([],["--world-resource-reload"],["--world-resource-reload","--world-reload-remove-pack","file/wrong"]):
+            with self.assertRaises(ValueError): harness.validate_fixture_combinations(harness.parse_args(base+extra))
+        harness.validate_fixture_combinations(harness.parse_args(base+["--world-resource-reload",
+            "--world-reload-remove-pack","file/mattmc-flat-item-transform-original"]))
+
+    def test_independent_child_transforms_cannot_collapse_to_parent_pose(self):
+        from PIL import Image
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-child-transforms")
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            for path in (root/"assets/minecraft/items").glob("*.json"):
+                if path.stem == "apple": continue
+                definition=json.loads(path.read_text())["model"]
+                self.assertEqual("minecraft:composite",definition["type"])
+                self.assertEqual(2,len(definition["models"]))
+                for layer,child in enumerate(definition["models"]):
+                    model=json.loads((root/"assets/minecraft/models"/(child["model"].split(":")[1]+".json")).read_text())
+                    self.assertEqual(1,len(model["elements"]))
+                    self.assertEqual([0,0,90 if layer==0 else 0],model["display"]["gui"]["rotation"])
+                    self.assertEqual([2 if layer==0 else -2,0,0],model["display"]["gui"]["translation"])
+            for independent in (True,False):
+                image=Image.new("RGB",(1280,720))
+                for index,box in enumerate(boxes):
+                    for x in range(16):
+                        for y in range(16):
+                            color=tuple(harness.flat_item_layer_expected(index,x,y,
+                                transformed=not independent,asymmetric=True,child_transforms=independent))
+                            for dx in range(2):
+                                for dy in range(2):
+                                    image.putpixel((box[0]+2*x+dx-1,box[1]+2*y+dy),color)
+                path=root/"children.png"; image.save(path)
+                report=harness.flat_item_pack_image_pair(path,path,"child-transforms",gui_scale=2)
+                self.assertEqual(independent,report["passed"])
+                self.assertEqual(45,sum(len(item["orientation_samples"]) for item in report["items"]))
+
+    def test_asymmetric_transformed_models_and_probes_detect_missing_rotation(self):
+        from PIL import Image
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-transformed-asymmetric")
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            models=list((root/"assets/minecraft/models/item/mattmc_layers").glob("*.json"))
+            self.assertEqual(16,len(models))
+            for path in models:
+                model=json.loads(path.read_text())
+                self.assertEqual([0,0,90],model["display"]["gui"]["rotation"])
+                for element in model["elements"]:
+                    layer=element["faces"]["south"]["tintindex"]
+                    self.assertEqual([0,8,7.5] if layer==0 else [4,4,7.5],element["from"])
+                    self.assertEqual([16,16,8.5] if layer==0 else [12,12,8.5],element["to"])
+            for rotation in (True,False):
+                image=Image.new("RGB",(1280,720))
+                for index,box in enumerate(boxes):
+                    for x in range(16):
+                        for y in range(16):
+                            # Compose the inverse quarter turn at the probe
+                            # to simulate keeping scale/translation but losing
+                            # rotation. Both images being wrong must still fail.
+                            px,py=(x,y) if rotation or index==0 else (10+y-8,8-(x-10))
+                            color=tuple(harness.flat_item_layer_expected(index,px,py,transformed=True,asymmetric=True))
+                            for dx in range(2):
+                                for dy in range(2):
+                                    image.putpixel((box[0]+2*x+dx-1,box[1]+2*y+dy),color)
+                path=root/"asymmetric.png"; image.save(path)
+                report=harness.flat_item_pack_image_pair(path,path,"transformed-asymmetric",gui_scale=2)
+                self.assertEqual(rotation,report["passed"])
+                self.assertEqual(45,sum(len(item["orientation_samples"]) for item in report["items"]))
+
+    def test_transformed_layers_use_ordinary_gui_display_semantics(self):
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-transformed")
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            models=list((root/"assets/minecraft/models/item/mattmc_layers").glob("*.json"))
+            self.assertEqual(16,len(models))
+            for path in models:
+                model=json.loads(path.read_text())
+                self.assertEqual("front",model["gui_light"])
+                self.assertEqual({"rotation":[0,0,90],"translation":[2,0,0],"scale":[0.5,0.5,1]},model["display"]["gui"])
+                for element in model["elements"]:
+                    self.assertNotIn("rotation",element)
+
+    def test_transformed_probes_reject_identically_wrong_untransformed_images(self):
+        from PIL import Image
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"transformed.png"
+            for transformed in (True,False):
+                image=Image.new("RGB",(1280,720))
+                for index,box in enumerate(boxes):
+                    for x in range(16):
+                        for y in range(16):
+                            color=tuple(harness.flat_item_layer_expected(index,x,y,transformed=transformed))
+                            for dx in range(2):
+                                for dy in range(2):
+                                    image.putpixel((box[0]+2*x+dx-1,box[1]+2*y+dy),color)
+                image.save(path)
+                report=harness.flat_item_pack_image_pair(path,path,"transformed",gui_scale=2)
+                self.assertEqual(transformed,report["passed"])
+                self.assertEqual(45,sum(len(item["orientation_samples"]) for item in report["items"]))
+
+    def test_rotated_layer_fixture_uses_baked_planar_rotation_not_gui_state(self):
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-rotated")
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            models=list((root/"assets/minecraft/models/item/mattmc_layers").glob("*.json"))
+            self.assertEqual(16,len(models))
+            for path in models:
+                model=json.loads(path.read_text())
+                self.assertEqual("front",model["gui_light"])
+                self.assertNotIn("display",model)
+                for element in model["elements"]:
+                    self.assertEqual([4,4,7.5],element["from"])
+                    self.assertEqual([12,12,8.5],element["to"])
+                    self.assertEqual({"origin":[8,8,8],"axis":"z","angle":45,"rescale":False},element["rotation"])
+
+    def test_rotated_layer_probes_require_tips_and_empty_corners(self):
+        from PIL import Image
+        self.assertEqual([55,106,16],harness.flat_item_layer_expected(1,3,8,rotated=True))
+        self.assertEqual([31,47,63],harness.flat_item_layer_expected(1,4,4,rotated=True))
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"rotated.png"
+            image=Image.new("RGB",(1280,720))
+            for index,box in enumerate(boxes):
+                for x in range(16):
+                    for y in range(16):
+                        color=tuple(harness.flat_item_layer_expected(index,x,y,rotated=True))
+                        for dx in range(2):
+                            for dy in range(2):
+                                image.putpixel((box[0]+2*x+dx-1,box[1]+2*y+dy),color)
+            image.save(path)
+            report=harness.flat_item_pack_image_pair(path,path,"rotated",gui_scale=2)
+            self.assertTrue(report["passed"])
+            self.assertEqual(45,sum(len(item["orientation_samples"]) for item in report["items"]))
+            image.putpixel((boxes[1][0]+5,boxes[1][1]+16),(31,47,63))
+            image.save(path)
+            self.assertFalse(harness.flat_item_pack_image_pair(path,path,"rotated",gui_scale=2)["passed"])
+
+    def test_layer_replacement_requires_exact_native_counts_in_order(self):
+        def trace(*counts):
+            return "\n".join(f"whole-frame.gui-item-layers groups=9 layers={count}" for count in counts)
+        self.assertTrue(harness.gui_item_layer_decode_evidence(trace(17)))
+        self.assertTrue(harness.gui_item_layer_decode_evidence(trace(17,17,16,16),True))
+        for log in (trace(171,16),trace(16,17),trace(17),trace(16),"prefix "+trace(17,16)):
+            self.assertFalse(harness.gui_item_layer_decode_evidence(log,True))
+
+    def test_layer_replacement_pixels_reject_stale_child_even_when_images_agree(self):
+        from PIL import Image
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"replacement.png"
+            image=Image.new("RGB",(1280,720))
+            for index,box in enumerate(boxes):
+                for x in range(16):
+                    for y in range(16):
+                        color=tuple(harness.flat_item_layer_expected(index,x,y,True,True))
+                        for dx in range(2):
+                            for dy in range(2):
+                                image.putpixel((box[0]+2*x+dx-1,box[1]+2*y+dy),color)
+            image.save(path)
+            report=harness.flat_item_pack_image_pair(path,path,"layer-replacement",gui_scale=2)
+            self.assertTrue(report["passed"])
+            self.assertEqual(45,sum(len(item["orientation_samples"]) for item in report["items"]))
+            image.putpixel((boxes[8][0]+27,boxes[8][1]+16),
+                           tuple(harness.flat_item_layer_expected(8,14,8,True,False)))
+            image.save(path)
+            self.assertFalse(harness.flat_item_pack_image_pair(path,path,"layer-replacement",gui_scale=2)["passed"])
+
+    def test_layer_replacement_changes_child_pixels_and_removes_a_semantic_layer(self):
+        from PIL import Image
+        after,before=capture_runner.gui_resource_pack_specs("flat-item-layer-replacement")
+        self.assertEqual(["mattmc-flat-item-layer-next","mattmc-flat-item-layers"],[after["name"],before["name"]])
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            for spec,count,alpha in ((before,2,128),(after,1,0)):
+                pack=root/spec["name"]
+                capture_runner.write_gui_resource_pack(pack,spec)
+                model=json.loads((pack/"assets/minecraft/items/coal.json").read_text())["model"]
+                self.assertEqual(count,len(model["models"]))
+                with Image.open(pack/"assets/minecraft/textures/item/mattmc_layer_green.png") as image:
+                    self.assertEqual(alpha,image.getpixel((4,16))[3])
+            self.assertEqual([79,23,31],harness.flat_item_layer_expected(8,14,8,True,True))
+            self.assertNotEqual(harness.flat_item_layer_expected(8,14,8,True),
+                                harness.flat_item_layer_expected(8,14,8,True,True))
+        args=harness.parse_args(["capture","--gui-resource-pack-scenario","flat-item-layer-replacement",
+            "--hotbar-item-fixture","flat-items"])
+        with self.assertRaisesRegex(ValueError,"layered item replacement"):
+            harness.validate_fixture_combinations(args)
+        args.world_resource_reload=True
+        args.world_reload_remove_pack="file/mattmc-flat-item-a"
+        with self.assertRaisesRegex(ValueError,"layered item replacement"):
+            harness.validate_fixture_combinations(args)
+        args.world_reload_remove_pack="file/mattmc-flat-item-layers"
+        harness.validate_fixture_combinations(args)
+
+    def test_layer_alpha_fixture_authors_cutoff_boundary_pixels_without_geometry_holes(self):
+        from PIL import Image
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-layer-alpha")
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            with Image.open(root/"assets/minecraft/textures/item/mattmc_layer_green.png") as image:
+                self.assertEqual([(0,255,0,a) for a in (0,25,26,128)],
+                                 [image.getpixel((x,16)) for x in (4,12,20,28)])
+            with Image.open(root/"assets/minecraft/textures/item/mattmc_layer_red.png") as image:
+                self.assertEqual((255,0,0,128),image.getpixel((16,16)))
+            for path in (root/"assets/minecraft/models/item/mattmc_layers").glob("*.json"):
+                for element in json.loads(path.read_text())["elements"]:
+                    self.assertEqual([0,0,7.5],element["from"])
+                    self.assertEqual([16,16,8.5],element["to"])
+            self.assertEqual({root/"pack.mcmeta"},set(root.rglob("*.mcmeta")))
+
+    def test_layer_alpha_probes_reject_discarded_layer_replacement_in_both_images(self):
+        from PIL import Image
+        # Independently calculated RGBA8 item pass followed by HUD composition.
+        for index,expected in ((1,([79,23,31],[79,23,31],[76,35,28],[55,106,16])),
+                               (6,([142,23,31],[142,23,31],[28,55,57],[15,87,31]))):
+            self.assertEqual(list(expected),[harness.flat_item_layer_expected(index,x,8,True) for x in (2,6,10,14)])
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"alpha-layers.png"
+            image=Image.new("RGB",(1280,720))
+            for index,box in enumerate(boxes):
+                for x in range(16):
+                    for y in range(16):
+                        color=tuple(harness.flat_item_layer_expected(index,x,y,True))
+                        for dx in range(2):
+                            for dy in range(2):
+                                image.putpixel((box[0]+2*x+dx-1,box[1]+2*y+dy),color)
+            image.save(path)
+            report=harness.flat_item_pack_image_pair(path,path,"layer-alpha",gui_scale=2)
+            self.assertTrue(report["passed"])
+            self.assertEqual(45,sum(len(item["orientation_samples"]) for item in report["items"]))
+            # A pixel below cutoff must retain the earlier layer, not replace it.
+            image.putpixel((boxes[6][0]+11,boxes[6][1]+16),(28,55,57))
+            image.save(path)
+            self.assertFalse(harness.flat_item_pack_image_pair(path,path,"layer-alpha",gui_scale=2)["passed"])
+
+    def test_layer_fixture_authors_composites_and_same_model_quads_on_one_plane(self):
+        from PIL import Image
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-layers")
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            for label,rgba in (("red",(255,0,0,128)),("green",(0,255,0,128))):
+                with Image.open(root/f"assets/minecraft/textures/item/mattmc_layer_{label}.png") as sprite:
+                    self.assertEqual((32,32),sprite.size)
+                    self.assertEqual(rgba,sprite.getpixel((16,16)))
+            for index,(resource,_,_) in enumerate(spec["sprites"]):
+                name=Path(resource).stem
+                model=json.loads((root/"assets/minecraft/items"/(name+".json")).read_text())["model"]
+                if index == 0: continue
+                children=model["models"] if index%2 == 0 else [model]
+                self.assertEqual(2 if index%2 == 0 else 1,len(children))
+                elements=[]
+                for child in children:
+                    definition=json.loads((root/"assets/minecraft/models"/(child["model"].removeprefix("minecraft:")+".json")).read_text())
+                    self.assertEqual("front",definition["gui_light"])
+                    elements.extend(definition["elements"])
+                self.assertEqual(2,len(elements))
+                self.assertEqual([8.5,8.5],[element["to"][2] for element in elements])
+                self.assertEqual([0,1],[element["faces"]["south"]["tintindex"] for element in elements])
+
+    def test_layer_witness_rejects_missing_layers_even_when_both_images_agree(self):
+        from PIL import Image
+        self.assertEqual([55,106,16],harness.flat_item_layer_expected(1,8,8))
+        self.assertEqual([103,59,16],harness.flat_item_layer_expected(2,8,8))
+        self.assertEqual([15,150,31],harness.flat_item_layer_expected(6,2,2))
+        self.assertEqual([79,23,31],harness.flat_item_layer_expected(6,8,8))
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"layers.png"
+            for viewport in ((1280,720), (640,480), (1600,900)):
+                with self.subTest(viewport=viewport):
+                    boxes,_=harness.flat_item_witness_layout(2,viewport)
+                    image=Image.new("RGB",viewport)
+                    for index,box in enumerate(boxes):
+                        for x in range(16):
+                            for y in range(16):
+                                color=tuple(harness.flat_item_layer_expected(index,x,y))
+                                for dy in range(2):
+                                    for dx in range(2):
+                                        px=box[0]+x*2+dx-1
+                                        if px>=0: image.putpixel((px,box[1]+y*2+dy),color)
+                    image.save(path)
+                    report=harness.flat_item_pack_image_pair(path,path,"layers",gui_scale=2,viewport=viewport)
+                    self.assertTrue(report["passed"])
+                    self.assertEqual(45,sum(len(item["orientation_samples"]) for item in report["items"]))
+                    image.putpixel((boxes[8][0]+15,boxes[8][1]+16),(31,47,63))
+                    image.save(path)
+                    self.assertFalse(harness.flat_item_pack_image_pair(path,path,"layers",gui_scale=2,viewport=viewport)["passed"])
+
+    def test_interpolated_item_fixture_uses_normal_pack_animation(self):
+        spec, = capture_runner.gui_resource_pack_specs("flat-item-animation-interpolated")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            animation = json.loads((root/"assets/minecraft/textures/item/feather.png.mcmeta").read_text())["animation"]
+            self.assertEqual({"width":32,"height":32,"frametime":4,"interpolate":True,"frames":[0,1]},animation)
+            self.assertFalse((root/"assets/minecraft/textures/item/apple.png.mcmeta").exists())
+
+    def test_interpolated_item_pixels_require_interior_phase_not_matching_stale_endpoints(self):
+        from PIL import Image, ImageDraw
+        boxes,_=harness.flat_item_witness_layout(2)
+        # Independently calculated packed-channel results at frame0/subframe1.
+        mixed=((237,78,58),(36,176,132),(39,105,200),(235,158,39))
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"interior.png"
+            image=Image.new("RGB",(1280,720))
+            for index,box in enumerate(boxes):
+                for q,color in enumerate(capture_runner.FLAT_ITEM_UV_COLORS if index == 0 else mixed):
+                    x,y=box[0]+(q%2)*16,box[1]+(q//2)*16
+                    ImageDraw.Draw(image).rectangle((x,y,x+15,y+15),fill=tuple(round(v*252/255) for v in color))
+            image.save(path)
+            self.assertTrue(harness.flat_item_pack_image_pair(path,path,"animation-interpolated",gui_scale=2,animation_frame=0,animation_subframe=1)["passed"])
+            self.assertFalse(harness.flat_item_pack_image_pair(path,path,"animation",gui_scale=2,animation_frame=0)["passed"])
+            self.assertFalse(harness.flat_item_pack_image_pair(path,path,"animation-interpolated",gui_scale=2,animation_frame=0,animation_subframe=3)["passed"])
+            for invalid in (None,False,0,4,-1):
+                with self.assertRaises(ValueError):
+                    harness.flat_item_pack_image_pair(path,path,"animation-interpolated",gui_scale=2,animation_frame=0,animation_subframe=invalid)
+
+    def test_animated_transition_requires_all_gui_only_slots_to_change_on_both_backends(self):
+        import copy
+        previous={"passed":True,"animation":{"frozen":{"frame":0}},"items":[
+            {"orientation_samples":[{"observed":[[0,0,0],[0,0,0]]} for _ in range(4)]} for _ in range(9)]}
+        current=copy.deepcopy(previous)
+        current["animation"]["frozen"]["frame"]=1
+        for item in current["items"][1:]:
+            for sample in item["orientation_samples"]: sample["observed"]=[[255,0,0],[255,0,0]]
+        self.assertTrue(harness.flat_item_animation_changed(previous,current))
+        for index in range(1,9):
+            stale=copy.deepcopy(current)
+            stale["items"][index]=copy.deepcopy(previous["items"][index])
+            self.assertFalse(harness.flat_item_animation_changed(previous,stale))
+        current["items"][0]=copy.deepcopy(current["items"][1])
+        self.assertFalse(harness.flat_item_animation_changed(previous,current))
+    def test_animation_fixture_keeps_held_item_static_and_animates_gui_only_sprite(self):
+        from PIL import Image
+        spec, = capture_runner.gui_resource_pack_specs("flat-item-animation")
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            textures=root/"assets/minecraft/textures/item"
+            with Image.open(textures/"apple.png") as held, Image.open(textures/"feather.png") as animated:
+                self.assertEqual((32,32),held.size)
+                self.assertEqual((32,64),animated.size)
+                self.assertEqual(held.getpixel((4,4)),animated.getpixel((4,4)))
+                self.assertNotEqual(animated.getpixel((4,4)),animated.getpixel((4,36)))
+            self.assertFalse((textures/"apple.png.mcmeta").exists())
+            self.assertEqual([0,1],json.loads((textures/"feather.png.mcmeta").read_text())["animation"]["frames"])
+            for index,(texture,_,_) in enumerate(spec["sprites"]):
+                model=json.loads((root/"assets/minecraft/models/item/mattmc_geometry"/(Path(texture).stem+".json")).read_text())
+                self.assertEqual("minecraft:item/feather" if index else "minecraft:item/apple",model["textures"]["layer0"])
+
+    def test_animation_witness_rejects_stale_frames_even_when_both_images_agree(self):
+        from PIL import Image, ImageDraw
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"frame.png"
+            image=Image.new("RGB",(1280,720))
+            for index,box in enumerate(boxes):
+                colors=capture_runner.FLAT_ITEM_UV_COLORS if index == 0 else tuple(reversed(capture_runner.FLAT_ITEM_UV_COLORS))
+                for q,color in enumerate(colors):
+                    x,y=box[0]+(q%2)*16,box[1]+(q//2)*16
+                    ImageDraw.Draw(image).rectangle((x,y,x+15,y+15),fill=tuple(round(v*252/255) for v in color))
+            image.save(path)
+            self.assertTrue(harness.flat_item_pack_image_pair(path,path,"animation",gui_scale=2,animation_frame=1)["passed"])
+            self.assertFalse(harness.flat_item_pack_image_pair(path,path,"animation",gui_scale=2,animation_frame=0)["passed"])
+            with self.assertRaises(ValueError): harness.flat_item_pack_image_pair(path,path,"animation",gui_scale=2)
+    def test_orientation_fixture_authors_all_signed_quarter_turn_mappings(self):
+        expected = ((0,1,2,3),(1,0,3,2),(2,3,0,1),(3,2,1,0),
+                    (2,0,3,1),(3,2,1,0),(1,3,0,2),(3,1,2,0),(0,2,1,3))
+        self.assertEqual(8,len(set(expected)))
+        spec,=capture_runner.gui_resource_pack_specs("flat-item-orientation")
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            for index,((texture,_,_),(uv,rotation)) in enumerate(zip(spec["sprites"],capture_runner.FLAT_ITEM_ORIENTATIONS)):
+                model=json.loads((root/"assets/minecraft/models/item/mattmc_geometry"/(Path(texture).stem+".json")).read_text())
+                face=model["elements"][0]["faces"]["south"]
+                self.assertEqual(list(uv),face["uv"])
+                self.assertEqual(rotation,face["rotation"])
+                self.assertEqual([capture_runner.FLAT_ITEM_UV_COLORS[q] for q in expected[index]],
+                    capture_runner.flat_item_orientation_colors(index))
+
+    def test_orientation_gate_rejects_unmirrored_impostors_on_both_sides(self):
+        from PIL import Image, ImageDraw
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            baseline,current=Path(temporary)/"baseline.png",Path(temporary)/"current.png"
+            image=Image.new("RGB",(1280,720))
+            def draw_item(index, colors):
+                box=boxes[index]
+                for q,color in enumerate(colors):
+                    x,y=box[0]+(q%2)*16,box[1]+(q//2)*16
+                    ImageDraw.Draw(image).rectangle((x,y,x+15,y+15),fill=tuple(round(v*252/255) for v in color))
+            for index in range(9): draw_item(index,capture_runner.flat_item_orientation_colors(index))
+            image.save(baseline);image.save(current)
+            result=harness.flat_item_pack_image_pair(baseline,current,"orientation",gui_scale=2)
+            self.assertTrue(result["passed"])
+            self.assertEqual(36,sum(len(row["orientation_samples"]) for row in result["items"]))
+            draw_item(1,capture_runner.flat_item_orientation_colors(0))
+            image.save(current);image.save(baseline)
+            self.assertFalse(harness.flat_item_pack_image_pair(baseline,current,"orientation",gui_scale=2)["passed"])
+
+    def test_uv_fixture_authors_distinct_regions_of_one_texture(self):
+        from PIL import Image
+        spec, = capture_runner.gui_resource_pack_specs("flat-item-uv")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            for (texture,_,_), uv in zip(spec["sprites"],capture_runner.FLAT_ITEM_RECTS):
+                model=json.loads((root/"assets/minecraft/models/item/mattmc_geometry"/(Path(texture).stem+".json")).read_text())
+                element,=model["elements"]
+                self.assertEqual([0,0,7.5],element["from"])
+                self.assertEqual([16,16,8.5],element["to"])
+                self.assertEqual(list(uv),element["faces"]["south"]["uv"])
+            with Image.open(root/"assets/minecraft/textures/item/apple.png") as image:
+                self.assertEqual((32,32),image.size)
+                for index,color in enumerate(capture_runner.FLAT_ITEM_UV_COLORS):
+                    self.assertEqual((*color,255),image.getpixel((8+16*(index%2),8+16*(index//2))))
+
+    def test_uv_witness_rejects_ignored_regions_even_when_both_images_agree(self):
+        from PIL import Image, ImageDraw
+        boxes,_=harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            baseline,current=Path(temporary)/"baseline.png",Path(temporary)/"current.png"
+            image=Image.new("RGB",(1280,720))
+            for box,(left,top,right,bottom) in zip(boxes,capture_runner.FLAT_ITEM_RECTS):
+                quadrant=((top+bottom)//2//8)*2+(left+right)//2//8
+                color=tuple(round(value*252/255) for value in capture_runner.FLAT_ITEM_UV_COLORS[quadrant])
+                ImageDraw.Draw(image).rectangle((box[0],box[1],box[2]-1,box[3]-1),fill=color)
+            image.save(baseline);image.save(current)
+            self.assertTrue(harness.flat_item_pack_image_pair(baseline,current,"uv",gui_scale=2)["passed"])
+            box=boxes[0]
+            ImageDraw.Draw(image).rectangle((box[0],box[1],box[2]-1,box[3]-1),fill=(232,198,30))
+            image.save(current);image.save(baseline)
+            self.assertFalse(harness.flat_item_pack_image_pair(baseline,current,"uv",gui_scale=2)["passed"])
+
+    def test_geometry_pack_authors_local_rectangles_without_renderer_overrides(self):
+        spec, = capture_runner.gui_resource_pack_specs("flat-item-geometry")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture_runner.write_gui_resource_pack(root,spec)
+            for (texture,_,_), (left,top,right,bottom) in zip(spec["sprites"],capture_runner.FLAT_ITEM_RECTS):
+                name = Path(texture).stem
+                model = json.loads((root/"assets/minecraft/models/item/mattmc_geometry"/(name+".json")).read_text())
+                self.assertEqual("front",model["gui_light"])
+                self.assertEqual("minecraft:item/apple",model["textures"]["layer0"])
+                element, = model["elements"]
+                self.assertEqual([left,16-bottom,7.5],element["from"])
+                self.assertEqual([right,16-top,8.5],element["to"])
+                self.assertEqual({"south"},set(element["faces"]))
+                self.assertEqual([0,0,16,16],element["faces"]["south"]["uv"])
+
+    def test_geometry_witness_rejects_stretched_models_even_if_both_images_agree(self):
+        from PIL import Image, ImageDraw
+        boxes,_ = harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            baseline,current = Path(temporary)/"baseline.png",Path(temporary)/"current.png"
+            image = Image.new("RGB",(1280,720))
+            for box,(left,top,right,bottom) in zip(boxes,capture_runner.FLAT_ITEM_RECTS):
+                ImageDraw.Draw(image).rectangle((box[0]-1+left*2,box[1]+top*2,
+                    box[0]-2+right*2,box[1]+bottom*2-1),fill=(35,209,97))
+            image.save(baseline); image.save(current)
+            self.assertTrue(harness.flat_item_pack_image_pair(baseline,current,"geometry",gui_scale=2)["passed"])
+            box = boxes[0]
+            ImageDraw.Draw(image).rectangle((box[0],box[1],box[2]-1,box[3]-1),fill=(35,209,97))
+            image.save(current)
+            self.assertFalse(harness.flat_item_pack_image_pair(baseline,current,"geometry",gui_scale=2)["passed"])
+            image.save(baseline)
+            self.assertFalse(harness.flat_item_pack_image_pair(baseline,current,"geometry",gui_scale=2)["passed"])
+
+    def test_tint_fixture_shares_one_authored_model_and_preserves_distinct_tints(self):
+        spec, = capture_runner.gui_resource_pack_specs("flat-item-tint-alpha")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture_runner.write_gui_resource_pack(root, spec)
+            definitions = sorted((root / "assets/minecraft/items").glob("*.json"))
+            self.assertEqual(9, len(definitions))
+            actual_tints = []
+            for texture, _, _ in spec["sprites"]:
+                model = json.loads((root / "assets/minecraft/items" / (Path(texture).stem + ".json")).read_text())["model"]
+                self.assertEqual("minecraft:model", model["type"])
+                self.assertEqual("minecraft:item/apple", model["model"])
+                self.assertEqual("minecraft:constant", model["tints"][0]["type"])
+                actual_tints.append(model["tints"][0]["value"])
+            self.assertEqual(list(capture_runner.FLAT_ITEM_TINTS), actual_tints)
+            self.assertEqual(9, len(set(actual_tints)))
+
+    def test_tint_gate_rejects_both_missing_tints_and_same_texture_cache_alias(self):
+        from PIL import Image, ImageDraw
+        boxes, _ = harness.flat_item_witness_layout(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            baseline, current = Path(temporary)/"baseline.png", Path(temporary)/"current.png"
+            image = Image.new("RGB", (1280,720))
+            for box, tint in zip(boxes, capture_runner.FLAT_ITEM_TINTS):
+                color = tuple(round(value * ((tint >> shift) & 255) / 255 * 252 / 255)
+                              for value, shift in zip((35,212,98), (16,8,0)))
+                ImageDraw.Draw(image).rectangle((box[0],box[1],box[2]-1,box[3]-1), fill=color)
+            image.save(baseline); image.save(current)
+            result = harness.flat_item_pack_image_pair(baseline,current,"tint-alpha",gui_scale=2)
+            self.assertTrue(result["passed"])
+            self.assertEqual(45, sum(len(row["alpha_steps"]) for row in result["items"]))
+            for color in ((35,209,97), image.getpixel((boxes[0][0]+16,boxes[0][1]+16))):
+                broken = image.copy()
+                box = boxes[1]
+                ImageDraw.Draw(broken).rectangle((box[0],box[1],box[2]-1,box[3]-1), fill=color)
+                broken.save(current)
+                self.assertFalse(harness.flat_item_pack_image_pair(baseline,current,"tint-alpha",gui_scale=2)["passed"])
+                broken.save(baseline)
+                self.assertFalse(harness.flat_item_pack_image_pair(baseline,current,"tint-alpha",gui_scale=2)["passed"])
+                image.save(baseline)
+
+    def test_intermediate_resize_images_require_explicit_extent_and_keep_alpha_gate(self):
+        from PIL import Image, ImageDraw
+        for invalid in ((640.0,480), (640,481), (True,480), [640,480]):
+            with self.assertRaises(ValueError): harness.flat_item_witness_layout(2,invalid)
+        with tempfile.TemporaryDirectory() as temporary:
+            baseline, current = Path(temporary)/"baseline.png", Path(temporary)/"current.png"
+            for viewport, first_box in (((640,480), (145,442,177,474)),
+                                        ((1600,900), (625,862,657,894))):
+                boxes, patches = harness.flat_item_witness_layout(2, viewport)
+                self.assertEqual(first_box, boxes[0])
+                image = Image.new("RGB", viewport, (35,209,97))
+                image.save(baseline); image.save(current)
+                with self.assertRaises(ValueError): harness.flat_item_pack_image_pair(baseline,current,"alpha",gui_scale=2)
+                report = harness.flat_item_pack_image_pair(baseline,current,"alpha",gui_scale=2,viewport=viewport)
+                self.assertTrue(report["passed"])
+                self.assertEqual(45, sum(len(item["alpha_steps"]) for item in report["items"]))
+                x,y,_,_ = boxes[0]; left,top,right,bottom = patches[1]
+                ImageDraw.Draw(image).rectangle((x+left,y+top,x+right-1,y+bottom-1),fill=(37,211,99))
+                image.save(current)
+                self.assertFalse(harness.flat_item_pack_image_pair(baseline,current,"alpha",gui_scale=2,viewport=viewport)["passed"])
+
+    def test_intermediate_resize_receipts_cannot_substitute_for_full_recovery(self):
+        sizes = ((1280,720), (640,480), (1600,900), (1280,720))
+        for stage in (1,2,3):
+            receipt = {"schema": "world-window-resize-recovery-v1", "complete": True, "captureStage": stage,
+                "windowPlacement": "client-32-64-v1",
+                "observations": [{"frame": i+1,"phase": i//2,"width": sizes[i//2][0],
+                                  "height": sizes[i//2][1],"scale": 2,"x":32,"y":64} for i in range(2*(stage+1))]}
+            self.assertTrue(harness.world_window_resize_receipt_valid(receipt,stage))
+            self.assertFalse(harness.world_window_resize_receipt_valid({**receipt, "captureStage": True},stage))
+            invalid = json.loads(json.dumps(receipt)); invalid["observations"][2]["y"] = 131
+            self.assertFalse(harness.world_window_resize_receipt_valid(invalid,stage))
+            for wrong in set((1,2,3))-{stage}:
+                self.assertFalse(harness.world_window_resize_receipt_valid(receipt,wrong))
+    def test_world_window_resize_requires_all_sizes_and_both_receipts(self):
+        sizes = ((1280,720), (640,480), (1600,900), (1280,720))
+        receipt = {"schema": "world-window-resize-recovery-v1", "complete": True,
+            "observations": [{"frame": i+1, "phase": i//2, "width": sizes[i//2][0],
+                              "height": sizes[i//2][1], "scale": 2} for i in range(8)]}
+        self.assertTrue(harness.world_window_resize_receipt_valid(receipt))
+        for key, value in (("width", 1280), ("height", 720), ("frame", 1), ("phase", 0), ("scale", 3)):
+            invalid = json.loads(json.dumps(receipt)); invalid["observations"][2][key] = value
+            self.assertFalse(harness.world_window_resize_receipt_valid(invalid))
+        self.assertFalse(harness.world_window_resize_receipt_valid({**receipt, "complete": False}))
+        self.assertFalse(harness.world_window_resize_receipt_valid({**receipt, "observations": receipt["observations"][:-1]}))
+        pair = {"baseline_artifact": "/baseline/result.json", "current_artifact": "/current/result.json",
+                "baseline_image": "baseline.png", "current_image": "current.png",
+                "fixture_equivalence": {"status": "passed"}}
+        for documents, expected in (([{"worldWindowResize": receipt}, {}], False),
+                                    ([{}, {"worldWindowResize": receipt}], False),
+                                    ([{"worldWindowResize": receipt}]*2, True)):
+            with mock.patch.object(harness, "latest_capture_meta_path", return_value=Path("meta.txt")), \
+                 mock.patch.object(harness, "read_key_values", return_value={"forced_option_guiScale": "2"}), \
+                 mock.patch.object(harness, "deterministic_capture_document", side_effect=documents), \
+                 mock.patch.object(harness, "flat_item_pack_image_pair", return_value={"passed": True}) as compare:
+                report = harness.flat_item_pack_parity_report({"pairs": [pair]}, "flat-item-alpha", 6, 2,
+                                                            window_resize_cycle=True)
+                self.assertEqual(expected, report["passed"])
+                self.assertEqual(expected, compare.called)
+
+    def test_world_window_resize_reaches_both_launchers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                    "--gui-resource-pack-scenario", "flat-item-alpha", "--hotbar-item-fixture", "flat-items",
+                    "--flat-item-gui-scale", "2", "--world-window-resize-cycle", "--rust-full-gameplay-attachments"])
+                harness.validate_fixture_combinations(args)
+                args._canonical_fixture_run_source = root / "fixture"
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.windowResizeCycle=true", shlex.split(env["JAVA_TOOL_OPTIONS"]))
+                args.world_gui_scale_cycle = True
+                with self.assertRaisesRegex(ValueError, "no GUI scale cycle"):
+                    harness.validate_fixture_combinations(args)
+    def test_layered_item_lifecycle_inputs_reach_both_backends_without_relaxing_guards(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for flag, property_name in (("--world-gui-scale-cycle", "guiScaleCycle"),
+                                        ("--world-window-resize-cycle", "windowResizeCycle")):
+                for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                    with self.subTest(fixture=flag, mode=name):
+                        mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                        args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                            "--gui-resource-pack-scenario", "flat-item-layers", "--hotbar-item-fixture", "flat-items",
+                            "--flat-item-gui-scale", "2", flag, "--rust-full-gameplay-attachments"])
+                        harness.validate_fixture_combinations(args)
+                        args._canonical_fixture_run_source = root / "fixture"
+                        _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                            root / "capture", "settled-static", args, "capture")
+                        self.assertIn(f"-Dmattmc.dev.deterministicCameraCapture.{property_name}=true",
+                                      shlex.split(env["JAVA_TOOL_OPTIONS"]))
+                        for field, invalid in (("flat_item_gui_scale", 3),
+                                               ("rust_full_gameplay_attachments", False),
+                                               ("gui_resource_pack_scenario", "flat-item-uv")):
+                            original = getattr(args, field)
+                            setattr(args, field, invalid)
+                            with self.assertRaises(ValueError):
+                                harness.validate_fixture_combinations(args)
+                            setattr(args, field, original)
+                        args.world_gui_scale_cycle = True
+                        args.world_window_resize_cycle = True
+                        with self.assertRaisesRegex(ValueError, "no GUI scale cycle"):
+                            harness.validate_fixture_combinations(args)
+
+    def test_layered_item_parity_requires_both_lifecycle_receipts_and_native_layers(self):
+        scale = {"schema": "world-gui-scale-2-3-2-v1", "complete": True,
+            "observations": [{"frame": i+1, "phase": i//2, "setting": value, "actual": value}
+                             for i,value in enumerate((2,2,3,3,2,2))]}
+        sizes = ((1280,720), (640,480), (1600,900), (1280,720))
+        resize = {"schema": "world-window-resize-recovery-v1", "complete": True,
+            "captureStage": 3, "windowPlacement": "client-32-64-v1",
+            "observations": [{"frame": i+1, "phase": i//2, "width": sizes[i//2][0],
+                "height": sizes[i//2][1], "scale": 2, "x": 32, "y": 64} for i in range(8)]}
+        pair = {"baseline_artifact": "/baseline/result.json", "current_artifact": "/current/result.json",
+            "baseline_image": "baseline.png", "current_image": "current.png",
+            "fixture_equivalence": {"status": "passed"}}
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary)/"native.log"
+            for key,receipt,kwargs in (("worldGuiScale", scale, {"gui_scale_cycle": True}),
+                                      ("worldWindowResize", resize, {"window_resize_cycle": True})):
+                for missing in ("baseline_artifact", "current_artifact", None):
+                    for decoded_layers in (9,17):
+                        documents = {pair[side]: {"selectedHotbarSlot": 1,
+                            **({key: receipt} if side != missing else {})}
+                            for side in ("baseline_artifact", "current_artifact")}
+                        log.write_text(f"whole-frame.gui-item-layers groups=9 layers={decoded_layers}\n")
+                        with mock.patch.object(harness, "latest_capture_meta_path", return_value=Path("meta.txt")), \
+                             mock.patch.object(harness, "read_key_values", return_value={"forced_option_guiScale": "2"}), \
+                             mock.patch.object(harness, "deterministic_capture_document", side_effect=lambda path: documents[str(path)]), \
+                             mock.patch.object(harness, "read_json", return_value={"capture": {"files": {"run_log": str(log)}}}), \
+                             mock.patch.object(harness, "flat_item_pack_image_pair", return_value={"passed": True}) as compare:
+                            result = harness.flat_item_pack_parity_report({"pairs": [pair]}, "flat-item-layers", 6, 2, **kwargs)
+                            expected = missing is None and decoded_layers == 17
+                            self.assertEqual(expected, result["passed"], (key,missing,decoded_layers))
+                            self.assertEqual(expected, compare.called)
+
+    def test_world_gui_scale_cycle_receipt_requires_distinct_observed_presentations(self):
+        receipt = {"schema": "world-gui-scale-2-3-2-v1", "complete": True,
+            "observations": [{"frame": i+1, "phase": i//2, "setting": scale, "actual": scale}
+                             for i, scale in enumerate((2,2,3,3,2,2))]}
+        self.assertTrue(harness.world_gui_scale_receipt_valid(receipt))
+        for invalid in (None, {}, {**receipt, "complete": False},
+                        {**receipt, "observations": receipt["observations"][:-1]}):
+            self.assertFalse(harness.world_gui_scale_receipt_valid(invalid))
+        for key, value in (("frame", 1), ("phase", 0), ("actual", 2), ("setting", 2)):
+            invalid = json.loads(json.dumps(receipt))
+            invalid["observations"][2][key] = value
+            self.assertFalse(harness.world_gui_scale_receipt_valid(invalid))
+
+    def test_world_gui_scale_cycle_reaches_both_launchers_and_requires_scale_two(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                    "--gui-resource-pack-scenario", "flat-item-alpha", "--hotbar-item-fixture", "flat-items",
+                    "--flat-item-gui-scale", "2", "--world-gui-scale-cycle", "--rust-full-gameplay-attachments"])
+                harness.validate_fixture_combinations(args)
+                args._canonical_fixture_run_source = root / "fixture"
+                _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                    root / "capture", "settled-static", args, "capture")
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.guiScaleCycle=true", shlex.split(env["JAVA_TOOL_OPTIONS"]))
+                args.flat_item_gui_scale = 3
+                with self.assertRaisesRegex(ValueError, "scale2"):
+                    harness.validate_fixture_combinations(args)
+
+    def test_world_gui_scale_cycle_cannot_pass_with_only_one_repository_receipt(self):
+        receipt = {"schema": "world-gui-scale-2-3-2-v1", "complete": True,
+            "observations": [{"frame": i+1, "phase": i//2, "setting": scale, "actual": scale}
+                             for i, scale in enumerate((2,2,3,3,2,2))]}
+        pair = {"baseline_artifact": "/baseline/result.json", "current_artifact": "/current/result.json",
+                "baseline_image": "baseline.png", "current_image": "current.png",
+                "fixture_equivalence": {"status": "passed"}}
+        for documents, expected in (([{"worldGuiScale": receipt}, {}], False),
+                                    ([{}, {"worldGuiScale": receipt}], False),
+                                    ([{"worldGuiScale": receipt}]*2, True)):
+            with mock.patch.object(harness, "latest_capture_meta_path", return_value=Path("meta.txt")), \
+                 mock.patch.object(harness, "read_key_values", return_value={"forced_option_guiScale": "2"}), \
+                 mock.patch.object(harness, "deterministic_capture_document", side_effect=documents), \
+                 mock.patch.object(harness, "flat_item_pack_image_pair", return_value={"passed": True}) as compare:
+                result = harness.flat_item_pack_parity_report({"pairs": [pair]}, "flat-item-alpha", 6, 2, True)
+                self.assertEqual(expected, result["passed"])
+                self.assertEqual(expected, compare.called)
+
+    def test_background_observation_uses_same_final_settling_schedule_for_both_backends(self):
+        args = harness.parse_args(["capture", "--hotbar-item-fixture", "flat-items",
+            "--gui-resource-pack-scenario", "flat-item-alpha", "--rust-full-gameplay-attachments",
+            "--item-background-pixels"])
+        harness.validate_fixture_combinations(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                root = Path(temporary)
+                repo = fake_repo(root, name)
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                _, env = harness.build_capture_command(repo,mode,root/name/"capture","correctness",args,"capture")
+                properties = dict(value[2:].split("=",1) for value in shlex.split(env["JAVA_TOOL_OPTIONS"])
+                                  if value.startswith("-D") and "=" in value)
+                self.assertEqual("8", properties["mattmc.dev.deterministicCameraCapture.framesPerPose"])
+                self.assertEqual("true", properties["mattmc.dev.deterministicCameraCapture.itemBackgroundPixels"])
+        args.rust_full_gameplay_attachments = False
+        with self.assertRaises(ValueError):
+            harness.validate_fixture_combinations(args)
+
+    def test_backed_alpha_fixture_changes_only_authored_hotbar_destination(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original, = capture_runner.gui_resource_pack_specs("flat-item-alpha")
+            backed, = capture_runner.gui_resource_pack_specs("flat-item-alpha-backed")
+            capture_runner.write_gui_resource_pack(root / "original", original)
+            capture_runner.write_gui_resource_pack(root / "backed", backed)
+            for path, _, _ in original["sprites"]:
+                self.assertEqual((root / "original" / path).read_bytes(), (root / "backed" / path).read_bytes())
+            path = "assets/minecraft/textures/gui/sprites/hud/hotbar.png"
+            self.assertFalse((root / "original" / path).exists())
+            with Image.open(root / "backed" / path) as image:
+                self.assertEqual((182,22), image.size)
+                self.assertEqual((31,47,63,255), image.getpixel((10,10)))
+                self.assertEqual({255}, set(image.getchannel("A").getdata()))
+
+    def test_alpha_gate_rejects_small_cutoff_leak_hidden_by_icon_average(self):
+        from PIL import Image, ImageDraw
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Image.new("RGB", (1280,720), (35,209,97))
+            baseline, current = root / "baseline.png", root / "current.png"
+            source.save(baseline)
+            source.save(current)
+            result = harness.flat_item_pack_image_pair(baseline, current, "alpha")
+            self.assertTrue(result["passed"])
+            self.assertEqual(45, sum(len(row["alpha_steps"]) for row in result["items"]))
+            ImageDraw.Draw(source).rectangle((376+11,663+11,376+13,663+13), fill=(37,211,99))
+            source.save(current)
+            result = harness.flat_item_pack_image_pair(baseline, current, "alpha")
+            self.assertFalse(result["passed"])
+            self.assertLess(max(result["items"][0]["mean_rgb_abs"]), 0.01)
+            self.assertFalse(result["items"][0]["alpha_steps"][1]["passed"])
+
+    def test_flat_item_scale_witnesses_preserve_legacy_and_sample_authored_alpha_interiors(self):
+        boxes, patches = harness.flat_item_witness_layout(3)
+        self.assertEqual((376,663,424,711), boxes[0])
+        self.assertEqual((856,663,904,711), boxes[-1])
+        self.assertEqual([(x-1,11,x+2,14) for x in (6,12,18,30,39)], patches)
+        for scale in (1,2,3):
+            boxes, patches = harness.flat_item_witness_layout(scale)
+            self.assertEqual(9, len(boxes))
+            for patch, source_left in zip(patches,(2,6,10,18,24)):
+                for x in range(patch[0],patch[2]):
+                    # Witness crop has a one-pixel inset relative to the item.
+                    source_x = math.floor((x + 1 + 0.5) * 2 / scale)
+                    self.assertTrue(source_left <= source_x < source_left + 4)
+                for y in range(patch[1],patch[3]):
+                    self.assertTrue(4 <= math.floor((y + 0.5) * 2 / scale) < 12)
+        for invalid in (0,4,2.0,True):
+            with self.assertRaises(ValueError): harness.flat_item_witness_layout(invalid)
+
+    def test_flat_item_scale_alpha_gates_reject_local_leaks_at_every_scale(self):
+        from PIL import Image, ImageDraw
+        with tempfile.TemporaryDirectory() as temp:
+            baseline, current = Path(temp)/"base.png", Path(temp)/"current.png"
+            for scale in (1,2,3):
+                image = Image.new("RGB",(1280,720),(35,209,97))
+                image.save(baseline); image.save(current)
+                report = harness.flat_item_pack_image_pair(baseline,current,"alpha",gui_scale=scale)
+                self.assertTrue(report["passed"])
+                self.assertEqual(45,sum(len(row["alpha_steps"]) for row in report["items"]))
+                box = harness.flat_item_witness_layout(scale)[0][0]
+                patch = harness.flat_item_witness_layout(scale)[1][1]
+                ImageDraw.Draw(image).rectangle((box[0]+patch[0],box[1]+patch[1],box[0]+patch[2]-1,box[1]+patch[3]-1),fill=(37,211,99))
+                image.save(current)
+                report = harness.flat_item_pack_image_pair(baseline,current,"alpha",gui_scale=scale)
+                self.assertFalse(report["passed"])
+                self.assertFalse(report["items"][0]["alpha_steps"][1]["passed"])
+
+    def test_flat_item_scale_is_identical_in_both_launchers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for scale in (1, 2, 3):
+                for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                    args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                        "--gui-resource-pack-scenario", "flat-item-alpha",
+                        "--hotbar-item-fixture", "flat-items", "--flat-item-gui-scale", str(scale)])
+                    args._canonical_fixture_run_source = root / "fixture"
+                    _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                        root / "capture", "settled-static", args, "capture")
+                    self.assertEqual(str(scale), env["MATTMC_CAPTURE_GUI_SCALE"])
+                    args.item_background_pixels = True
+                    args.rust_full_gameplay_attachments = True
+                    if scale != 3:
+                        with self.assertRaisesRegex(ValueError, "GUI scale 3"):
+                            harness.validate_fixture_combinations(args)
+
+    def test_flat_item_scale_report_rejects_missing_or_mismatched_evidence(self):
+        pair = {"baseline_artifact": "/baseline/result.json", "current_artifact": "/current/result.json",
+                "baseline_image": "baseline.png", "current_image": "current.png",
+                "fixture_equivalence": {"status": "passed"}}
+        for scale in (1, 2, 3):
+            with mock.patch.object(harness, "latest_capture_meta_path", return_value=None):
+                self.assertFalse(harness.flat_item_pack_parity_report(
+                    {"pairs": [pair]}, "flat-item-alpha", 6, scale)["passed"])
+            for observed in (str(scale), str(4 - scale) if scale != 2 else "3", None):
+                with mock.patch.object(harness, "latest_capture_meta_path", return_value=Path("meta.txt")), \
+                     mock.patch.object(harness, "read_key_values", side_effect=[
+                         {"forced_option_guiScale": str(scale)}, {"forced_option_guiScale": observed}]), \
+                     mock.patch.object(harness, "flat_item_pack_image_pair", return_value={"passed": True}) as compare:
+                    report = harness.flat_item_pack_parity_report({"pairs": [pair]}, "flat-item-alpha", 6, scale)
+                    self.assertEqual(observed == str(scale), report["passed"])
+                    self.assertEqual(observed == str(scale), compare.called)
+
+    def test_alpha_pack_has_identical_explicit_cutoff_steps_for_all_nine_items(self):
+        from PIL import Image
+        spec, = capture_runner.gui_resource_pack_specs("flat-item-alpha")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture_runner.write_gui_resource_pack(root, spec)
+            self.assertEqual(9, len(spec["sprites"]))
+            for path, width, height in spec["sprites"]:
+                with Image.open(root / path) as image:
+                    self.assertEqual((32, 32), image.size)
+                    self.assertEqual(capture_runner.GUI_PACK_COLORS["b"], image.getpixel((16, 16)))
+                    for left, alpha in ((2, 0), (6, 25), (10, 26), (18, 128), (24, 255)):
+                        self.assertEqual((255, 255, 255, alpha), image.getpixel((left + 1, 8)))
+            with self.assertRaises(ValueError):
+                capture_runner.asymmetric_png(16, 16, (255,255,255,255), "b", item_alpha_steps=True)
+
+    def test_local_item_gate_rejects_blank_wrong_pack_and_one_missing_icon(self):
+        from PIL import Image, ImageDraw
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline, current = root / "baseline.png", root / "current.png"
+            for variant, color in (("a", (235, 37, 66)), ("b", (35, 210, 97))):
+                image = Image.new("RGB", (1280, 720))
+                draw = ImageDraw.Draw(image)
+                for index in range(9):
+                    left = 376 + 60 * index
+                    draw.rectangle((left, 663, left + 47, 710), fill=color)
+                image.save(baseline)
+                image.save(current)
+                self.assertTrue(harness.flat_item_pack_image_pair(baseline, current, variant)["passed"])
+                self.assertFalse(harness.flat_item_pack_image_pair(baseline, current,
+                    "b" if variant == "a" else "a")["passed"])
+                # One missing icon is tiny in a whole-frame average but fatal here.
+                draw.rectangle((856, 663, 903, 710), fill=(0, 0, 0))
+                image.save(current)
+                self.assertFalse(harness.flat_item_pack_image_pair(baseline, current, variant)["passed"])
+                image.save(baseline)
+                self.assertFalse(harness.flat_item_pack_image_pair(baseline, current, variant)["passed"])
+            self.assertFalse(harness.flat_item_pack_parity_report({}, "flat-item-a", 6)["passed"])
+            self.assertTrue(harness.flat_item_pack_parity_report({}, "vanilla", 6)["passed"])
+
+    def test_item_pack_replaces_only_nine_textures_with_distinct_resolution_and_orientation(self):
+        from PIL import Image
+        expected = {f"assets/minecraft/textures/item/{name}.png" for name in
+                    ("apple", "feather", "paper", "diamond", "iron_ingot", "stick", "redstone", "arrow", "coal")}
+        for variant, size in (("a", 16), ("b", 32)):
+            specs = capture_runner.gui_resource_pack_specs("flat-item-" + variant)
+            self.assertEqual(1, len(specs))
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "pack"
+                capture_runner.write_gui_resource_pack(root, specs[0])
+                self.assertEqual(expected | {"pack.mcmeta"},
+                                 {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()})
+                for name in expected:
+                    with Image.open(root / name) as image:
+                        self.assertEqual((size, size), image.size)
+                        self.assertEqual(capture_runner.GUI_PACK_COLORS[variant], image.getpixel((2, 2)))
+                        self.assertNotEqual(image.getpixel((0, 2)), image.getpixel((2, 0)))
+        specs = capture_runner.gui_resource_pack_specs("flat-item-replacement")
+        self.assertEqual(["mattmc-flat-item-b", "mattmc-flat-item-a"], [s["name"] for s in specs])
+
+    def test_item_pack_schedules_match_for_both_backends_and_replacement_requires_reload(self):
+        for scenario in ("flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+            argv = ["capture", "--hotbar-item-fixture", "flat-items", "--gui-resource-pack-scenario", scenario]
+            if scenario.endswith("replacement"):
+                removed="file/mattmc-flat-item-layers" if scenario == "flat-item-layer-replacement" else "file/mattmc-flat-item-a"
+                if scenario == "flat-item-transform-replacement": removed="file/mattmc-flat-item-transform-original"
+                argv += ["--world-resource-reload", "--world-reload-remove-pack", removed]
+            args = harness.parse_args(argv)
+            harness.validate_fixture_combinations(args)
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for name, mode_name in [("current", "current-rust-vulkan-shaders-off"),
+                                        ("frozen", "frozen-opengl-shaders-off")]:
+                    target = fake_repo(root, name)
+                    mode = next(m for m in harness.MATRIX_MODES if m.name == mode_name)
+                    _, env = harness.build_capture_command(target, mode, root / name / "capture", "correctness", args, "capture")
+                    options = env["JAVA_TOOL_OPTIONS"]
+                    # The JVM applies the last property when generic pack
+                    # defaults precede the specific fixture schedule.
+                    properties = dict(value[2:].split("=", 1) for value in shlex.split(options)
+                                      if value.startswith("-D") and "=" in value)
+                    self.assertEqual("1", properties["mattmc.dev.deterministicCameraCapture.poseCount"])
+                    self.assertEqual("0.0", properties["mattmc.dev.deterministicCameraCapture.yawDelta"])
+                    if scenario in ("flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+                        self.assertEqual("true",properties["mattmc.dev.graphicsAuditGuiItemFoilBlend"])
+                        self.assertEqual("1",properties["mattmc.dev.deterministicCameraCapture.selectedHotbarSlot"])
+                        if scenario in ("flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+                            self.assertEqual("true",properties["mattmc.dev.guiItemRasterTrace"])
+                        if scenario == "flat-item-foil-moving":
+                            self.assertEqual("10000",properties["mattmc.dev.graphicsAuditGuiItemFoilPhase"])
+                    if scenario in ("flat-item-animation", "flat-item-animation-interpolated"):
+                        self.assertEqual("true",properties["mattmc.dev.graphicsAuditGuiItemAnimation"])
+                        self.assertEqual("1",properties["mattmc.dev.deterministicCameraCapture.selectedHotbarSlot"])
+        for argv in (["capture", "--gui-resource-pack-scenario", "flat-item-a"],
+                     ["capture", "--hotbar-item-fixture", "flat-items", "--gui-resource-pack-scenario", "flat-item-replacement"]):
+            with self.assertRaises(ValueError):
+                harness.validate_fixture_combinations(harness.parse_args(argv))
+
+    def test_second_foil_phase_is_forwarded_and_requires_reference(self):
+        base=["capture","--hotbar-item-fixture","flat-items","--gui-resource-pack-scenario","flat-item-foil-moving",
+              "--flat-item-foil-phase","40000"]
+        with self.assertRaises(ValueError):
+            harness.validate_fixture_combinations(harness.parse_args(base))
+        args=harness.parse_args(base+["--flat-item-foil-reference","first-phase"])
+        harness.validate_fixture_combinations(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            for name,mode_name in (("current","current-rust-vulkan-shaders-off"),("frozen","frozen-opengl-shaders-off")):
+                target=fake_repo(root,name)
+                mode=next(m for m in harness.MATRIX_MODES if m.name==mode_name)
+                _,env=harness.build_capture_command(target,mode,root/name/"capture","correctness",args,"capture")
+                self.assertIn("-Dmattmc.dev.graphicsAuditGuiItemFoilPhase=40000",env["JAVA_TOOL_OPTIONS"])
+                self.assertNotIn("-Dmattmc.dev.graphicsAuditGuiItemFoilPhase=10000",env["JAVA_TOOL_OPTIONS"])
+
+    def test_flat_item_fixture_is_forwarded_to_both_reference_and_current(self):
+        args = harness.parse_args(["capture", "--hotbar-item-fixture", "flat-items"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, mode_name in [("current", "current-rust-vulkan-shaders-off"),
+                                    ("frozen", "frozen-opengl-shaders-off")]:
+                target = fake_repo(root, name)
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == mode_name)
+                _, env = harness.build_capture_command(target, mode, root / name / "capture", "correctness", args, "capture")
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.hotbarItemFixture=flat-items",
+                              env["JAVA_TOOL_OPTIONS"])
 
 
 if __name__ == "__main__":

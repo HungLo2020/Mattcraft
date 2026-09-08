@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.InteractionResult;
@@ -20,7 +19,7 @@ class BrokenItemBehaviorTest {
 
 	@BeforeAll
 	static void bootstrap() {
-		SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+		SharedConstants.tryDetectVersion();
 		Bootstrap.bootStrap();
 	}
 

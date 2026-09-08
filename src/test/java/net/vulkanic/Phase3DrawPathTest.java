@@ -5760,11 +5760,11 @@ public class Phase3DrawPathTest {
         int helper = source.indexOf("private static void validateParticleQuadSemantics(");
         assertTrue(helper >= 0,
             "particle routes must validate copied semantics before atlas staging");
-        String body = source.substring(helper, source.indexOf("private static void ensureParticleAtlasAssetLocked", helper));
+        String body = source.substring(helper, source.indexOf("public static void ensureParticleAtlasAnimationAsset", helper));
         assertTrue(body.contains("Float.isFinite(value)"),
             "particle positions, rotations, size, and UVs must reject non-finite values");
-        assertTrue(body.contains("quadSize <= 0.0F"),
-            "particle quad size must be positive before geometry emission");
+        assertFalse(body.contains("quadSize <= 0.0F"),
+            "vanilla lifetime interpolation uses signed and zero particle sizes; finite-value validation must preserve them");
         assertTrue(body.contains("quaternionLengthSquared"),
             "particle billboard rotation must reject a zero quaternion");
     }
@@ -5789,7 +5789,7 @@ public class Phase3DrawPathTest {
         Path rendererFile = SRC_MAIN_JAVA.resolve(
             "net/vulkanic/world/RustGalWorldPrimitiveRenderer.java");
         String source = readSource(rendererFile);
-        int atlasBranch = source.indexOf("byte[] pngBytes = output.toByteArray();");
+        int atlasBranch = source.indexOf("var payload = AtlasTexturePayload.copy(textureId, atlasLocation");
         int budget = source.indexOf("ensureWorldMeshRegistryCapacityLocked(PARTICLE_ATLAS_TEXTURE_IDENTITIES", atlasBranch);
         int registration = source.indexOf("registerWorldMeshTexture(", atlasBranch);
         assertTrue(atlasBranch >= 0 && budget > atlasBranch && registration > budget,

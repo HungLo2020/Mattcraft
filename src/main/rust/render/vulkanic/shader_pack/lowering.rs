@@ -5000,12 +5000,35 @@ pub fn derive_terrain_source_varying_contract(
     vertex: &PreprocessedShaderSource,
     fragment: &PreprocessedShaderSource,
 ) -> GalResult<TerrainSourceVaryingContract> {
+    derive_simple_varying_contract(vertex.expanded_source(), fragment.expanded_source())
+}
+
+/// Shared source-level interface linking. No runtime renderer state is used.
+pub(in crate::render::vulkanic) fn bind_simple_paired_varyings(vertex: &str, fragment: &str) -> GalResult<(String, String)> {
+    let contract = derive_simple_varying_contract(vertex, fragment)?;
+    if contract.fields.iter().any(|field| !matches!(field.type_name.as_str(),
+        "float" | "vec2" | "vec3" | "vec4" | "int" | "ivec2" | "ivec3" | "ivec4"
+        | "uint" | "uvec2" | "uvec3" | "uvec4")) {
+        return Err(GalError::unsupported_feature("post-effect varying requires a multi-location interface contract"));
+    }
+    for (source, storage) in [(vertex, VaryingStorage::Out), (fragment, VaryingStorage::In)] {
+        if !collect_stage_varyings(source, storage)?.is_empty()
+            && source.lines().any(|line| line.trim().starts_with("layout")
+                && line.contains(&format!(" {} ", storage.keyword()))) {
+            return Err(GalError::unsupported_feature("post-effect mixed explicit and implicit varying locations are unavailable"));
+        }
+    }
+    Ok((apply_varying_locations(vertex, VaryingStorage::Out, &contract)?,
+        apply_varying_locations(fragment, VaryingStorage::In, &contract)?))
+}
+
+fn derive_simple_varying_contract(vertex: &str, fragment: &str) -> GalResult<TerrainSourceVaryingContract> {
     let mut vertex_outputs = BTreeMap::new();
-    for field in collect_stage_varyings(vertex.expanded_source(), VaryingStorage::Out)? {
+    for field in collect_stage_varyings(vertex, VaryingStorage::Out)? {
         insert_stage_varying(&mut vertex_outputs, field, "vertex output")?;
     }
     let mut fragment_inputs = BTreeMap::new();
-    for field in collect_stage_varyings(fragment.expanded_source(), VaryingStorage::In)? {
+    for field in collect_stage_varyings(fragment, VaryingStorage::In)? {
         insert_stage_varying(&mut fragment_inputs, field, "fragment input")?;
     }
 
@@ -8327,6 +8350,24 @@ mod tests {
             .to_string();
         assert!(error.contains("gbufferModelView"));
         assert!(error.contains("legacy transform"));
+    }
+
+    #[test]
+    fn post_effect_interface_linking_matches_names_not_declaration_order() {
+        let (vertex, fragment) = bind_simple_paired_varyings(
+            "out vec2 first;\nout vec3 second;\n",
+            "in vec3 second;\nin vec2 first;\n").unwrap();
+        assert!(vertex.contains("layout(location = 0) out vec2 first;"));
+        assert!(fragment.contains("layout(location = 0) in vec2 first;"));
+        assert!(vertex.contains("layout(location = 1) out vec3 second;"));
+        assert!(fragment.contains("layout(location = 1) in vec3 second;"));
+        for input in ["in vec3 first;\n", "in vec2 missing;\n", "flat in vec2 first;\n"] {
+            assert!(bind_simple_paired_varyings("out vec2 first;\n", input).is_err());
+        }
+        assert!(bind_simple_paired_varyings("out mat4 matrix;\n", "in mat4 matrix;\n").is_err());
+        assert!(bind_simple_paired_varyings("out vec2 values[2];\n", "in vec2 values[2];\n").is_err());
+        assert!(bind_simple_paired_varyings("layout(location=0) out vec2 fixed;\nout vec2 other;\n",
+            "in vec2 other;\n").is_err());
     }
 
     #[test]

@@ -434,6 +434,7 @@ public final class DeterministicCameraCapture {
 	 * This is capture metadata only; it never participates in route selection.
 	 */
 	private static boolean wholeFrameAttachmentCaptureArmed;
+	private static String wholeFrameGuiFoilTiming = "null";
 	private static boolean wholeFrameAttachmentCaptureRequestIssued;
 	private static boolean wholeFrameAttachmentCaptureReady;
 	private static int framesAwaitingWholeFrameAttachmentCapture;
@@ -898,8 +899,31 @@ public final class DeterministicCameraCapture {
 			|| wholeFrameAttachmentCaptureRequestIssued) {
 			return -1L;
 		}
+		if (GraphicsAuditBlockDisplayFixture.guiItemAnimationRequested()) {
+			Minecraft minecraft = Minecraft.getInstance();
+			try {
+				if (!GraphicsAuditBlockDisplayFixture.readyForCapture(minecraft)) return -1L;
+			} catch (IllegalStateException timeout) {
+				fail(timeout.getMessage());
+				return -1L;
+			}
+			// Normal final-output capture can bypass the ordinary screenshot
+			// callback. Bind this observation to the frame being claimed, not
+			// a later tick at metadata serialization time.
+			blockAnimationAtCapture = GraphicsAuditBlockDisplayFixture.animationObservation(minecraft);
+		}
 		wholeFrameAttachmentCaptureRequestIssued = true;
+		try {
+			if (!GraphicsAuditGuiFoilTiming.readyForCapture()) {
+				wholeFrameAttachmentCaptureRequestIssued = false;
+				return -1L;
+			}
+		} catch (IllegalStateException timeout) {
+			fail(timeout.getMessage());
+			return -1L;
+		}
 		wholeFrameAttachmentCaptureDeterministicFrame = currentInProgressRenderedFrameIndex();
+		wholeFrameGuiFoilTiming = GraphicsAuditGuiFoilTiming.snapshot();
 		return wholeFrameAttachmentCaptureDeterministicFrame;
 	}
 
@@ -1071,6 +1095,9 @@ public final class DeterministicCameraCapture {
 	 * external desktop capture against later swapchain presentations.
 	 */
 	private static boolean captureWholeFrameFinalOutput() {
+		net.sodium.client.render.StaticTerrainParityDiagnostics.recordRustFinalOutputCaptureCoverage(
+			wholeFrameAttachmentCaptureDeterministicFrame, wholeFrameAttachmentCaptureGameplayFrame
+		);
 		if (poseIndex < 0 || poseIndex >= poses.length) {
 			fail("selected-source final-output capture has no active deterministic pose");
 			return false;
@@ -1101,6 +1128,8 @@ public final class DeterministicCameraCapture {
 			Files.createDirectories(SCREENSHOT_DIR);
 			Files.copy(source, currentScreenshotPath, StandardCopyOption.REPLACE_EXISTING);
 			Files.copy(skyFogSource, skyFogReceiptPath, StandardCopyOption.REPLACE_EXISTING);
+			Files.writeString(currentScreenshotPath.resolveSibling(fileName + ".foil-timing.json"),
+				wholeFrameGuiFoilTiming, StandardCharsets.UTF_8);
 			StringBuilder json = new StringBuilder(768);
 			json.append("{\n");
 			json.append("  \"index\": ").append(captureIndex).append(",\n");
@@ -1210,6 +1239,7 @@ public final class DeterministicCameraCapture {
 			return;
 		}
 		applyFixedCaptureTime(minecraft);
+		GraphicsAuditPostEffectFixture.beforeRender(minecraft);
 		applyRuntimeOverrides(minecraft, minecraft.player);
 		if (poseIndex >= poses.length) {
 			// External screenshot acknowledgement can advance the final pose just
@@ -1514,6 +1544,30 @@ public final class DeterministicCameraCapture {
 		if (!advanceRustGalGuiScreenCycle(minecraft)) {
 			return;
 		}
+		// Lifecycle fixtures must finish before a final-output readback can be
+		// armed: the coordinator may acknowledge that readback before the later
+		// ordinary screenshot callback is reached.
+		if (!GraphicsAuditWorldResize.prepareWorldCapture(minecraft, renderedFrameIndex)) {
+			resetWholeFrameAttachmentCaptureState();
+			settledReadyGateSatisfied = false;
+			renderedFramesAtPose = 0;
+			writeMetadata(minecraft, "waiting_for_world_window_resize");
+			return;
+		}
+		if (!GraphicsAuditWorldGuiScale.prepareWorldCapture(minecraft, renderedFrameIndex)) {
+			resetWholeFrameAttachmentCaptureState();
+			settledReadyGateSatisfied = false;
+			renderedFramesAtPose = 0;
+			writeMetadata(minecraft, "waiting_for_world_gui_scale");
+			return;
+		}
+		if (!GraphicsAuditResourceReload.prepareWorldCapture(minecraft, renderedFrameIndex)) {
+			resetWholeFrameAttachmentCaptureState();
+			settledReadyGateSatisfied = false;
+			renderedFramesAtPose = 0;
+			writeMetadata(minecraft, "waiting_for_world_resource_reload");
+			return;
+		}
 		renderedFramesAtPose++;
 		// Selected-source rows may opt into a bounded per-pose final readback.  The
 		// ordinary default retains one attachment set, while the opt-in prevents a
@@ -1545,6 +1599,11 @@ public final class DeterministicCameraCapture {
 			// matching attachment request. Advancing to the screenshot here would
 			// make the next frame's receipt unrelated evidence.
 			framesAwaitingWholeFrameAttachmentCapture++;
+			if (GraphicsAuditGuiFoilTiming.movingRequested() && !wholeFrameAttachmentCaptureRequestIssued) {
+				// Natural phase selection has its own wall-clock deadline; no
+				// submission/readback has been requested yet.
+				return;
+			}
 			if (framesAwaitingWholeFrameAttachmentCapture > ACK_TIMEOUT_FRAMES) {
 				fail("timed out waiting for selected-source attachment capture promotion");
 			} else if ((framesAwaitingWholeFrameAttachmentCapture % 30) == 0) {
@@ -1620,6 +1679,21 @@ public final class DeterministicCameraCapture {
 			if (INTERNAL_SCREENSHOTS) {
 				captureCurrentPoseInternally(minecraft);
 			} else {
+				try {
+					if (!GraphicsAuditBlockDisplayFixture.readyForCapture(minecraft)) {
+						// The pose is already settled. Observe the next normally
+						// rendered frame, not every eighth frame of an animation.
+						// Discard this candidate's readback and arm a fresh one so
+						// a later phase never reuses an earlier presentation.
+						resetWholeFrameAttachmentCaptureState();
+						wholeFrameAttachmentCaptureArmed = captureWholeFrameAttachmentsForPose;
+						renderedFramesAtPose = Math.max(0, FRAMES_PER_POSE - 1);
+						return;
+					}
+				} catch (IllegalStateException phaseTimeout) {
+					fail(phaseTimeout.getMessage());
+					return;
+				}
 				requestCurrentPoseScreenshot(minecraft);
 			}
 			resetWholeFrameAttachmentCaptureState();
@@ -1640,6 +1714,7 @@ public final class DeterministicCameraCapture {
 	 * submission readback.
 	 */
 	private static void resetWholeFrameAttachmentCaptureState() {
+		wholeFrameGuiFoilTiming = "null";
 		wholeFrameAttachmentCaptureArmed = false;
 		wholeFrameAttachmentCaptureRequestIssued = false;
 		wholeFrameAttachmentCaptureReady = false;
@@ -3510,6 +3585,9 @@ public final class DeterministicCameraCapture {
 	}
 
 	private static BlockState staticTerrainReplacementState() {
+		if ("translucent-mixed".equals(STATIC_TERRAIN_SCENARIO)) {
+			return GraphicsAuditMixedFluidFixture.enclosureBlock().defaultBlockState();
+		}
 		if ("translucent-water".equals(STATIC_TERRAIN_SCENARIO)) {
 			return Blocks.WATER.defaultBlockState();
 		}
@@ -4374,6 +4452,7 @@ public final class DeterministicCameraCapture {
 			return;
 		}
 		Direction forward = minecraft.player.getDirection();
+		GraphicsAuditOverlapProjection.configure(target, forward);
 		Direction right = forward.getClockWise();
 		BlockState[] layers = {
 			Blocks.RED_STAINED_GLASS.defaultBlockState(),
@@ -5732,13 +5811,11 @@ public final class DeterministicCameraCapture {
 	private static String blockAnimationAtCapture = "null";
 
 	private static void requestCurrentPoseScreenshot(Minecraft minecraft) {
-		try {
-			if (!GraphicsAuditBlockDisplayFixture.readyForCapture(minecraft)) return;
-		} catch (IllegalStateException phaseTimeout) {
-			fail(phaseTimeout.getMessage());
-			return;
-		}
 		blockAnimationAtCapture = GraphicsAuditBlockDisplayFixture.animationObservation(minecraft);
+		GraphicsAuditFlowingWaterFixture.captureSurface();
+		GraphicsAuditLavaFixture.captureSurface();
+		GraphicsAuditMixedFluidFixture.captureBottomSurface();
+		net.sodium.client.render.StaticTerrainParityDiagnostics.recordAppearanceSourceAtCapture();
 		// Correlate the copied Rust semantic source with the ordinary screenshot
 		// request after this pose's rendering completed. This has no route or
 		// renderer effect; it only writes bounded diagnostic evidence.
@@ -5767,6 +5844,7 @@ public final class DeterministicCameraCapture {
 		json.append("  \"observedYaw\": ").append(format(minecraft.player == null ? 0.0F : minecraft.player.getYRot())).append(",\n");
 		json.append("  \"observedPitch\": ").append(format(minecraft.player == null ? 0.0F : minecraft.player.getXRot())).append(",\n");
 		json.append("  \"renderedFrameIndex\": ").append(renderedFrameIndex).append(",\n");
+		json.append("  \"guiItemFoilTiming\": ").append(GraphicsAuditGuiFoilTiming.snapshot()).append(",\n");
 		appendWholeFramePresentationCorrelation(json, renderedFrameIndex, 2).append(",\n");
 		appendDistantHorizonsExecutionCorrelation(json, 2).append(",\n");
 		appendDistantHorizonsTextureProbeReceipt(json, 2).append(",\n");
@@ -5782,6 +5860,13 @@ public final class DeterministicCameraCapture {
 			Files.writeString(requestPath, json.toString(), StandardCharsets.UTF_8);
 		} catch (IOException exception) {
 			fail("failed to write deterministic screenshot request " + requestPath + ": " + exception.getMessage());
+			return;
+		}
+		try {
+			Files.writeString(currentScreenshotPath.resolveSibling(fileName + ".foil-timing.json"),
+				GraphicsAuditGuiFoilTiming.snapshot(), StandardCharsets.UTF_8);
+		} catch (IOException exception) {
+			fail("failed to write GUI foil timing receipt: " + exception.getMessage());
 			return;
 		}
 
@@ -5867,6 +5952,18 @@ public final class DeterministicCameraCapture {
 		long requestedRenderedFrameIndex,
 		int indent
 	) {
+		String nativeOrder = "null";
+		json.append(" ".repeat(Math.max(0, indent))).append("\"translucentFixtureProjection\":")
+			.append(GraphicsAuditOverlapProjection.receipt()).append(",\n");
+		json.append(" ".repeat(Math.max(0, indent))).append("\"cameraPoseHistory\":")
+			.append(GraphicsAuditCameraHistory.receipt(Minecraft.getInstance().player)).append(",\n");
+		String orderRoot = System.getenv("MATTMC_STATIC_TERRAIN_BATCH_TRACE_DIR");
+		if (orderRoot != null && lastWholeFramePresentation != null
+			&& lastWholeFramePresentation.deterministicRenderedFrameIndex() == requestedRenderedFrameIndex) {
+			nativeOrder = NativeTerrainOrderCapture.read(Path.of(orderRoot).resolve("static_terrain_batch_trace.json"),
+				lastWholeFramePresentation.gameplayFrameId());
+		}
+		json.append(" ".repeat(Math.max(0, indent))).append("\"nativeTerrainOrder\":").append(nativeOrder).append(",\n");
 		json.append(" ".repeat(Math.max(0, indent))).append("\"wholeFramePresentationCorrelation\":");
 		WholeFramePresentation presentation = lastWholeFramePresentation;
 		if (presentation == null || presentation.deterministicRenderedFrameIndex() != requestedRenderedFrameIndex) {
@@ -5991,7 +6088,9 @@ public final class DeterministicCameraCapture {
 		player.yHeadRotO = pose.yaw();
 		player.yBodyRot = pose.yaw();
 		player.yBodyRotO = pose.yaw();
+		if ("translucent-overlap".equals(STATIC_TERRAIN_SCENARIO)) GraphicsAuditCameraHistory.settle(player);
 		net.minecraft.client.particle.GraphicsAuditTerrainParticleFixture.install(Minecraft.getInstance());
+		net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.install(Minecraft.getInstance());
 	}
 
 	private static ForcedBlockOutlineTarget findForcedBlockOutlineTarget(ClientLevel level, LocalPlayer player) {
@@ -6141,8 +6240,18 @@ public final class DeterministicCameraCapture {
 			return;
 		}
 		List<ItemStack> items = switch (HOTBAR_ITEM_FIXTURE) {
+			case "flat-items" -> List.of(
+				new ItemStack(net.minecraft.world.item.Items.APPLE),
+				new ItemStack(net.minecraft.world.item.Items.FEATHER),
+				new ItemStack(net.minecraft.world.item.Items.PAPER),
+				new ItemStack(net.minecraft.world.item.Items.DIAMOND),
+				new ItemStack(net.minecraft.world.item.Items.IRON_INGOT),
+				new ItemStack(net.minecraft.world.item.Items.STICK),
+				new ItemStack(net.minecraft.world.item.Items.REDSTONE),
+				new ItemStack(net.minecraft.world.item.Items.ARROW),
+				new ItemStack(net.minecraft.world.item.Items.COAL));
 			case "animated-block" -> GraphicsAuditAnimatedItemFixture.items();
-			case "standard-3d" -> List.of(
+			case "standard-3d", "standard-3d-logs" -> List.of(
 				new ItemStack(Blocks.STONE),
 				new ItemStack(Blocks.GRASS_BLOCK),
 				new ItemStack(Blocks.REDSTONE_ORE),
@@ -6151,12 +6260,19 @@ public final class DeterministicCameraCapture {
 				new ItemStack(Blocks.OAK_TRAPDOOR),
 				new ItemStack(Blocks.WHITE_WOOL),
 				new ItemStack(Blocks.CRAFTING_TABLE),
-				new ItemStack(Blocks.DIRT)
+				new ItemStack(HOTBAR_ITEM_FIXTURE.equals("standard-3d-logs") ? Blocks.OAK_LOG : Blocks.DIRT)
 			);
 			default -> throw new IllegalStateException("unknown deterministic hotbar fixture: " + HOTBAR_ITEM_FIXTURE);
 		};
 		for (int slot = 0; slot < items.size(); slot++) {
+			if (slot > 0 && Boolean.getBoolean("mattmc.dev.graphicsAuditGuiItemFoilBlend")) {
+				items.get(slot).set(net.minecraft.core.component.DataComponents.ENCHANTMENT_GLINT_OVERRIDE, true);
+			}
 			player.getInventory().setItem(slot, items.get(slot));
+		}
+		if (Boolean.getBoolean("mattmc.dev.graphicsAuditGuiItemFoilBlend")) {
+			Minecraft.getInstance().options.glintSpeed().set(GraphicsAuditGuiFoilTiming.movingRequested() ? 0.5 : 0.0);
+			Minecraft.getInstance().options.glintStrength().set(0.5);
 		}
 	}
 
@@ -6887,6 +7003,10 @@ public final class DeterministicCameraCapture {
 	}
 
 	private static void setupBlockDisplayAndWorldTextScenarios(Minecraft minecraft, LocalPlayer player) {
+		if (!GraphicsAuditBlockDisplayFixture.requested()) GraphicsAuditLavaFixture.install(minecraft);
+		if (GraphicsAuditFlowingWaterFixture.requested() && !GraphicsAuditBlockDisplayFixture.requested()) {
+			GraphicsAuditFlowingWaterFixture.install(minecraft);
+		}
 		if (GraphicsAuditBlockDisplayFixture.requested()) {
 			GraphicsAuditBlockDisplayFixture.install(minecraft);
 			return;
@@ -8824,6 +8944,16 @@ public final class DeterministicCameraCapture {
 		json.append("{\n");
 		appendField(json, "status", status).append(",\n");
 		appendField(json, "backend", activeBackend()).append(",\n");
+		json.append("  \"worldWindowResize\": ").append(GraphicsAuditWorldResize.worldReceipt()).append(",\n");
+		json.append("  \"worldGuiScale\": ").append(GraphicsAuditWorldGuiScale.worldReceipt()).append(",\n");
+		json.append("  \"worldResourceReload\": ").append(GraphicsAuditResourceReload.worldReceipt()).append(",\n");
+		json.append("  \"flowingWaterFixture\": ").append(GraphicsAuditFlowingWaterFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"lavaFixture\": ").append(GraphicsAuditLavaFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"lavaSurfaceAtCapture\": ").append(GraphicsAuditLavaFixture.capturedSurface()).append(",\n");
+		json.append("  \"lavaParticleOcclusionAtCapture\": ").append(GraphicsAuditLavaFixture.capturedParticles()).append(",\n");
+		json.append("  \"flowingWaterSurfaceAtCapture\": ").append(GraphicsAuditFlowingWaterFixture.capturedSurface()).append(",\n");
+		json.append("  \"mixedFluidBottomSurfaceAtCapture\": ").append(GraphicsAuditMixedFluidFixture.capturedBottomSurface()).append(",\n");
+		json.append("  \"postEffectFixture\": ").append(GraphicsAuditPostEffectFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"worldMenuFixture\": ").append(GraphicsAuditWorldMenuFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"animatedItemFixture\": ").append("animated-block".equals(HOTBAR_ITEM_FIXTURE)
 			? GraphicsAuditAnimatedItemFixture.receipt(minecraft) : "null").append(",\n");
@@ -8868,6 +8998,7 @@ public final class DeterministicCameraCapture {
 		appendField(json, "blockDisplayScenario", BLOCK_DISPLAY_SCENARIO).append(",\n");
 		json.append("  \"blockDisplayFixture\": ").append(GraphicsAuditBlockDisplayFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"terrainParticleFixture\": ").append(net.minecraft.client.particle.GraphicsAuditTerrainParticleFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"atlasParticleFixture\": ").append(net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"blockDisplayAnimationObservation\": ").append(GraphicsAuditBlockDisplayFixture.animationObservation(minecraft)).append(",\n");
 		json.append("  \"blockDisplayAnimationAtCapture\": ").append(blockAnimationAtCapture).append(",\n");
 		appendWorldTextDiagnostics(json).append(",\n");
@@ -9053,6 +9184,12 @@ public final class DeterministicCameraCapture {
 			appendField(json, "bossBarOverlay", FORCED_BOSS_BAR_OVERLAY).append(",\n");
 			json.append("  \"selectedHotbarSlot\": ").append(player == null ? -1 : currentSelectedHotbarSlot(player)).append(",\n");
 			appendField(json, "hotbarItemFixture", HOTBAR_ITEM_FIXTURE).append(",\n");
+			json.append("  \"guiItemFoilSources\": ");
+			GraphicsAuditGuiFoilSource.appendJson(json);
+			json.append(",\n");
+			json.append("  \"guiItemFoilCount\": ").append(player == null ? 0 : java.util.stream.IntStream.range(1,9).filter(slot -> player.getInventory().getItem(slot).hasFoil()).count()).append(",\n");
+			json.append("  \"guiItemGlintSpeed\": ").append(Minecraft.getInstance().options.glintSpeed().get()).append(",\n");
+			json.append("  \"guiItemGlintStrength\": ").append(Minecraft.getInstance().options.glintStrength().get()).append(",\n");
 		json.append("  \"experienceProgress\": ").append(player == null ? -1.0F : player.experienceProgress).append(",\n");
 		json.append("  \"experienceLevel\": ").append(player == null ? -1 : player.experienceLevel).append(",\n");
 		json.append("  \"framesPerPose\": ").append(FRAMES_PER_POSE).append(",\n");

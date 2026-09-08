@@ -39,6 +39,7 @@ public final class RustGalFrameCoordinator {
 	private static final int MAX_RUST_GUI_MESH_INDICES = 196_608;
 	private static final Logger LOGGER = LogUtils.getLogger();
 	private static final Object LOCK = new Object();
+	private static final GuiAtlasReferencePublication GUI_ATLAS_REFERENCES = new GuiAtlasReferencePublication();
 	private static VulkanicGalBridge bridge;
 	/**
 	 * The bridge owns a native graphics context for its entire lifetime.  These
@@ -328,9 +329,16 @@ public final class RustGalFrameCoordinator {
 	 */
 	static void invalidateGuiRawImages() {
 		synchronized (LOCK) {
+			GUI_ATLAS_REFERENCES.invalidate();
 			pendingRawImages.clear();
 			rawImageGeneration++;
 			attemptedRawImageGeneration = Math.min(attemptedRawImageGeneration, uploadedRawImageGeneration);
+		}
+	}
+
+	static void stageGuiAtlasReference(GuiAtlasRegion reference) {
+		synchronized (LOCK) {
+			GUI_ATLAS_REFERENCES.stage(reference);
 		}
 	}
 
@@ -365,7 +373,7 @@ public final class RustGalFrameCoordinator {
 			flushPendingGuiAssetsLocked();
 			List<RustGalFrameScheduler.Token> tokens = elements.stream().map(RustGalGuiElementRenderState::token).toList();
 			List<RustGalFrameScheduler.Item<QueuedGuiRequest>> requests = SCHEDULER.takeAllItems(tokens, generation);
-			executeFrameBatches(window, requests, false, window.getGuiScaledWidth(), window.getGuiScaledHeight(), -1, -1, null);
+			executeFrameBatches(window, requests, false, window.getGuiScaledWidth(), window.getGuiScaledHeight(), -1, -1, null, null);
 		}
 	}
 
@@ -479,6 +487,11 @@ public final class RustGalFrameCoordinator {
 
 	/** Semantic post-effect identity copied from the active GameRenderer state. */
 	public static void executeWholeFrameVulkan(Minecraft minecraft, GuiRenderState renderState, String postEffectId) {
+		executeWholeFrameVulkan(minecraft, renderState, postEffectId, null);
+	}
+
+	public static void executeWholeFrameVulkan(Minecraft minecraft, GuiRenderState renderState,
+		String postEffectId, VulkanicGalBridge.EngineGlobalsRecord engineGlobals) {
 		if (!RustGalGuiRenderer.isWholeFrameVulkanActive()) {
 			throw new IllegalStateException("Rust Vulkan whole-frame shell requires "
 				+ "an admitted Vulkan backend selection (or "
@@ -570,7 +583,7 @@ public final class RustGalFrameCoordinator {
 		}
 		// Native Vulkan execution must not monopolize the semantic producer lock.
 		executeFrameBatches(window, requests, true, window.getGuiScaledWidth(), window.getGuiScaledHeight(), renderState.blurBeforeStratumIndex(), blurRadius,
-			normalizeSemanticPostEffectId(postEffectId));
+			normalizeSemanticPostEffectId(postEffectId), engineGlobals);
 		// The Java GUI renderer normally resets this state after its draw pass.  The
 		// whole-frame route replaces that pass, so it must retire the copied semantic
 		// state here or every screen frame would accumulate prior elements forever.
@@ -681,6 +694,7 @@ public final class RustGalFrameCoordinator {
 			retireOutstanding(true);
 			auditMessage(metricsAuditLine(0L, METRICS.frames, lastSubmitted, RustGalGuiRenderer.isWholeFrameVulkanEnabled()));
 			bridge = null;
+			GUI_ATLAS_REFERENCES.resetAcceptance();
 			bridgeMode = BridgeMode.NONE;
 			RustGalVulkanWholeFrameMode.deactivateRustPresentation();
 			renderThread = null;
@@ -792,7 +806,8 @@ public final class RustGalFrameCoordinator {
 		int guiHeight,
 		int guiBlurBeforeStratum,
 		int guiBlurRadius,
-		String postEffectId
+		String postEffectId,
+		VulkanicGalBridge.EngineGlobalsRecord engineGlobals
 	) {
 		if (requests.isEmpty() && !allowEmpty) {
 			return;
@@ -968,6 +983,11 @@ public final class RustGalFrameCoordinator {
 			}
 			VulkanicGalBridge.WholeFrameSubmitResult wholeFrameResult = null;
 			VulkanicGalBridge.GuiFrameSubmitResult guiResult = null;
+			// All world uploads have completed before immutable GUI declarations
+			// are accepted. Rejection propagates; never render copied fallback pixels.
+			GUI_ATLAS_REFERENCES.retainUsedCommands(affineQuadRequests, tiledQuadRequests, meshBatchRequests);
+			GUI_ATLAS_REFERENCES.flush(RustGalWorldPrimitiveRenderer::requireAcceptedWorldMeshTextureGeneration,
+				bridge::updateGuiAtlasReferences);
 			if (wholeFrameVulkan) {
 				if (primitiveFrame == null) {
 					GraphicsFrameBenchmark.beginPhase("rust-gal.frame.consume-world-frame");
@@ -986,6 +1006,7 @@ public final class RustGalFrameCoordinator {
 				// Rust frame contains the corresponding owned work; this keeps the
 				// comparator honest without pretending that Sodium or DH Java renderers
 				// ran on the Rust route.
+				RustGalWorldPrimitiveRenderer.requireAcceptedParticleTextures(primitiveFrame.materialQuads());
 				wholeFrameResult = bridge.submitWholeFrameWithAffineGuiAndWorldTextAndFirstPerson(
 					generation,
 					frameId,
@@ -1018,7 +1039,8 @@ public final class RustGalFrameCoordinator {
 					guiBlurRadius,
 					postEffectId,
 					guiProjection,
-					tiledQuadRequests
+					tiledQuadRequests,
+					engineGlobals
 				);
 				if (Boolean.getBoolean("mattmc.dev.graphicsAuditSliceMetrics")) {
 					auditMessage("Rust GUI whole-frame result mesh items=" + wholeFrameResult.guiMeshItemCount()
@@ -1207,6 +1229,13 @@ public final class RustGalFrameCoordinator {
 			presentStarted = System.nanoTime();
 			recordFixedOperation(Operation.FRAME_PRESENT, VulkanicGalBridge.Struct.FRAME_PRESENT.byteSize());
 			VulkanicGalBridge.PresentedFrame presented = bridge.presentFrame(frameId, correlationId, submissionId);
+			// Publish this successful submission's semantic execution evidence
+			// before a final-output capture can acknowledge its presented image.
+			if (wholeFrameResult != null) {
+				RustGalTerrainRenderer.recordExecutedStaticTerrainInstances(
+					primitiveFrame.meshInstances(), frameId, submissionId
+				);
+			}
 				if (wholeFrameVulkan) {
 					auditMessage("gal.frame.present backend=vulkan correlation=" + correlationId
 						+ " frame=" + presented.frameId()
@@ -1259,11 +1288,6 @@ public final class RustGalFrameCoordinator {
 			METRICS.batchesExecuted += requests.size();
 			if (wholeFrameResult != null) {
 				GraphicsFrameBenchmark.beginPhase("rust-gal.frame.post-submit-metrics");
-				RustGalTerrainRenderer.recordExecutedStaticTerrainInstances(
-					primitiveFrame.meshInstances(),
-					frameId,
-					submissionId
-				);
 				recordWholeFrameMetrics(wholeFrameResult);
 				GraphicsFrameBenchmark.recordRustWholeFrameTimeline(
 					correlationId,
@@ -2152,8 +2176,10 @@ public final class RustGalFrameCoordinator {
 			// or publish an old cached payload while the new incarnation is absent.
 			var atlas = Minecraft.getInstance().getAtlasManager().getAtlasOrThrow(
 				net.minecraft.data.AtlasIds.BLOCKS);
-			if (atlas.semanticAnimationResource() == null) return;
-			net.vulkanic.world.RustGalTerrainRenderer.ensureTerrainAtlasAssetForWorldMesh();
+			if (atlas.semanticAnimationResource() != null) {
+				net.vulkanic.world.RustGalTerrainRenderer.ensureTerrainAtlasAssetForWorldMesh();
+			}
+			RustGalWorldPrimitiveRenderer.ensureParticleAtlasAnimationAsset();
 			var status = RustGalWorldPrimitiveRenderer.flushPendingWorldMeshAssets(bridge);
 			if (status != null) recordStatus(Operation.WORLD_MESH_ASSET_UPDATE, status);
 			RustGalWorldPrimitiveRenderer.flushPendingAtlasAnimationTicks(bridge);

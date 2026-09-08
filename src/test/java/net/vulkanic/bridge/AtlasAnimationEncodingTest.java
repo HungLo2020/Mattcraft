@@ -49,7 +49,7 @@ class AtlasAnimationEncodingTest {
             assertTrue(javax.imageio.ImageIO.write(image, "PNG", png));
             int atlas = 0x54a17a1a;
             Status before = bridge.updateWorldMeshAssets(1, List.of(),
-                List.of(new WorldMeshTextureAssetRecord(atlas, png.toByteArray())), List.of());
+                List.of(new WorldMeshTextureAssetRecord(atlas, png.toByteArray(), List.of())), List.of());
             assertThrows(IllegalStateException.class, () -> bridge.stageAtlasAnimationAssets(atlas, 77, 40, snapshot));
             Status staged = bridge.stageAtlasAnimationAssets(atlas, 1, 40, snapshot);
             assertEquals(before.submissionId(), staged.submissionId());
@@ -71,14 +71,14 @@ class AtlasAnimationEncodingTest {
     }
 
     @Test
-    void stagesThroughRealRustVulkanContextWithoutSubmittingGpuWork() throws Exception {
-        int terrainAtlas = 0x54a17a1a;
+    void stagesAnExplicitNonTerrainAtlasThroughRealRustVulkanContextWithoutSubmittingGpuWork() throws Exception {
+        int terrainAtlas = 202; // Semantic test asset, deliberately not the terrain-atlas identity.
         var image = new java.awt.image.BufferedImage(2, 1, java.awt.image.BufferedImage.TYPE_INT_ARGB);
         image.setRGB(0, 0, 0xff123456);
         image.setRGB(1, 0, 0xffabcdef);
         var png = new java.io.ByteArrayOutputStream();
         assertTrue(javax.imageio.ImageIO.write(image, "PNG", png));
-        var texture = new WorldMeshTextureAssetRecord(terrainAtlas, png.toByteArray());
+        var texture = new WorldMeshTextureAssetRecord(terrainAtlas, png.toByteArray(), List.of());
         var source = new AtlasAnimationSourceRecord(1, 0, 0, 1, 1, true, List.of(
             new WorldMeshAnimationFrameRecord(0, 2), new WorldMeshAnimationFrameRecord(1, 2)),
             List.of(new SpriteAnimationMipRecord(2, 1, new byte[]{10, 20, 30, 7, 110, 120, (byte)130, 99})));
@@ -109,7 +109,7 @@ class AtlasAnimationEncodingTest {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment request = VulkanicGalBridge.encodeAtlasAnimationUpdate(arena, 17, 23, 41, List.of(source));
             assertEquals(48, request.byteSize());
-            assertEquals(30, request.get(ValueLayout.JAVA_INT, 0));
+            assertEquals(42, request.get(ValueLayout.JAVA_INT, 0));
             assertEquals(48, request.get(ValueLayout.JAVA_INT, 4));
             assertEquals(17, request.get(ValueLayout.JAVA_INT, 8));
             assertEquals(0, request.get(ValueLayout.JAVA_INT, 12));

@@ -16,8 +16,20 @@ use crate::render::vulkanic::world_primitive_frontend::{
     WORLD_MATERIAL_SOURCE_UNSPECIFIED, WORLD_MATERIAL_SOURCE_UV_LOCAL_TEXTURE,
     WORLD_MATERIAL_SOURCE_UV_MINECRAFT_BLOCK_ATLAS, WORLD_MATERIAL_SOURCE_WEATHER,
     WORLD_MESH_INSTANCE_FLAG_OUTLINE_ONLY,
+    WORLD_MESH_INSTANCE_FLAG_CAMERA_SORTED_QUADS,
+    WORLD_MESH_SECTION_ALL,
 };
 use std::collections::BTreeSet;
+
+fn decode_world_item_foil(instance: &FfiWorldMeshInstanceRecord) -> GalResult<Option<super::super::item_foil::StandardItemFoil>> {
+    let foil = super::super::item_foil::StandardItemFoil::decode(instance.item_foil_mode,
+        instance.item_foil_clock_millis, instance.item_foil_speed, instance.item_foil_strength)?;
+    if foil.is_some() && (instance.stratum != WORLD_STRATUM_ENTITY_MESH
+        || instance.terrain_placement_mode != 0 || instance.flags != 0 || instance.block_entity_id != -1) {
+        return Err(GalError::invalid_argument("standard foil requires an ordinary entity mesh instance"));
+    }
+    Ok(foil)
+}
 
 fn is_world_mesh_stratum(stratum: u32) -> bool {
     matches!(
@@ -45,17 +57,26 @@ fn validate_mesh_instance_semantic_identity(
     instance: &FfiWorldMeshInstanceRecord,
     label: &str,
 ) -> GalResult<()> {
+    decode_mesh_instance_transform(instance)?;
     if instance.mesh_key == 0 || instance.mesh_generation == 0 {
         return Err(GalError::ffi(
             StatusCode::InvalidArgument,
             format!("{label} key and generation must be non-zero"),
         ));
     }
-    if instance.flags & !WORLD_MESH_INSTANCE_FLAG_OUTLINE_ONLY != 0 {
+    if instance.flags & !(WORLD_MESH_INSTANCE_FLAG_OUTLINE_ONLY | WORLD_MESH_INSTANCE_FLAG_CAMERA_SORTED_QUADS) != 0 {
         return Err(GalError::ffi(
             StatusCode::InvalidArgument,
             format!("{label} contains unknown semantic flags"),
         ));
+    }
+    if instance.flags & WORLD_MESH_INSTANCE_FLAG_CAMERA_SORTED_QUADS != 0
+        && (instance.stratum != WORLD_STRATUM_TERRAIN
+            || instance.mesh_section_index != WORLD_MESH_SECTION_ALL
+            || !matches!(instance.depth_policy, WORLD_DEPTH_POLICY_TEST_WRITE | WORLD_DEPTH_POLICY_TEST_NO_WRITE))
+    {
+        return Err(GalError::ffi(StatusCode::InvalidArgument,
+            format!("{label} camera-sorted quads require complete translucent terrain")));
     }
     if instance.flags & WORLD_MESH_INSTANCE_FLAG_OUTLINE_ONLY != 0
         && (instance.stratum != WORLD_STRATUM_ENTITY_MESH || instance.outline_color_argb == 0)
@@ -72,6 +93,20 @@ fn validate_mesh_instance_semantic_identity(
         ));
     }
     Ok(())
+}
+
+fn decode_mesh_instance_transform(instance: &FfiWorldMeshInstanceRecord) -> GalResult<[f32;16]> {
+    match instance.terrain_placement_mode {
+        0 if instance.terrain_origin == [0;3] && instance.terrain_camera == [0.0;3] => Ok(instance.transform),
+        1 if instance.stratum == WORLD_STRATUM_TERRAIN && instance.mesh_section_index == WORLD_MESH_SECTION_ALL
+            && instance.entity_id == 0 && instance.block_entity_id == -1
+            && instance.transform == [1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0] => {
+            crate::render::vulkanic::terrain::placement::TerrainSectionPlacement {
+                origin:instance.terrain_origin, camera:instance.terrain_camera,
+            }.lower()
+        }
+        _ => Err(GalError::invalid_argument("incoherent semantic terrain placement")),
+    }
 }
 
 pub(crate) unsafe fn decode_world_text_image_update(
@@ -1509,6 +1544,7 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
         let viewport_height =
             decode_world_viewport_axis(instance.viewport_height, "world mesh viewport height")?;
         mesh_instances.push(WorldMeshInstanceRequest {
+            item_foil: decode_world_item_foil(instance)?,
             stratum: instance.stratum,
             mesh_key: instance.mesh_key,
             mesh_generation: instance.mesh_generation,
@@ -1519,7 +1555,7 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
             color_argb: instance.color_argb,
             entity_id: instance.entity_id,
             entity_color_argb: instance.entity_color_argb,
-            transform: instance.transform,
+            transform: decode_mesh_instance_transform(instance)?,
             outline_color_argb: instance.outline_color_argb,
             flags: instance.flags,
             block_entity_id: instance.block_entity_id,
@@ -1691,6 +1727,22 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
         request.generation,
         frame_target,
         WorldPrimitiveFrame {
+            engine_globals: match request.engine_globals_present {
+                0 => None,
+                1 => {
+                    let values = crate::render::vulkanic::shader_pack::engine_globals::EngineGlobals {
+                        screen_width: request.engine_screen_width,
+                        screen_height: request.engine_screen_height,
+                        game_ticks: request.engine_game_ticks,
+                        partial_tick: request.engine_partial_tick,
+                        glint_alpha: request.engine_glint_alpha,
+                        menu_blur_radius: request.engine_menu_blur_radius,
+                    };
+                    values.uniforms()?;
+                    Some(values)
+                }
+                _ => return Err(GalError::invalid_argument("engine Globals presence must be zero or one")),
+            },
             frame_id: request.frame_id,
             correlation_id: request.correlation_id,
             viewport_width,
@@ -1767,6 +1819,11 @@ unsafe fn decode_world_first_person_mesh_instances(
             "world first-person mesh instance",
         )?;
         validate_mesh_instance_semantic_identity(instance, "world first-person mesh instance")?;
+        if instance.terrain_placement_mode != 0 {
+            return Err(GalError::invalid_argument(
+                "first-person mesh instances cannot use terrain placement",
+            ));
+        }
         if instance.flags & WORLD_MESH_INSTANCE_FLAG_OUTLINE_ONLY != 0 {
             return Err(GalError::ffi(
                 StatusCode::InvalidArgument,
@@ -1833,6 +1890,7 @@ unsafe fn decode_world_first_person_mesh_instances(
             "world first-person mesh viewport height",
         )?;
         instances.push(WorldMeshInstanceRequest {
+            item_foil: decode_world_item_foil(instance)?,
             stratum: instance.stratum,
             mesh_key: instance.mesh_key,
             mesh_generation: instance.mesh_generation,
@@ -2684,12 +2742,31 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_whole_frame_submit(
                     gui_tiled_quads,
                 )| {
                     let world_frame_id = world_frame.frame_id;
+                    let item_layer_count = gui_affine_quads.iter().map(|quad|quad.item_raster_layers.len()).sum::<usize>();
+                    context.ffi_input_bytes = context.ffi_input_bytes.saturating_add(
+                        item_layer_count as u64 * size_of::<FfiGuiItemRasterLayer>() as u64);
+                    if item_layer_count != 0 {
+                        whole_frame_trace(&format!("whole-frame.gui-item-layers groups={} layers={}",
+                            gui_affine_quads.iter().filter(|quad|!quad.item_raster_layers.is_empty()).count(),item_layer_count));
+                        if std::env::var_os("MATTMC_TRACE_WHOLE_FRAME").is_some() {
+                            let matrices=gui_affine_quads.iter().flat_map(|quad| &quad.item_raster_layers)
+                                .map(|layer| layer.model_transform);
+                            let mut distinct=BTreeSet::new();
+                            let mut nonidentity=0;
+                            for matrix in matrices {
+                                nonidentity+=usize::from(matrix!=Default::default());
+                                distinct.insert(matrix.0.map(|v| if v==0.0 {0} else {v.to_bits()}));
+                            }
+                            whole_frame_trace(&format!("whole-frame.gui-item-transforms layers={} nonidentity={} distinct={}",
+                                item_layer_count,nonidentity,distinct.len()));
+                        }
+                    }
                     let ffi_decode_nanos =
                         crate::render::vulkanic::metrics::elapsed_nanos_u64(decode_started);
                     let gui_started = std::time::Instant::now();
                     context
                         .world_primitive_frontend
-                        .validate_post_effect_request(&post_effect_id)?;
+                        .validate_post_effect_request_with_globals(&post_effect_id, world_frame.engine_globals)?;
                     whole_frame_trace(&format!(
                         "whole-frame.frontend.begin generation={} frame={} decode_nanos={}",
                         generation, world_frame_id, ffi_decode_nanos

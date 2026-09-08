@@ -1236,7 +1236,7 @@ mod tests {
                 buffer_name(gl.get_parameter_i32(glow::ELEMENT_ARRAY_BUFFER_BINDING)),
                 "borrowed OpenGL guard must restore VAO-scoped index buffer"
             );
-            assert_f32_eq(0.125, gl.get_parameter_f32(glow::BLEND_COLOR));
+            // GL_BLEND_COLOR writes four floats; a scalar query corrupts the stack.
             let blend_color = parameter_f32x4(&gl, glow::BLEND_COLOR);
             assert_f32_eq(0.125, blend_color[0]);
             assert_f32_eq(0.25, blend_color[1]);

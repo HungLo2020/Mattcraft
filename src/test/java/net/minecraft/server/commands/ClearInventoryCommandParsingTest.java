@@ -2,7 +2,6 @@ package net.minecraft.server.commands;
 
 import com.mojang.brigadier.StringReader;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.arguments.item.ItemPredicateArgument;
@@ -19,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class ClearInventoryCommandParsingTest {
     @BeforeAll
     static void bootstrapMinecraft() {
-        SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+        SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 

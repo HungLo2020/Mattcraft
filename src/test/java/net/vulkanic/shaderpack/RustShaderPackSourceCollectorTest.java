@@ -28,6 +28,10 @@ class RustShaderPackSourceCollectorTest {
 		assertTrue(RustShaderPackSourceCollector.configuredPackNameFromProperties(config).isEmpty());
 		Files.writeString(config, "enableShaders=false\n");
 		assertTrue(RustShaderPackSourceCollector.configuredPackNameFromProperties(config).isEmpty());
+		Files.writeString(config, "enableShaders=false\nshaderPack=ComplementaryHungLoIfied.zip\n");
+		assertTrue(RustShaderPackSourceCollector.configuredPackNameFromProperties(config).isEmpty());
+		Files.writeString(config, "enableShaders=true\nshaderPack=ComplementaryHungLoIfied.zip\n");
+		assertEquals("ComplementaryHungLoIfied.zip", RustShaderPackSourceCollector.configuredPackNameFromProperties(config).orElseThrow());
 	}
 
 	@Test
@@ -257,6 +261,12 @@ class RustShaderPackSourceCollectorTest {
 
 	@Test
 	void resourceManagerShaderPathsNormalizeToRustSnapshotRoot() {
+		assertEquals("assets/minecraft/shaders/post/probe.fsh",
+			RustShaderPackSourceCollector.vanillaShaderSourcePath(net.minecraft.resources.ResourceLocation.parse("minecraft:shaders/post/probe.fsh")));
+		assertEquals("assets/example/shaders/post/probe.fsh",
+			RustShaderPackSourceCollector.vanillaShaderSourcePath(net.minecraft.resources.ResourceLocation.parse("example:shaders/post/probe.fsh")));
+		assertThrows(IllegalArgumentException.class, () -> RustShaderPackSourceCollector.vanillaShaderSourcePath(
+			net.minecraft.resources.ResourceLocation.parse("example:post/probe.fsh")));
 		assertEquals("program/custom.fsh",
 			RustShaderPackSourceCollector.normalizeShaderSourcePath("shaders/program/custom.fsh"));
 		assertEquals("program/custom.fsh",

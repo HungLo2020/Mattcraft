@@ -2548,6 +2548,116 @@ fn buffer_texture_copy_commands_validate_usage_ranges_and_hazards() {
 }
 
 #[test]
+fn texture_row_reversal_is_capability_checked_and_retains_copy_validation() {
+    for supported in [false, true] {
+        let mut caps = vulkan_capabilities();
+        caps.features.texture_row_reversal = supported;
+        let mut gal = gal_with_capabilities(caps);
+        let source = gal.create_texture(texture("row-source", TextureFormat::Rgba8Unorm,
+            vec![TextureUsage::TransferSrc])).unwrap();
+        let destination = gal.create_texture(texture("row-destination", TextureFormat::Rgba8Unorm,
+            vec![TextureUsage::TransferDst])).unwrap();
+        let region = TextureImageCopyRegion {
+            row_order: TextureRowOrder::Reverse,
+            src_texture: source, src_mip: 0, src_layer: 0,
+            src_origin: TextureOrigin3d { x: 0, y: 0, z: 0 },
+            dst_texture: destination, dst_mip: 0, dst_layer: 0,
+            dst_origin: TextureOrigin3d { x: 0, y: 0, z: 0 },
+            extent: Extent3d { width: 2, height: 3, depth: 1 },
+        };
+        let list = |region| CommandListDesc { label: "reverse-rows".into(),
+            operations: vec![CommandOp::CopyTexture(region)] };
+        if supported {
+            gal.create_command_list(list(region.clone())).unwrap();
+            assert_code(gal.create_command_list(list(TextureImageCopyRegion {
+                dst_texture: source, ..region.clone()
+            })), StatusCode::InvalidArgument);
+            assert_code(gal.create_command_list(list(TextureImageCopyRegion {
+                dst_origin: TextureOrigin3d { x: 0, y: 127, z: 0 }, ..region
+            })), StatusCode::InvalidArgument);
+        } else {
+            assert_code(gal.create_command_list(list(region.clone())), StatusCode::UnsupportedFeature);
+            gal.create_command_list(list(TextureImageCopyRegion {
+                row_order: TextureRowOrder::Preserve, ..region
+            })).unwrap();
+        }
+    }
+}
+
+#[test]
+fn vulkan_texture_row_reversal_copies_exact_asymmetric_color_and_depth_rows() {
+    use super::backends::vulkan::VulkanBackend;
+    // This is deliberately a real device test: inability to create the backend
+    // must not be reported as a passing pixel comparison.
+    let backend = VulkanBackend::new("explicit row reversal conformance").unwrap();
+    let mut gal = VulkanicGal::new_with_backend(Box::new(backend), false);
+    for format in [TextureFormat::Rgba8Unorm, TextureFormat::Depth32Float] {
+        let extent = Extent3d { width: 2, height: 3, depth: 1 };
+        let pixels: Vec<u8> = if format == TextureFormat::Depth32Float {
+            [0.125f32, 0.25, 0.375, 0.5, 0.625, 0.875].into_iter()
+                .flat_map(f32::to_le_bytes).collect()
+        } else { (1u8..=24).collect() };
+        let source = gal.create_texture(TextureDesc {
+            label: "row-source".into(), dimension: TextureDimension::D2, format, extent,
+            mip_levels: 1, array_layers: 1,
+            usages: vec![TextureUsage::TransferDst, TextureUsage::TransferSrc],
+        }).unwrap();
+        let destination = gal.create_texture(TextureDesc {
+            label: "row-destination".into(), dimension: TextureDimension::D2, format, extent,
+            mip_levels: 1, array_layers: 1,
+            usages: vec![TextureUsage::TransferDst, TextureUsage::TransferSrc],
+        }).unwrap();
+        let upload = gal.create_buffer(BufferDesc {
+            label: "row-upload".into(), size: 24, memory: MemoryDomain::Upload,
+            usages: vec![BufferUsage::HostWrite, BufferUsage::TransferSrc],
+        }).unwrap();
+        let readback = gal.create_buffer(BufferDesc {
+            label: "row-readback".into(), size: 24, memory: MemoryDomain::Readback,
+            usages: vec![BufferUsage::TransferDst, BufferUsage::HostRead],
+        }).unwrap();
+        let barrier = |resource, before, after| CommandOp::Barrier(ResourceBarrier {
+            resource, subresources: None, before, after,
+            src_queue: QueueClass::Graphics, dst_queue: QueueClass::Graphics,
+        });
+        let copy = |buffer, texture| BufferImageCopyRegion {
+            buffer, buffer_offset: 0, bytes_per_row: 8, rows_per_image: 3, texture,
+            texture_mip: 0, texture_layer: 0,
+            texture_origin: TextureOrigin3d { x: 0, y: 0, z: 0 }, extent,
+        };
+        let list = gal.create_command_list(CommandListDesc {
+            label: "explicit-row-reversal".into(), operations: vec![
+                CommandOp::HostWriteBuffer { buffer: upload, offset: 0, data: pixels.clone() },
+                barrier(upload, TextureUsageState::TransferDst, TextureUsageState::TransferSrc),
+                barrier(source, TextureUsageState::Undefined, TextureUsageState::TransferDst),
+                CommandOp::CopyBufferToTexture(copy(upload, source)),
+                barrier(source, TextureUsageState::TransferDst, TextureUsageState::TransferSrc),
+                barrier(destination, TextureUsageState::Undefined, TextureUsageState::TransferDst),
+                CommandOp::CopyTexture(TextureImageCopyRegion {
+                    row_order: TextureRowOrder::Reverse,
+                    src_texture: source, src_mip: 0, src_layer: 0,
+                    src_origin: TextureOrigin3d { x: 0, y: 0, z: 0 },
+                    dst_texture: destination, dst_mip: 0, dst_layer: 0,
+                    dst_origin: TextureOrigin3d { x: 0, y: 0, z: 0 }, extent,
+                }),
+                barrier(destination, TextureUsageState::TransferDst, TextureUsageState::TransferSrc),
+                CommandOp::CopyTextureToBuffer(copy(readback, destination)),
+                barrier(readback, TextureUsageState::TransferDst, TextureUsageState::ShaderRead),
+                CommandOp::HostReadBuffer { buffer: readback, offset: 0, size: 24 },
+            ],
+        }).unwrap();
+        let token = gal.submit(SubmissionBatch {
+            label: "explicit-row-reversal".into(), command_lists: vec![list],
+        }).unwrap();
+        gal.retire_through_for_test(token.submission).unwrap();
+        let reads = gal.completed_host_reads();
+        let actual = &reads.iter().rev().find(|read| read.buffer == readback).unwrap().bytes;
+        let expected: Vec<u8> = pixels.chunks_exact(8).rev().flatten().copied().collect();
+        assert_eq!(&expected, actual, "row reversal must preserve exact texels for {format:?}");
+        for handle in [source, destination, upload, readback] { gal.destroy(handle).unwrap(); }
+    }
+}
+
+#[test]
 fn texture_copy_validates_depth_snapshot_regions_and_transfer_hazards() {
     let mut gal = gal();
     let source = gal
@@ -2565,6 +2675,7 @@ fn texture_copy_validates_depth_snapshot_regions_and_transfer_hazards() {
         ))
         .unwrap();
     let region = TextureImageCopyRegion {
+        row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
         src_texture: source,
         src_mip: 0,
         src_layer: 0,
@@ -4263,7 +4374,19 @@ fn frozen_ffi_abi_sizes_and_capability_negotiation_are_stable() {
     assert_eq!(FFI_ABI_V28_VERSION, 28);
     assert_eq!(FFI_ABI_V29_VERSION, 29);
     assert_eq!(FFI_ABI_V30_VERSION, 30);
-    assert_eq!(FFI_ABI_VERSION, FFI_ABI_V30_VERSION);
+    assert_eq!(FFI_ABI_V31_VERSION, 31);
+    assert_eq!(FFI_ABI_V32_VERSION, 32);
+    assert_eq!(FFI_ABI_V33_VERSION, 33);
+    assert_eq!(FFI_ABI_V34_VERSION, 34);
+    assert_eq!(FFI_ABI_V35_VERSION, 35);
+    assert_eq!(FFI_ABI_V36_VERSION, 36);
+    assert_eq!(FFI_ABI_V37_VERSION, 37);
+    assert_eq!(FFI_ABI_V38_VERSION, 38);
+    assert_eq!(FFI_ABI_V39_VERSION, 39);
+    assert_eq!(FFI_ABI_V40_VERSION, 40);
+    assert_eq!(FFI_ABI_V41_VERSION, 41);
+    assert_eq!(FFI_ABI_V42_VERSION, 42);
+    assert_eq!(FFI_ABI_VERSION, FFI_ABI_V42_VERSION);
     assert!(!FFI_INITIAL_PRESENTATION_SUPPORTED);
     assert_eq!(size_of::<FfiHeader>(), 8);
     assert_eq!(size_of::<FfiHandle>(), 8);

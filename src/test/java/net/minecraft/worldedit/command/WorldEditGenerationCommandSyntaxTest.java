@@ -1,6 +1,5 @@
 package net.minecraft.worldedit.command;
 
-import net.minecraft.DetectedVersion;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import org.junit.jupiter.api.BeforeAll;
@@ -18,7 +17,7 @@ class WorldEditGenerationCommandSyntaxTest {
 
     @BeforeAll
     static void bootstrapMinecraft() {
-        SharedConstants.setVersion(DetectedVersion.BUILT_IN);
+        SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 

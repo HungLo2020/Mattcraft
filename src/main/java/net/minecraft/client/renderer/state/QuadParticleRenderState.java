@@ -59,7 +59,7 @@ public class QuadParticleRenderState implements SubmitNodeCollector.ParticleGrou
 		if (rustWholeFrame && (layer == null || !Float.isFinite(f) || !Float.isFinite(g) || !Float.isFinite(h)
 			|| !Float.isFinite(i) || !Float.isFinite(j) || !Float.isFinite(k) || !Float.isFinite(l)
 			|| !Float.isFinite(m) || !Float.isFinite(n) || !Float.isFinite(o) || !Float.isFinite(p)
-			|| !Float.isFinite(q) || m <= 0.0F
+			|| !Float.isFinite(q)
 			|| !Float.isFinite(i * i + j * j + k * k + l * l)
 			|| i * i + j * j + k * k + l * l <= 1.0e-8F)) {
 			throw new IllegalArgumentException("Rust whole-frame particle admission requires finite copied quad semantics");
@@ -73,6 +73,7 @@ public class QuadParticleRenderState implements SubmitNodeCollector.ParticleGrou
 		((QuadParticleRenderState.Storage)this.particles.computeIfAbsent(layer, layerx -> new QuadParticleRenderState.Storage()))
 			.add(f, g, h, i, j, k, l, m, n, o, p, q, r, s);
 		this.particleCount++;
+		net.minecraft.client.dev.GraphicsAuditLavaFixture.observeParticle(f, g, h, i, j, k, l, m, r);
 	}
 
 	/** Copies the extracted particle semantics into the explicit Rust world stream. */
@@ -91,10 +92,8 @@ public class QuadParticleRenderState implements SubmitNodeCollector.ParticleGrou
 		}
 		Set<net.minecraft.resources.ResourceLocation> atlasIdentities = new HashSet<>();
 		for (SingleQuadParticle.Layer layer : this.particles.keySet()) {
-			if (!net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_PARTICLES.equals(layer.textureAtlasLocation())
-				&& !atlasIdentities.add(layer.textureAtlasLocation())) continue;
-			if (!net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_PARTICLES.equals(layer.textureAtlasLocation())
-				&& !RustGalWorldPrimitiveRenderer.ensureParticleAtlasAvailable(layer.textureAtlasLocation())) {
+			if (!atlasIdentities.add(layer.textureAtlasLocation())) continue;
+			if (!RustGalWorldPrimitiveRenderer.ensureParticleAtlasAvailable(layer.textureAtlasLocation())) {
 				RustGalWorldPrimitiveRenderer.recordUnsupportedParticleGroup();
 				throw new IllegalStateException("Rust whole-frame particle atlas preflight rejected " + layer.textureAtlasLocation());
 			}

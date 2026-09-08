@@ -14,6 +14,26 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GuiItemMeshSemanticCollectorTest {
 	@Test
+	void standardFoilCopiesOriginalUvsWithoutAClientOrTextureTransform() throws Exception {
+		float[] positions = {0,0,0, 1,0,0, 1,1,0, 0,1,0};
+		float[] atlas = {0.2F,0.3F, 0.4F,0.3F, 0.4F,0.8F, 0.2F,0.8F};
+		float[] local = {0,0, 1,0, 1,1, 0,1};
+		var source = new GuiItemMeshSemanticCollector.GuiItemMeshQuad(7,"test",positions,atlas,local,
+			new int[]{1,2,3,4},new int[]{5,6,7,8},2,true);
+		var copy = GuiItemMeshSemanticCollector.class.getDeclaredMethod("glintQuad",
+			GuiItemMeshSemanticCollector.GuiItemMeshQuad.class,long.class);
+		copy.setAccessible(true);
+		var foil = (GuiItemMeshSemanticCollector.GuiItemMeshQuad)copy.invoke(null,source,99L);
+		assertEquals(99L,foil.assetId());
+		assertArrayEquals(positions,foil.positions());
+		assertArrayEquals(atlas,foil.atlasUvs());
+		assertArrayEquals(local,foil.localUvs());
+		assertArrayEquals(new int[]{-1,-1,-1,-1},foil.colorsArgb());
+		atlas[0]=0.99F;
+		assertEquals(0.2F,foil.atlasUvs()[0]);
+	}
+
+	@Test
 	void semanticMaterialModesIncludeExplicitTranslucentItems() {
 		assertEquals(
 			List.of(

@@ -4189,6 +4189,37 @@ pub fn minimal_direct_terrain_translucent_program() -> TerrainMaterialProgram {
     minimal_direct_terrain_material_program(TerrainMaterialProgramKind::Translucent)
 }
 
+/// Blended model texture with the vanilla item/entity alpha-discard contract.
+/// This is not Sodium translucent terrain: model sampling uses implicit LOD,
+/// and alpha below 0.1 must discard before any depth/stencil write.
+pub fn minimal_direct_model_translucent_cutout_program() -> TerrainMaterialProgram {
+    let mut program = minimal_direct_terrain_translucent_program();
+    program.identity = ProgramIdentity::new("vulkanic:builtin/direct_model_translucent_cutout_v1");
+    program.vertex.label = "direct-model-translucent-cutout.vertex".to_string();
+    program.vertex.source = program.vertex.source.replacen(
+        "#version 450\n", "#version 450\n#define VULKANIC_MODEL_TRANSLUCENT_CUTOUT 1\n", 1);
+    program.fragment.label = "direct-model-translucent-cutout.fragment".to_string();
+    program.fragment.source = program.fragment.source.replacen(
+        "#version 450\n", "#version 450\n#define VULKANIC_MODEL_TRANSLUCENT_CUTOUT 1\n", 1);
+    program
+}
+
+/// Private standard model foil program. Requires an explicit per-instance
+/// foil buffer at set0/binding4 and original UVs. The explicit frontend owns
+/// transport, binding and lifetime validation. Never accepts decal foil.
+pub const STANDARD_ITEM_FOIL_PROGRAM_ID: &str = "vulkanic:builtin/direct_standard_item_foil_v1";
+
+pub fn minimal_direct_standard_item_foil_program() -> TerrainMaterialProgram {
+    let mut program = minimal_direct_terrain_cutout_program();
+    program.identity = ProgramIdentity::new(STANDARD_ITEM_FOIL_PROGRAM_ID);
+    program.vertex.label = "direct-standard-item-foil.vertex".to_string();
+    program.vertex.source = MINIMAL_TERRAIN_MATERIAL_VERTEX.replacen(
+        "#version 450\n", "#version 450\n#define VULKANIC_STANDARD_ITEM_FOIL 1\n", 1);
+    program.fragment.label = "direct-standard-item-foil.fragment".to_string();
+    program.fragment.source = STANDARD_ITEM_FOIL_FRAGMENT.to_string();
+    program
+}
+
 pub fn minimal_terrain_material_program(
     kind: TerrainMaterialProgramKind,
 ) -> TerrainMaterialProgram {
@@ -4536,6 +4567,15 @@ layout(location = 9) out vec2 v_fog_distances;
 layout(location = 10) flat out vec4 v_fog_color_and_environmental_start;
 layout(location = 11) flat out vec4 v_fog_ranges;
 layout(location = 12) flat out uint v_terrain_material_bits;
+#ifdef VULKANIC_STANDARD_ITEM_FOIL
+// Two affine rows (xy basis, z translation) and RGB strength. Padding is
+// explicit; no reuse of terrain animation fields or packed vertex alpha.
+struct ItemFoilInstance { vec4 uv_row0; vec4 uv_row1; vec4 parameters; };
+layout(set = 0, binding = 4, std430) readonly buffer ItemFoilInstances {
+    ItemFoilInstance foil_instances[];
+};
+layout(location = 13) flat out float v_foil_strength;
+#endif
 void main() {
     MeshVertex vertex = vertices[gl_VertexIndex];
     MeshInstance instance = instances[gl_InstanceIndex];
@@ -4556,13 +4596,23 @@ void main() {
     v_uv = (material_semantics & 1u) != 0u
         ? vertex.shader_data.xy
         : vec2(vertex.position_uv.w, vertex.color_uv.w);
-    // Frozen OpenGL Sodium encodes each 0..15 light level as `level * 16`
-    // and divides it by 256 in `chunk_vertex.glsl`. LightTexture is linear,
+    // Frozen OpenGL Sodium preserves UV2 byte coordinates (including smooth
+    // lighting's fractional levels) and divides by 256 in chunk_vertex.glsl.
+    // The copied vertex lane is byte/240; rescale without nibble truncation.
+    // LightTexture is linear,
     // so this deliberately samples at `level / 16`, including the boundary
     // interpolation between neighbouring lightmap texels. Do not replace it
     // with texel-centre coordinates: that is a different lighting contract.
     // The resulting lit vertex color is then interpolated across the triangle.
-    vec2 light_uv = clamp(vertex.extra_data.xy, vec2(0.0), vec2(1.0)) * (15.0 / 16.0);
+#ifdef VULKANIC_STANDARD_ITEM_FOIL
+    ItemFoilInstance foil = foil_instances[gl_InstanceIndex];
+    vec3 original_uv = vec3(vertex.position_uv.w, vertex.color_uv.w, 1.0);
+    v_uv = vec2(dot(foil.uv_row0.xyz, original_uv), dot(foil.uv_row1.xyz, original_uv));
+    v_foil_strength = foil.parameters.x;
+    // Frozen glint consumes ColorModulator, not baked tint or lightmap.
+    v_color = instance.color;
+#else
+    vec2 light_uv = clamp(vertex.extra_data.xy, vec2(0.0), vec2(255.0 / 240.0)) * (15.0 / 16.0);
     // Frozen's standalone baked blocks use core/terrain.vsh, not Sodium's
     // chunk shader. Its half-texel offset samples the lightmap texel centres.
     if ((material_semantics & 8u) != 0u) {
@@ -4582,7 +4632,18 @@ void main() {
         const vec3 LIGHT0_DIRECTION = normalize(vec3(0.2, 1.0, -0.7));
         const vec3 LIGHT1_DIRECTION = normalize(vec3(-0.2, 1.0, 0.7));
         const vec3 NETHER_LIGHT1_DIRECTION = normalize(vec3(-0.2, -1.0, 0.7));
-        vec3 normal = normalize(vec3(vertex.normal_light.yz, vertex.extra_data.z));
+        // Mesh normals are model-local, just like positions. Frozen's baked
+        // encoder transforms them by the pose normal matrix before lighting;
+        // the separate frame view matrix is not part of that pose operation.
+        vec3 normal = normalize(transpose(inverse(mat3(instance.model)))
+            * vec3(vertex.normal_light.yz, vertex.extra_data.z));
+#ifdef VULKANIC_MODEL_TRANSLUCENT_CUTOUT
+        // Frozen BakedModelEncoder transforms then NormI8.pack truncates
+        // each component toward zero before the vertex attribute is read.
+        // Preserve that quantization in Rust's shader, not in Java extraction.
+        // Do not normalize again: the packed vector is not exactly unit length.
+        normal = trunc(clamp(normal, vec3(-1.0), vec3(1.0)) * 127.0) / 127.0;
+#endif
         vec2 light = max(vec2(0.0), vec2(
             dot(LIGHT0_DIRECTION, normal),
             dot((material_semantics & 4u) != 0u ? NETHER_LIGHT1_DIRECTION : LIGHT1_DIRECTION, normal)
@@ -4590,6 +4651,7 @@ void main() {
         float diffuse = min(1.0, (light.x + light.y) * 0.6 + 0.4);
         v_color.rgb *= diffuse;
     }
+#endif
     v_material = instance.material;
     v_animation_region = instance.animation_region;
     v_animation_next_region = instance.animation_next_region;
@@ -5239,6 +5301,37 @@ void main() {
 }
 "#;
 
+const STANDARD_ITEM_FOIL_FRAGMENT: &str = r#"#version 450
+layout(set = 0, binding = 2) uniform texture2D Tex0;
+layout(set = 0, binding = 3) uniform sampler Samp0;
+layout(location = 0) in vec2 v_uv;
+layout(location = 1) in vec4 v_color;
+layout(location = 9) in vec2 v_fog_distances;
+layout(location = 10) flat in vec4 v_fog_color_and_environmental_start;
+layout(location = 11) flat in vec4 v_fog_ranges;
+layout(location = 13) flat in float v_foil_strength;
+layout(location = 0) out vec4 out_color;
+float foil_fog_value(float distance, float start, float end) {
+    // Frozen OpenGL fog.glsl sentinel/degenerate-range behavior.
+    if (distance != distance || abs(distance) >= 1.0e12
+        || max(abs(start), abs(end)) >= 1.0e12) return 0.0;
+    if (end <= start) return distance > start ? 1.0 : 0.0;
+    if (distance <= start) return 0.0;
+    if (distance >= end) return 1.0;
+    return clamp((distance - start) / (end - start), 0.0, 1.0);
+}
+void main() {
+    vec4 color = texture(sampler2D(Tex0, Samp0), v_uv) * v_color;
+    if (color.a < 0.1) discard;
+    float fog = max(
+        foil_fog_value(v_fog_distances.x, v_fog_color_and_environmental_start.w, v_fog_ranges.x),
+        foil_fog_value(v_fog_distances.y, v_fog_ranges.y, v_fog_ranges.z));
+    // Foil fades to black; ordinary fog-color mixing is incorrect. Neither
+    // strength nor fog changes texture alpha or discard coverage.
+    out_color = vec4(color.rgb * ((1.0 - fog) * v_foil_strength), color.a);
+}
+"#;
+
 pub const MINIMAL_TERRAIN_MATERIAL_FRAGMENT_DIRECT: &str = r#"#version 450
 layout(set = 0, binding = 2) uniform texture2D Tex0;
 layout(set = 0, binding = 3) uniform sampler Samp0;
@@ -5284,10 +5377,14 @@ void main() {
     // Frozen Sodium's compact material byte controls both this exact choice
     // and alpha cutoff. A non-mipped material asks for a negative LOD bias
     // while retaining derivative-selected mip sampling.
+#ifdef VULKANIC_MODEL_TRANSLUCENT_CUTOUT
+    vec4 color = texture(sampler2D(Tex0, Samp0), sample_uv);
+#else
     bool use_mipmaps = (v_terrain_material_bits & 1u) != 0u;
     vec4 color = use_mipmaps
         ? texture(sampler2D(Tex0, Samp0), sample_uv)
         : texture(sampler2D(Tex0, Samp0), sample_uv, -FROZEN_MAX_TEXTURE_LOD_BIAS);
+#endif
     if (v_material.y > 0.5) {
         vec2 next_uv = v_animation_next_region.xy + v_uv * v_animation_next_region.zw;
         vec4 next_color = texture(sampler2D(Tex0, Samp0), next_uv);
@@ -5297,6 +5394,9 @@ void main() {
     if (v_overlay_color.a > 0.0) {
         color.rgb = mix(color.rgb, v_overlay_color.rgb, v_overlay_color.a);
     }
+#ifdef VULKANIC_MODEL_TRANSLUCENT_CUTOUT
+    if (color.a < 0.1) discard;
+#endif
     uint alpha_cutoff_class = (v_terrain_material_bits >> 1u) & 3u;
     float alpha_cutoff = float[4](0.0, 0.1, 0.1, 1.0)[alpha_cutoff_class];
 #ifdef VULKANIC_TERRAIN_FRAGMENT_DISCARD
@@ -5765,6 +5865,7 @@ mod tests {
         assert!(MINIMAL_TERRAIN_MATERIAL_VERTEX.contains("NETHER_LIGHT1_DIRECTION"));
         assert!(MINIMAL_TERRAIN_MATERIAL_VERTEX.contains("v_color.rgb *= diffuse"));
         assert!(MINIMAL_TERRAIN_MATERIAL_VERTEX.contains("(material_semantics & 1u) != 0u"));
+        assert!(MINIMAL_TERRAIN_MATERIAL_VERTEX.contains("transpose(inverse(mat3(instance.model)))"));
     }
 
     #[test]
@@ -5841,7 +5942,7 @@ mod tests {
             );
             assert!(source.contains("layout(set = 1, binding = 1) uniform sampler LightmapSampler"));
             assert!(source.contains(
-                "clamp(vertex.extra_data.xy, vec2(0.0), vec2(1.0)) * (15.0 / 16.0);"
+                "clamp(vertex.extra_data.xy, vec2(0.0), vec2(255.0 / 240.0)) * (15.0 / 16.0);"
             ));
             assert!(source.contains("texture(sampler2D(LightmapTexture, LightmapSampler), light_uv)"));
         }
@@ -5853,14 +5954,14 @@ mod tests {
         let vertex = minimal_direct_terrain_vertex_source();
         // Frozen OpenGL Sodium `block_layer_opaque.vsh` samples its linear
         // LightTexture directly at `a_LightAndData.xy / 256`. The semantic
-        // stream holds each packed level as level / 15, while Sodium's CPU
-        // encoder stores it as level * 16, producing level / 16 exactly.
+        // stream holds each full byte as byte / 240, preserving fractional
+        // levels as well as the usual level * 16 coordinates.
         // Sampling here—not
         // the fragment—
         // also preserves Frozen's interpolation of already-lit vertex color.
         assert!(vertex.contains("layout(set = 1, binding = 0) uniform texture2D LightmapTexture"));
         assert!(vertex.contains(
-            "clamp(vertex.extra_data.xy, vec2(0.0), vec2(1.0)) * (15.0 / 16.0);"
+            "clamp(vertex.extra_data.xy, vec2(0.0), vec2(255.0 / 240.0)) * (15.0 / 16.0);"
         ));
         assert!(vertex.contains("v_color = vec4(vertex.color_uv.rgb, vertex.normal_light.w) * instance.color"));
         assert!(vertex.contains("texture(sampler2D(LightmapTexture, LightmapSampler), light_uv)"));
