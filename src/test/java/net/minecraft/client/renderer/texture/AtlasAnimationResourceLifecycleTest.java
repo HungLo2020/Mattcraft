@@ -36,9 +36,18 @@ class AtlasAnimationResourceLifecycleTest {
     void realAtlasUploadBindsUsesBeforeWorldPublicationAndRetiresOldSpriteIdentity() throws Exception {
         verifyAtlasLifecycle(TextureAtlas.LOCATION_BLOCKS);
         verifyAtlasLifecycle(TextureAtlas.LOCATION_PARTICLES);
+        verifyAtlasLifecycle(net.minecraft.client.renderer.Sheets.SHIELD_SHEET);
     }
 
     private void verifyAtlasLifecycle(net.minecraft.resources.ResourceLocation location) throws Exception {
+        verifyAtlasLifecycle(location, true);
+    }
+
+    @Test void shieldResourceLifecycleRemainsPrivateWithoutJavaTickerFallback() throws Exception {
+        verifyAtlasLifecycle(net.minecraft.client.renderer.Sheets.SHIELD_SHEET, false);
+    }
+
+    private void verifyAtlasLifecycle(net.minecraft.resources.ResourceLocation location, boolean shieldLifecycle) throws Exception {
         // Install only the CPU semantic device; no Java or borrowed GPU context.
         // Restore static test scaffolding even if upload or an assertion fails.
         var device = VulkanicAPI.class.getDeclaredField("device");
@@ -48,6 +57,8 @@ class AtlasAnimationResourceLifecycleTest {
         String previousMode = System.getProperty(property);
         String tickProperty = "mattmc.dev.rustGalAtlasAnimation";
         String previousTicks = System.getProperty(tickProperty);
+        String shieldProperty = "mattmc.dev.rustGalShieldAtlasAnimation";
+        String previousShield = System.getProperty(shieldProperty);
         var config = net.sodium.client.SodiumClientMod.class.getDeclaredField("CONFIG");
         config.setAccessible(true);
         var previousConfig = config.get(null);
@@ -55,7 +66,7 @@ class AtlasAnimationResourceLifecycleTest {
         try {
             System.setProperty(property, "true");
             System.clearProperty(tickProperty);
-            if (location.equals(TextureAtlas.LOCATION_PARTICLES)) System.setProperty(tickProperty, "true");
+            System.setProperty(shieldProperty, Boolean.toString(shieldLifecycle));
             config.set(null, net.sodium.client.gui.SodiumGameOptions.defaults());
             device.set(null, new VulkanWholeFrameSemanticGpuDevice());
             atlas = new TextureAtlas(location);
@@ -66,11 +77,25 @@ class AtlasAnimationResourceLifecycleTest {
             var first = preparations(location);
             atlas.upload(first);
             var oldResource = atlas.semanticAnimationResource();
+            if (!shieldLifecycle) {
+                assertNull(oldResource);
+                assertNull(atlas.texture);
+                assertNull(atlas.textureView);
+                assertNull(first.regions().get(ResourceLocation.withDefaultNamespace("audit/animated")).semanticAnimationResource());
+                var tickers = TextureAtlas.class.getDeclaredField("animatedTextures");
+                tickers.setAccessible(true);
+                assertTrue(((List<?>)tickers.get(atlas)).isEmpty());
+                atlas.cycleAnimationFrames();
+                assertNull(atlas.semanticAnimationResource());
+                return;
+            }
             assertNotNull(oldResource);
             assertEquals(location, oldResource.atlas());
             assertEquals(location.equals(TextureAtlas.LOCATION_BLOCKS)
                 ? net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_TERRAIN_BLOCK_ATLAS
-                : net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_PARTICLE_ATLAS,
+                : location.equals(TextureAtlas.LOCATION_PARTICLES)
+                    ? net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_PARTICLE_ATLAS
+                    : net.vulkanic.world.RustGalWorldPrimitiveRenderer.shieldAtlasTextureId(),
                 oldResource.semanticTextureId());
             assertSame(oldResource.source(), atlas.semanticAnimationSource());
             assertNull(atlas.texture);
@@ -96,11 +121,15 @@ class AtlasAnimationResourceLifecycleTest {
             }));
             System.clearProperty(tickProperty);
             atlas.cycleAnimationFrames();
+            long firstTick = 2;
+            assertEquals(firstTick, oldResource.producedTickForDiagnostics(),
+                "standard-atlas events must progress without private consumer flags");
             System.setProperty(tickProperty, "true");
             atlas.cycleAnimationFrames();
-            assertThrows(IllegalArgumentException.class, () -> oldResource.enqueueTick(2, true),
-                "the private real texture tick must enqueue exactly the next semantic event");
-            oldResource.enqueueTick(3, false);
+            assertEquals(firstTick+1, oldResource.producedTickForDiagnostics());
+            assertThrows(IllegalArgumentException.class, () -> oldResource.enqueueTick(firstTick+1, true),
+                "the real texture tick must enqueue exactly the next semantic event");
+            oldResource.enqueueTick(firstTick+2, false);
             var second = preparations(location);
             atlas.upload(second);
             var replacement = atlas.semanticAnimationResource();
@@ -123,6 +152,8 @@ class AtlasAnimationResourceLifecycleTest {
             config.set(null, previousConfig);
             if (previousTicks == null) System.clearProperty(tickProperty);
             else System.setProperty(tickProperty, previousTicks);
+            if (previousShield == null) System.clearProperty(shieldProperty);
+            else System.setProperty(shieldProperty, previousShield);
             if (previousMode == null) System.clearProperty(property);
             else System.setProperty(property, previousMode);
         }
@@ -142,5 +173,7 @@ class AtlasAnimationResourceLifecycleTest {
         assertTrue(pump.indexOf("ensureParticleAtlasAnimationAsset()") < pump.indexOf("flushPendingWorldMeshAssets(bridge)"));
         assertFalse(pump.contains("presentFrame("));
         assertFalse(pump.contains("executeFrameBatches("));
+        assertFalse(pump.contains("privateTickDeliveryEnabled()"),
+            "resource delivery must not be stranded behind a consumer admission flag");
     }
 }

@@ -26,7 +26,7 @@ class WorldItemFoilEncodingTest {
 
     @Test void exportedNativeLayoutCarriesExactAndCanonicalAbsentFields() throws Exception {
         try (var bridge = VulkanicGalBridge.create("rust-vulkan"); var arena = Arena.ofConfined()) {
-            assertEquals(42, ABI_VERSION);
+            assertEquals(54, ABI_VERSION);
             var layout = Struct.WORLD_MESH_INSTANCE_RECORD;
             var item = arena.allocate(layout.byteSize(), 8);
             var encode = VulkanicGalBridge.class.getDeclaredMethod("encodeWorldItemFoil", MemorySegment.class, StandardItemFoilRecord.class);
@@ -36,6 +36,13 @@ class WorldItemFoilEncodingTest {
             assertEquals(12345, item.get(ValueLayout.JAVA_LONG, layout.offset(21)));
             assertEquals(0.125, item.get(ValueLayout.JAVA_DOUBLE, layout.offset(22)));
             assertEquals(0.1234567F, item.get(ValueLayout.JAVA_FLOAT, layout.offset(23)));
+            var entity = new StandardItemFoilRecord(12345, 0.125, 0.1234567F, StandardFoilKind.ENTITY);
+            encode.invoke(null, item, entity);
+            assertEquals(2, item.get(ValueLayout.JAVA_INT, layout.offset(20)));
+            assertEquals(12345, item.get(ValueLayout.JAVA_LONG, layout.offset(21)));
+            assertEquals(0.125, item.get(ValueLayout.JAVA_DOUBLE, layout.offset(22)));
+            assertEquals(0.1234567F, item.get(ValueLayout.JAVA_FLOAT, layout.offset(23)));
+            assertEquals(entity, instance(WORLD_MESH_ENTITY_STRATUM).withItemFoil(entity).itemFoil());
             // Reuse dirty storage: absent data must be actively zeroed.
             encode.invoke(null, item, null);
             assertEquals(0, item.get(ValueLayout.JAVA_INT, layout.offset(20)));

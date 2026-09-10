@@ -2878,7 +2878,14 @@ class NativeMeshingProductionContractTest {
     @Test
     void sourceCoverageDoesNotRecountRustOwnedExperienceOrbBillboards() throws IOException {
         String orb = source("src/main/java/net/minecraft/client/renderer/entity/ExperienceOrbRenderer.java");
-        assertTrue(orb.contains("!(route.usesRustWholeFrameVulkan() && submitNodeCollector.isSemanticCoverageOnly())"));
+        assertTrue(orb.contains("!submitNodeCollector.isSemanticCoverageOnly() && RustGalWorldPrimitiveRenderer.nativeExperienceOrbGeometryEnabled()"));
+        int guard = orb.indexOf("if (net.vulkanic.VulkanicAPI.isVulkanBackendSelected()");
+        int coverage = orb.indexOf("if (!submitNodeCollector.isSemanticCoverageOnly())", guard);
+        int stop = orb.indexOf("return;", coverage);
+        int billboard = orb.indexOf("poseStack.pushPose()", stop);
+        int callback = orb.indexOf("submitCustomGeometrySemantic(", billboard);
+        assertTrue(guard >= 0 && coverage > guard && stop > coverage && billboard > stop && callback > billboard,
+            "Vulkan coverage must return before Java billboard expansion and callback admission");
     }
 
     @Test

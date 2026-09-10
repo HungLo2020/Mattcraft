@@ -986,7 +986,7 @@ public abstract class LivingEntityRenderer<T extends LivingEntity, S extends Liv
 			var rustLivingModelOwnership = net.vulkanic.world.LivingEntityBaseModelOwnershipPolicy.currentOwnershipRoute(rustLivingModelFamily);
 			boolean semanticSubmission = EntityRenderDispatcher.isSemanticSubmission();
 			boolean rustLivingOutlineOnlySubmitted = false;
-			if (rustOutlineOnlyLivingBody && rustLivingModelFamily && entityIdentity != null
+			if (!semanticSubmission && rustOutlineOnlyLivingBody && rustLivingModelFamily && entityIdentity != null
 				&& net.vulkanic.world.WorldRenderRoutePolicy.currentModelMeshRoute(true).usesRustWholeFrameVulkan()) {
 				RenderType outlineMaterial = this.model.renderType(textureIdentity);
 				if (outlineMaterial == null || outlineMaterial.isOutline()
@@ -1000,7 +1000,11 @@ public abstract class LivingEntityRenderer<T extends LivingEntity, S extends Liv
 			var rustLivingModelDisposition = net.vulkanic.world.LivingEntityBaseModelOwnershipPolicy.classify(
 				semanticSubmission, rustLivingModelFamily, rustLivingModelEligible || rustLivingOutlineOnlySubmitted, rustLivingModelOwnership
 			);
-			if (rustLivingModelDisposition == net.vulkanic.world.LivingEntityBaseModelOwnershipPolicy.Disposition.RUST_AVAILABLE) {
+			if (semanticSubmission && rustOutlineOnlyLivingBody) {
+				submitNodeCollector.submitModelOutlineSemanticTexture(this.model, livingEntityRenderState,
+					poseStack, this.model.renderType(textureIdentity), livingEntityRenderState.lightCoords,
+					textureIdentity, livingEntityRenderState.outlineColor);
+			} else if (rustLivingModelDisposition == net.vulkanic.world.LivingEntityBaseModelOwnershipPolicy.Disposition.RUST_AVAILABLE) {
 				if (!rustLivingOutlineOnlySubmitted && !net.vulkanic.world.RustGalWorldPrimitiveRenderer.enqueueStandaloneModelMesh(
 					this.model, livingEntityRenderState, poseStack.last(), renderType, textureIdentity, entityIdentity,
 					livingEntityRenderState.lightCoords, i, k, livingEntityRenderState.outlineColor

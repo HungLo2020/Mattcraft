@@ -711,7 +711,6 @@ impl SubmissionLowerer {
                         == Some(HandleKind::FrameTarget)
                     {
                         let frame = objects.frame_target(*target)?;
-                        let clear_frame = !state.frame_target_touched;
                         let old_layout = state
                             .frame_target_layouts
                             .get(target)
@@ -749,10 +748,11 @@ impl SubmissionLowerer {
                             .first()
                             .and_then(|attachment| attachment.clear_color)
                             .map(|color| [color.r, color.g, color.b, color.a])
-                            .unwrap_or([0.08, 0.31, 0.74, 1.0]);
-                        let load = if clear_frame {
-                            vk::AttachmentLoadOp::CLEAR
-                        } else if colors.is_empty() {
+                            .unwrap_or([0.0; 4]);
+                        // The GAL pass declares preservation/clearing. A prior
+                        // image copy is as real a writer as a render pass; do
+                        // not replace an explicit Load with backend policy.
+                        let load = if colors.is_empty() {
                             vk::AttachmentLoadOp::LOAD
                         } else {
                             load_op(colors[0].load_op)
@@ -771,7 +771,6 @@ impl SubmissionLowerer {
                                 clear[2],
                                 clear[3]
                             ));
-                        state.frame_target_touched = true;
                         let depth_attachment = depth_stencil
                             .as_ref()
                             .map(|attachment| {
@@ -882,6 +881,8 @@ impl SubmissionLowerer {
                         min_depth: 0.0,
                         max_depth: 1.0,
                     };
+                    state.pass_extent = Some(extent);
+                    state.raster_y_direction = Some(crate::render::vulkanic::resources::RasterYDirection::Up);
                     let scissor = vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },
                         extent: vk::Extent2D {
@@ -896,6 +897,7 @@ impl SubmissionLowerer {
                         .device
                         .cmd_set_scissor(command_buffer, 0, &[scissor]);
                     state.in_pass = true;
+                    state.provoking_vertex = None;
                     state.frame_present = frame_present;
                 }
                 CommandOp::EndPass => {
@@ -920,6 +922,23 @@ impl SubmissionLowerer {
                 }
                 CommandOp::BindGraphicsPipeline(handle) => {
                     let pipeline = objects.graphics_pipeline(*handle)?;
+                    if state.raster_y_direction != Some(pipeline.raster_y_direction) {
+                        let extent = state.pass_extent.ok_or_else(|| GalError::backend("raster viewport requires an active pass extent"))?;
+                        let down = pipeline.raster_y_direction == crate::render::vulkanic::resources::RasterYDirection::Down;
+                        self.context.device.cmd_set_viewport(command_buffer, 0, &[vk::Viewport {
+                            x: 0.0, y: if down { 0.0 } else { extent.height as f32 },
+                            width: extent.width as f32,
+                            height: if down { extent.height as f32 } else { -(extent.height as f32) },
+                            min_depth: 0.0, max_depth: 1.0,
+                        }]);
+                        state.raster_y_direction = Some(pipeline.raster_y_direction);
+                    }
+                    if !self.context.provoking_vertex_per_pipeline && state.provoking_vertex
+                        .is_some_and(|previous| previous != pipeline.provoking_vertex) {
+                        return Err(GalError::unsupported_feature(
+                            "Vulkan device forbids mixed provoking vertex modes in one render pass"));
+                    }
+                    state.provoking_vertex = Some(pipeline.provoking_vertex);
                     self.context.device.cmd_bind_pipeline(
                         command_buffer,
                         vk::PipelineBindPoint::GRAPHICS,
@@ -1303,6 +1322,12 @@ impl SubmissionLowerer {
                     state
                         .frame_target_layouts
                         .insert(*dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                    // Copy-only world output (for example hidden HUD) still
+                    // belongs to this frame's existing presentation boundary.
+                    state.pending_frame_presents.insert(*dst, FramePresentTransition {
+                        target: *dst, image: frame.image, image_index: frame.image_index,
+                        frame_id: frame.frame_id, range,
+                    });
                 }
                 CommandOp::GenerateMipmaps {
                     texture,
@@ -2169,6 +2194,10 @@ mod timestamp_tests {
             vk::AccessFlags2::TRANSFER_READ
                 == frame_layout_access_mask(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         );
+        assert!(vk::PipelineStageFlags2::COPY
+            == frame_layout_stage_mask(vk::ImageLayout::TRANSFER_DST_OPTIMAL));
+        assert!(vk::AccessFlags2::TRANSFER_WRITE
+            == frame_layout_access_mask(vk::ImageLayout::TRANSFER_DST_OPTIMAL));
         assert!(
             vk::PipelineStageFlags2::NONE
                 == frame_layout_stage_mask(vk::ImageLayout::PRESENT_SRC_KHR)
@@ -2186,6 +2215,15 @@ mod timestamp_tests {
         let access = access_mask(TextureUsageState::ShaderRead);
         assert!(access.contains(vk::AccessFlags2::SHADER_SAMPLED_READ));
         assert!(access.contains(vk::AccessFlags2::UNIFORM_READ));
+        assert!(access.contains(vk::AccessFlags2::SHADER_STORAGE_READ));
+    }
+
+    #[test]
+    fn shader_write_barrier_covers_atomic_read_modify_write() {
+        let access = access_mask(TextureUsageState::ShaderWrite);
+        assert!(access.contains(vk::AccessFlags2::SHADER_STORAGE_READ));
+        assert!(access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE));
+        assert!(stage_mask(TextureUsageState::ShaderWrite).contains(vk::PipelineStageFlags2::VERTEX_SHADER));
     }
 
     #[test]
@@ -2210,11 +2248,13 @@ mod timestamp_tests {
 
 #[derive(Default)]
 struct EncodingState {
+    pass_extent: Option<crate::render::vulkanic::resources::Extent3d>,
+    raster_y_direction: Option<crate::render::vulkanic::resources::RasterYDirection>,
     in_pass: bool,
+    provoking_vertex: Option<crate::render::vulkanic::resources::ProvokingVertex>,
     graphics_pipeline: Option<crate::render::vulkanic::handles::Handle>,
     compute_pipeline: Option<crate::render::vulkanic::handles::Handle>,
     pipeline_layout: Option<crate::render::vulkanic::handles::Handle>,
-    frame_target_touched: bool,
     frame_present: Option<FramePresentTransition>,
     frame_target_layouts: BTreeMap<Handle, vk::ImageLayout>,
     transfer_dst_textures: BTreeSet<Handle>,
@@ -2322,7 +2362,7 @@ fn frame_layout_stage_mask(layout: vk::ImageLayout) -> vk::PipelineStageFlags2 {
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => {
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
         }
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => vk::PipelineStageFlags2::COPY,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL | vk::ImageLayout::TRANSFER_DST_OPTIMAL => vk::PipelineStageFlags2::COPY,
         _ => vk::PipelineStageFlags2::TOP_OF_PIPE,
     }
 }
@@ -2333,6 +2373,7 @@ fn frame_layout_access_mask(layout: vk::ImageLayout) -> vk::AccessFlags2 {
             vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
         }
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL => vk::AccessFlags2::TRANSFER_READ,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL => vk::AccessFlags2::TRANSFER_WRITE,
         _ => vk::AccessFlags2::empty(),
     }
 }
@@ -2388,16 +2429,20 @@ fn image_access_mask(state: TextureUsageState) -> vk::AccessFlags2 {
 pub(super) fn access_mask(state: TextureUsageState) -> vk::AccessFlags2 {
     match state {
         TextureUsageState::Undefined | TextureUsageState::Present => vk::AccessFlags2::empty(),
-        // `ShaderRead` is the backend-neutral read state used for both sampled
-        // textures and descriptor-backed uniform buffers.  A barrier that
+        // `ShaderRead` is the backend-neutral read state used for sampled
+        // textures and descriptor-backed uniform/storage buffers. A barrier that
         // names only sampled reads does not make a preceding update visible to
         // a graphics UBO load, which can leave a draw observing stale frame
         // parameters. Image barriers use image_access_mask instead, because
         // their explicit resource type excludes uniform-buffer accesses.
         TextureUsageState::ShaderRead => {
             vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::UNIFORM_READ
+                | vk::AccessFlags2::SHADER_STORAGE_READ
         }
-        TextureUsageState::ShaderWrite => vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        // Writable bindings may be read/modify/write (including atomics).
+        // The coarse GAL shader-write state must make initial data visible
+        // to those reads, as well as ordering the resulting writes.
+        TextureUsageState::ShaderWrite => vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
         TextureUsageState::ShaderStorageRead => vk::AccessFlags2::SHADER_STORAGE_READ,
         TextureUsageState::ColorAttachment => {
             vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE

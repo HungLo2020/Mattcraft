@@ -142,6 +142,7 @@ public final class RustGalGuiRawImageAssets {
 	}
 
 	static void invalidate() {
+		GuiItemSemanticIdentities.clear();
 		RustGalFrameCoordinator.invalidateGuiRawImages();
 		RustGalGuiRenderer.invalidateTextAtlasMetadata();
 		synchronized (LOCK) {
@@ -482,7 +483,7 @@ public final class RustGalGuiRawImageAssets {
 		// staged until its bounded pending-image transaction has succeeded, so a
 		// rejected update can be retried instead of being hidden by this fast path.
 		RustGalFrameCoordinator.stageGuiRawImage(new VulkanicGalBridge.GuiRawImageAssetRecord(
-			asset.assetId(), RAW_RGBA8, asset.width(), asset.height(), asset.pixels()
+			asset.assetId(), RAW_RGBA8, asset.width(), asset.height(), asset.pixels(), asset.samplingFilter(), asset.samplingAddress()
 		));
 		synchronized (LOCK) {
 			if (STAGED_ASSETS.size() >= MAX_SEMANTIC_IDENTITIES) {
@@ -556,13 +557,18 @@ public final class RustGalGuiRawImageAssets {
 	}
 
 	@Nullable
-	private static Asset decode(ResourceLocation resourceId, Resource resource, int maximumPixels) {
+	static Asset decode(ResourceLocation resourceId, Resource resource, int maximumPixels) {
 		try (InputStream input = resource.open()) {
 			byte[] encoded = input.readNBytes(MAX_ENCODED_BYTES + 1);
 			if (encoded.length > MAX_ENCODED_BYTES) {
 				return null;
 			}
-			return decode(resourceId, encoded, maximumPixels);
+			Asset decoded = decode(resourceId, encoded, maximumPixels);
+			if (decoded == null) return null;
+			var metadata = resource.metadata().getSection(net.minecraft.client.resources.metadata.texture.TextureMetadataSection.TYPE);
+			return new Asset(decoded.assetId(), decoded.identity(), decoded.width(), decoded.height(), decoded.pixels(),
+				metadata.map(net.minecraft.client.resources.metadata.texture.TextureMetadataSection::blur).orElse(false) ? 2 : 1,
+				metadata.map(net.minecraft.client.resources.metadata.texture.TextureMetadataSection::clamp).orElse(false) ? 2 : 1);
 		} catch (IOException error) {
 			return null;
 		}
@@ -666,7 +672,10 @@ public final class RustGalGuiRawImageAssets {
 		}
 	}
 
-	record Asset(long assetId, String identity, int width, int height, byte[] pixels) {
+	record Asset(long assetId, String identity, int width, int height, byte[] pixels, int samplingFilter, int samplingAddress) {
+		Asset(long assetId, String identity, int width, int height, byte[] pixels) {
+			this(assetId, identity, width, height, pixels, 0, 0);
+		}
 		Asset {
 			pixels = pixels.clone();
 		}

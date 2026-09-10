@@ -1,11 +1,10 @@
 package net.vulkanic.gui;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
+
 import java.util.List;
-import net.blaze3d.vertex.PoseStack;
 import net.vulkanic.bridge.VulkanicGalBridge;
-import net.sodium.api.math.MatrixHelper;
 import org.junit.jupiter.api.Test;
-import org.joml.Matrix4f;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -13,6 +12,63 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GuiItemMeshSemanticCollectorTest {
+	@Test
+	void nativeBakedFaceAndFoilAreCopiedWithoutReplacingTheSourceNormal() {
+		float[] position={1,2,3};
+		var vertex=new VulkanicGalBridge.GuiMeshVertexRecord(position,new float[]{0,0},new float[]{0,0},
+			-1,0x005a005a,5,1);
+		position[0]=99;
+		assertEquals(1,vertex.position()[0]);
+		assertEquals(0x005a005a,vertex.normalPacked());
+		assertEquals(5,vertex.sourceFace());
+		assertEquals(1,vertex.sourceFoilType());
+		var layer=new GuiItemMeshSemanticCollector.GuiItemMeshLayer(
+			GuiItemMeshSemanticCollector.MaterialMode.CUTOUT,true,identityMatrix(),List.of(),null,1);
+		assertEquals(1,layer.sourceFoilType());
+		org.junit.jupiter.api.Assertions.assertNull(layer.itemFoil());
+		for (int face : new int[]{-1,0,7}) {
+			assertThrows(IllegalArgumentException.class, () -> new VulkanicGalBridge.GuiMeshVertexRecord(
+				new float[3],new float[2],new float[2],-1,1,face,1));
+		}
+		assertThrows(IllegalArgumentException.class, () -> new VulkanicGalBridge.GuiMeshVertexRecord(
+			new float[3],new float[2],new float[2],-1,1,5,2));
+	}
+
+	@Test
+	void nativeBlockMeshCarriesBoundsWithoutJavaRasterSetup() {
+		double[] bounds = {-0.5,-0.5,-0.5,0.5,0.5,0.5};
+		var raster = new VulkanicGalBridge.GuiBlockItemRasterRecord(3,bounds);
+		var mesh = new GuiItemMeshSemanticCollector.GuiItemMesh("minecraft:stone",0,0,0,0,16,16,
+			new float[]{1,0,0,1,0,0},List.of(),List.of(),raster);
+		bounds[0] = -99;
+		assertEquals(-0.5,mesh.blockItemRaster().modelBounds()[0]);
+		assertEquals(3,mesh.blockItemRaster().guiScale());
+		var fields=java.util.Arrays.stream(GuiItemMeshSemanticCollector.GuiItemMesh.class.getRecordComponents())
+			.map(java.lang.reflect.RecordComponent::getName).toList();
+		for (String forbidden : List.of("renderWidth","renderHeight","guardPixels","offscreenModelTransform"))
+			assertFalse(fields.contains(forbidden),"semantic block mesh cannot express Java raster setup");
+		assertThrows(IllegalArgumentException.class, () -> new GuiItemMeshSemanticCollector.GuiItemMesh(
+			"minecraft:stone",0,0,0,0,16,16,new float[6],List.of(),List.of(),null));
+	}
+
+	@Test
+	void specialFoilRejectsBeforeClientResourceAccessOrPartialDrawPublication() throws Exception {
+		var layer = new net.minecraft.client.renderer.item.ItemStackRenderState.SemanticLayer(
+			List.of(), new int[0], null,
+			net.minecraft.client.renderer.item.ItemStackRenderState.FoilType.SPECIAL,
+			true, false, true, identityMatrix());
+		var output = new java.util.ArrayList<GuiItemMeshSemanticCollector.GuiItemMeshLayer>();
+		var sources = new java.util.ArrayList<GuiItemTextureSource>();
+		var append = GuiItemMeshSemanticCollector.class.getDeclaredMethod("appendLayer",
+			net.minecraft.client.renderer.item.ItemStackRenderState.SemanticLayer.class,
+			List.class, List.class);
+		append.setAccessible(true);
+		assertEquals("special-foil-native-contract-unavailable",
+			append.invoke(null, layer, output, sources));
+		assertTrue(output.isEmpty());
+		assertTrue(sources.isEmpty());
+	}
+
 	@Test
 	void standardFoilCopiesOriginalUvsWithoutAClientOrTextureTransform() throws Exception {
 		float[] positions = {0,0,0, 1,0,0, 1,1,0, 0,1,0};
@@ -66,12 +122,19 @@ class GuiItemMeshSemanticCollectorTest {
 			"src/main/java/net/vulkanic/gui/GuiItemMeshSemanticCollector.java"
 		));
 		assertTrue(source.contains("MaterialMode.GLINT"));
-		assertTrue(source.contains("List<RustGalGuiRawImageAssets.Asset> assets"),
-			"the collector must return copied assets for post-admission staging");
+		assertTrue(source.contains("List<GuiItemTextureSource> sources"),
+			"the collector must return typed immutable resources for post-admission staging");
+		assertTrue(source.contains("new GuiItemTextureSource.Atlas("));
+		assertTrue(source.contains("new GuiItemTextureSource.Raw(asset)"));
+		assertFalse(source.contains("resolveAnimatedSprite"), "animation frame selection belongs to the native atlas");
+		assertTrue(source.contains("RustGalGuiItemRenderer.itemLocalUv("),
+			"owned atlas UVs must be copied exactly, not clamped into a different mapping");
 		assertTrue(source.contains("resolveAssetId(quad.assetId())"),
-			"mesh staging must preserve the exact copied asset identity, including animated frames");
+			"mesh staging must preserve the exact copied raw asset identity, including foil");
 		assertTrue(source.contains("ENCHANTED_GLINT_ITEM"));
-		assertTrue(source.contains("specialFoilQuad"));
+		assertFalse(source.contains("specialFoilQuad"));
+		assertTrue(source.contains("special-foil-native-contract-unavailable"));
+		assertFalse(source.contains("SPECIAL_FOIL_TEXTURE_SCALE"));
 	}
 
 	@Test
@@ -151,36 +214,28 @@ class GuiItemMeshSemanticCollectorTest {
 	}
 
 	@Test
-	void copiedStandard3dTargetDoesNotRetainMutableTransforms() {
+	void copiedGuiSemanticsDoNotRetainMutableTransforms() {
 		float[] guiPose = new float[] {1.0F, 0.0F, 0.0F, 1.0F, 4.0F, 8.0F};
-		float[] offscreen = identityMatrix();
+		var raster=new VulkanicGalBridge.GuiBlockItemRasterRecord(2,new double[]{-.5,-.5,-.5,.5,.5,.5});
 		GuiItemMeshSemanticCollector.GuiItemMesh mesh = new GuiItemMeshSemanticCollector.GuiItemMesh(
-			"minecraft:stone", 4, 8, 4, 8, 20, 24, guiPose, 34, 34, 1, offscreen, List.of(), List.of()
+			"minecraft:stone", 4, 8, 4, 8, 20, 24, guiPose, List.of(), List.of(),raster
 		);
 		guiPose[0] = 7.0F;
-		offscreen[5] = 9.0F;
-		float[] copied = mesh.offscreenModelTransform();
-		copied[10] = 11.0F;
+		mesh.guiPose()[0] = 11.0F;
 
 		assertArrayEquals(new float[] {1.0F, 0.0F, 0.0F, 1.0F, 4.0F, 8.0F}, mesh.guiPose());
-		assertArrayEquals(identityMatrix(), mesh.offscreenModelTransform());
 		assertThrows(IllegalArgumentException.class, () -> new GuiItemMeshSemanticCollector.GuiItemMesh(
-			"minecraft:stone", 0, 0, 0, 0, 16, 16, new float[6], 2, 2, 1, identityMatrix(), List.of(), List.of()
+			"minecraft:stone", 0, 0, 0, 0, 16, 16, new float[5], List.of(), List.of(),raster
 		));
 	}
 
 	@Test
-	void copiedNormalsMatchTheJavaItemPoseNormalMatrix() {
-		Matrix4f transform = new Matrix4f().rotateX((float)(Math.PI / 2.0)).scale(1.0F, -1.0F, -1.0F);
-		PoseStack poseStack = new PoseStack();
-		poseStack.mulPose(transform);
-		int rawNormal = 0x007f0000;
-
-		assertEquals(
-			MatrixHelper.transformNormal(poseStack.last().normal(), poseStack.last().trustedNormals, rawNormal),
-			GuiItemMeshSemanticCollector.transformGuiNormal(transform, rawNormal),
-			"the copied normal must match Java's item encoder before Rust receives it"
-		);
+	void collectorHasNoJavaRasterOrNormalTransformRoute() throws Exception {
+		String source=java.nio.file.Files.readString(java.nio.file.Path.of(
+			"src/main/java/net/vulkanic/gui/GuiItemMeshSemanticCollector.java"));
+		for (String forbidden : List.of("rustGalGuiBlockItemLayout","standard3dTarget(","transformGuiNormal(","new PoseStack(","invert().transpose()"))
+			assertFalse(source.contains(forbidden),"removed Java rendering policy must not return: "+forbidden);
+		assertTrue(source.contains("normals[index] = quad.getAccurateNormal(index)"));
 	}
 
 	private static float[] identityMatrix() {

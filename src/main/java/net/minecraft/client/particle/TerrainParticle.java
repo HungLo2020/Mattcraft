@@ -28,6 +28,9 @@ public class TerrainParticle extends SingleQuadParticle {
 	private boolean isOpaque;
 	private boolean alphaTested;
 
+	/** Read-only fixture receipt; does not select rendering behavior. */
+	boolean graphicsAuditAlphaTested() { return this.alphaTested; }
+
 	public TerrainParticle(ClientLevel clientLevel, double d, double e, double f, double g, double h, double i, BlockState blockState) {
 		this(clientLevel, d, e, f, g, h, i, blockState, BlockPos.containing(d, e, f));
 	}
@@ -149,7 +152,9 @@ public class TerrainParticle extends SingleQuadParticle {
 				this.getV1(),
 				ARGB.colorFromFloat(this.alpha, this.rCol, this.gCol, this.bCol),
 			this.getLightColor(f),
-			!this.alphaTested
+			this.alphaTested ? net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_CUTOUT
+				: this.isOpaque ? net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_OPAQUE
+				: net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_TRANSLUCENT
 			);
 		if (queued) {
 			// Both the normal particle pass and the Rust whole-frame collector

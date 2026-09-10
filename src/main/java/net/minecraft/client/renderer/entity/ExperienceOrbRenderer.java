@@ -34,6 +34,28 @@ public class ExperienceOrbRenderer extends EntityRenderer<ExperienceOrb, Experie
 	public void submit(
 		ExperienceOrbRenderState experienceOrbRenderState, PoseStack poseStack, SubmitNodeCollector submitNodeCollector, CameraRenderState cameraRenderState
 	) {
+		net.minecraft.client.dev.GraphicsAuditExperienceOrbFixture.observeSubmit(experienceOrbRenderState, poseStack.last().pose());
+		WorldRenderRoutePolicy.Route route = WorldRenderRoutePolicy.currentExperienceOrbRoute();
+		if (!submitNodeCollector.isSemanticCoverageOnly() && RustGalWorldPrimitiveRenderer.nativeExperienceOrbGeometryEnabled()) {
+			float phase = experienceOrbRenderState.ageInTicks / 2.0F;
+			int red = (int)((Mth.sin(phase) + 1.0F) * 0.5F * 255.0F);
+			int blue = (int)((Mth.sin(phase + (float)(Math.PI * 4.0 / 3.0)) + 1.0F) * 0.1F * 255.0F);
+			RustGalWorldPrimitiveRenderer.enqueueNativeExperienceOrb(poseStack.last(), experienceOrbRenderState,
+				cameraRenderState.orientation, red, blue);
+			RustGalWorldPrimitiveRenderer.recordExperienceOrbRouteDecision("rust-vulkan-whole-frame", true, true, false);
+			return;
+		}
+		// Coverage traversals and unavailable Vulkan routes must never reach the
+		// OpenGL compatibility billboard producer below, including during handoff.
+		if (net.vulkanic.VulkanicAPI.isVulkanBackendSelected()
+			|| net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled()) {
+			RustGalWorldPrimitiveRenderer.recordExperienceOrbRouteDecision("disabled", false, false, false);
+			if (!submitNodeCollector.isSemanticCoverageOnly()) {
+				throw new IllegalStateException("Rust whole-frame experience-orb route is unavailable while Rust owns presentation");
+			}
+			super.submit(experienceOrbRenderState, poseStack, submitNodeCollector, cameraRenderState);
+			return;
+		}
 		poseStack.pushPose();
 		int i = experienceOrbRenderState.icon;
 		float f = (i % 4 * 16 + 0) / 64.0F;
@@ -52,26 +74,9 @@ public class ExperienceOrbRenderer extends EntityRenderer<ExperienceOrb, Experie
 		poseStack.mulPose(cameraRenderState.orientation);
 		float s = 0.3F;
 		poseStack.scale(0.3F, 0.3F, 0.3F);
-		WorldRenderRoutePolicy.Route route = WorldRenderRoutePolicy.currentExperienceOrbRoute();
-		// The whole-frame presenter can become authoritative between route
-		// selection and the first entity submit during backend handoff. Re-read
-		// that explicit presenter state instead of converting the handoff into a
-		// Java fallback or a false unavailable-route crash.
-		boolean rustWholeFrame = route.usesRustWholeFrameVulkan()
-			|| net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled();
-		// Coverage-only traversal must never be counted as a second Java draw,
-		// even while the Rust route is already selected for the enclosing frame.
-		boolean rustWholeFrameCoverageExcluded =
-			!(route.usesRustWholeFrameVulkan() && submitNodeCollector.isSemanticCoverageOnly());
-		if (!submitNodeCollector.isSemanticCoverageOnly() && rustWholeFrame && rustWholeFrameCoverageExcluded) {
-			if (!RustGalWorldPrimitiveRenderer.enqueueExperienceOrb(
-				poseStack.last(), experienceOrbRenderState, f, g, h, j, p, r
-			)) {
-				throw new IllegalStateException("Rust whole-frame experience-orb route selected without a semantic material request");
-			}
-			RustGalWorldPrimitiveRenderer.recordExperienceOrbRouteDecision("rust-vulkan-whole-frame", true, true, false);
-		} else if (!rustWholeFrame && route != WorldRenderRoutePolicy.Route.DISABLED) {
+		if (route != WorldRenderRoutePolicy.Route.DISABLED) {
 			submitNodeCollector.submitCustomGeometrySemantic(poseStack, RENDER_TYPE, (pose, vertexConsumer) -> {
+				net.minecraft.client.dev.GraphicsAuditExperienceOrbFixture.observeCallback(experienceOrbRenderState, pose.pose());
 				vertex(vertexConsumer, pose, -0.5F, -0.25F, p, 255, r, f, j, experienceOrbRenderState.lightCoords);
 				vertex(vertexConsumer, pose, 0.5F, -0.25F, p, 255, r, g, j, experienceOrbRenderState.lightCoords);
 				vertex(vertexConsumer, pose, 0.5F, 0.75F, p, 255, r, g, h, experienceOrbRenderState.lightCoords);
@@ -80,16 +85,9 @@ public class ExperienceOrbRenderer extends EntityRenderer<ExperienceOrb, Experie
 			RustGalWorldPrimitiveRenderer.recordExperienceOrbRouteDecision("java-legacy", false, false, !submitNodeCollector.isSemanticCoverageOnly());
 		} else {
 			RustGalWorldPrimitiveRenderer.recordExperienceOrbRouteDecision("disabled", false, false, false);
-			if (!submitNodeCollector.isSemanticCoverageOnly()
-				&& (net.vulkanic.VulkanicAPI.isVulkanBackendSelected()
-					|| net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled())) {
-				throw new IllegalStateException("Rust whole-frame experience-orb route is unavailable while Rust owns presentation");
-			}
 		}
 		poseStack.popPose();
-		if (submitNodeCollector.isSemanticCoverageOnly() || !rustWholeFrame) {
-			super.submit(experienceOrbRenderState, poseStack, submitNodeCollector, cameraRenderState);
-		}
+		super.submit(experienceOrbRenderState, poseStack, submitNodeCollector, cameraRenderState);
 	}
 
 	private static void vertex(VertexConsumer vertexConsumer, PoseStack.Pose pose, float f, float g, int i, int j, int k, float h, float l, int m) {
@@ -108,5 +106,6 @@ public class ExperienceOrbRenderer extends EntityRenderer<ExperienceOrb, Experie
 	public void extractRenderState(ExperienceOrb experienceOrb, ExperienceOrbRenderState experienceOrbRenderState, float f) {
 		super.extractRenderState(experienceOrb, experienceOrbRenderState, f);
 		experienceOrbRenderState.icon = experienceOrb.getIcon();
+		net.minecraft.client.dev.GraphicsAuditExperienceOrbFixture.configureRenderState(experienceOrb, experienceOrbRenderState);
 	}
 }

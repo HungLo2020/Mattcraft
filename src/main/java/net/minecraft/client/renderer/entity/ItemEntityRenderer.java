@@ -39,6 +39,9 @@ public class ItemEntityRenderer extends EntityRenderer<ItemEntity, ItemEntityRen
 		super.extractRenderState(itemEntity, itemEntityRenderState, f);
 		itemEntityRenderState.bobOffset = itemEntity.bobOffs;
 		itemEntityRenderState.extractItemGroupRenderState(itemEntity, itemEntity.getItem(), this.itemModelResolver);
+		net.minecraft.client.dev.GraphicsAuditDroppedItemFoilFixture.observe(itemEntity,
+			itemEntityRenderState.ageInTicks, itemEntityRenderState.bobOffset,
+			itemEntityRenderState.count, itemEntityRenderState.seed, itemEntityRenderState.lightCoords);
 	}
 
 	public void submit(

@@ -4,11 +4,9 @@ import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.navigation.ScreenRectangle;
 import net.minecraft.client.gui.render.state.GuiItemRenderState;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.block.model.BakedQuad;
-import net.minecraft.core.Direction;
 import net.minecraft.client.renderer.entity.ItemRenderer;
 import net.minecraft.client.renderer.item.ItemStackRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -16,28 +14,21 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.ARGB;
 import net.minecraft.util.Mth;
 import net.minecraft.world.phys.AABB;
-import net.sodium.api.math.MatrixHelper;
 import net.sodium.client.render.immediate.model.BakedModelEncoder;
 import net.sodium.client.model.quad.BakedQuadView;
-import net.blaze3d.vertex.PoseStack;
-import org.joml.Matrix3f;
-import org.joml.Matrix4f;
-import org.joml.Vector3f;
 
 /**
  * Copies ordinary vanilla GUI item-model semantics before any native packing.
  * It intentionally retains no renderer, model, atlas, or GPU objects. The
- * collected family is private until a Rust-owned GUI mesh pass consumes it.
+ * Rust owns raster layout, normal selection, lighting and GPU execution.
  */
 public final class GuiItemMeshSemanticCollector {
-	private static final int MAX_STANDARD_3D_AXIS = 4096;
 	private GuiItemMeshSemanticCollector() {
 	}
 
 	/**
-	 * Copies the bounded standard-3D GUI item setup. This is the semantic
-	 * equivalent of {@code Standard3dItemRenderer}'s offscreen pose, not a
-	 * reference to its renderer, target, projection buffer, or lighting state.
+	 * Copies original standard-3D GUI item semantics. No offscreen extent,
+	 * raster pose, transformed normal, or GPU state is computed here.
 	 */
 	public static CollectionResult collectStandard3d(GuiItemRenderState item, int guiScale) {
 		if (item == null || item.itemStackRenderState() == null) {
@@ -52,91 +43,61 @@ public final class GuiItemMeshSemanticCollector {
 		if (guiScale <= 0) {
 			return CollectionResult.rejected("gui-scale");
 		}
-		Standard3dTarget target = standard3dTarget(item, guiScale);
-		if (target == null) {
-			return CollectionResult.rejected("offscreen-extent");
-		}
+		AABB modelBounds = item.itemStackRenderState().getModelBoundingBox();
+		if (modelBounds == null) return CollectionResult.rejected("model-bounds");
+		var blockRaster = new net.vulkanic.bridge.VulkanicGalBridge.GuiBlockItemRasterRecord(
+			guiScale, new double[] {modelBounds.minX, modelBounds.minY, modelBounds.minZ,
+				modelBounds.maxX, modelBounds.maxY, modelBounds.maxZ},item.itemStackRenderState().isOversizedInGui());
 		List<GuiItemMeshLayer> layers = new ArrayList<>();
+		List<GuiItemTextureSource> sources = new ArrayList<>();
 		String[] rejection = new String[1];
 		item.itemStackRenderState().forEachSemanticLayer(layer -> {
 			if (rejection[0] != null) {
 				return;
 			}
-			rejection[0] = appendLayer(layer, target.modelTransform(), layers);
+			rejection[0] = appendLayer(layer, layers, sources);
 		});
 		if (rejection[0] != null || layers.isEmpty()) {
 			return CollectionResult.rejected(rejection[0] == null ? "empty-mesh" : rejection[0]);
 		}
-		List<RustGalGuiRawImageAssets.Asset> assets = new ArrayList<>();
 		for (GuiItemMeshLayer layer : layers) for (GuiItemMeshQuad quad : layer.quads()) {
 			RustGalGuiRawImageAssets.Asset asset = RustGalGuiRawImageAssets.resolveAssetId(quad.assetId());
-			if (asset != null && assets.stream().noneMatch(existing -> existing.assetId() == asset.assetId())) assets.add(asset);
+			if (asset != null && sources.stream().noneMatch(existing -> existing.assetId() == asset.assetId()))
+				sources.add(new GuiItemTextureSource.Raw(asset));
 		}
-		ScreenRectangle bounds = item.bounds();
-		int left = bounds == null ? item.x() : bounds.left();
-		int top = bounds == null ? item.y() : bounds.top();
-		int right = bounds == null ? item.x() + 16 : bounds.right();
-		int bottom = bounds == null ? item.y() + 16 : bounds.bottom();
+		// Native layout receives the original logical item origin/box; Rust
+		// derives oversized placement before applying the copied GUI pose.
+		int left = item.x();
+		int top = item.y();
+		int right = item.x() + 16;
+		int bottom = item.y() + 16;
 		return CollectionResult.accepted(new GuiItemMesh(
 			item.name(), item.x(), item.y(), left, top, right, bottom,
 			new float[] {item.pose().m00(), item.pose().m01(), item.pose().m10(), item.pose().m11(), item.pose().m20(), item.pose().m21()},
-			target.width(), target.height(), target.guardPixels(), target.modelTransform(),
-			layers, assets
+			layers, sources, blockRaster
 		));
 	}
 
-	private static Standard3dTarget standard3dTarget(GuiItemRenderState item, int guiScale) {
-		AABB bounds = item.itemStackRenderState().getModelBoundingBox();
-		if (bounds == null) {
-			return null;
-		}
-		int logicalWidth = Math.max(16, Mth.ceil((float)bounds.getXsize() * 16.0F));
-		int logicalHeight = Math.max(16, Mth.ceil((float)bounds.getYsize() * 16.0F));
-		boolean expanded = logicalWidth > 16 || logicalHeight > 16;
-		int guardPixels = 1;
-		long widthLong = (long) logicalWidth * guiScale + guardPixels * 2L;
-		long heightLong = (long) logicalHeight * guiScale + guardPixels * 2L;
-		if (widthLong > MAX_STANDARD_3D_AXIS || heightLong > MAX_STANDARD_3D_AXIS) {
-			return null;
-		}
-		int width = (int) widthLong;
-		int height = (int) heightLong;
-		PoseStack pose = new PoseStack();
-		// Matches PictureInPictureRenderer + Standard3dItemRenderer exactly,
-		// while retaining only a copied matrix at this Java/Rust boundary.
-		pose.translate(width / 2.0F, height / 2.0F, 0.0F);
-		float scale = guiScale * 16.0F;
-		pose.scale(scale, scale, -scale);
-		pose.scale(1.0F, -1.0F, -1.0F);
-		if (expanded) {
-			pose.translate((float)(-(bounds.minX + bounds.maxX) / 2.0), (float)(-(bounds.minY + bounds.maxY) / 2.0), 0.0F);
-		}
-		float[] modelTransform = new float[16];
-		pose.last().pose().get(modelTransform);
-		return new Standard3dTarget(width, height, guardPixels, modelTransform);
-	}
-
-	private static String appendLayer(ItemStackRenderState.SemanticLayer layer, float[] standard3dTransform, List<GuiItemMeshLayer> output) {
+	private static String appendLayer(ItemStackRenderState.SemanticLayer layer, List<GuiItemMeshLayer> output,
+		List<GuiItemTextureSource> sources) {
 		if (layer == null) return "missing-layer";
 		if (layer.hasSpecialRenderer()) return "special-renderer";
 		if (layer.foilType() == ItemStackRenderState.FoilType.SPECIAL) {
-			RustGalGuiRawImageAssets.Asset glint = RustGalGuiRawImageAssets.resolve(ItemRenderer.ENCHANTED_GLINT_ITEM);
-			if (glint == null) return "glint-texture-unavailable";
+			return "special-foil-native-contract-unavailable";
 		}
 		if (layer.renderType() == null || layer.quads().isEmpty()) return "empty-or-missing-render-type";
 		MaterialMode mode = materialMode(layer.renderType());
 		if (mode == null) return "render-type";
 
 		List<GuiItemMeshQuad> quads = new ArrayList<>(layer.quads().size());
-		Matrix4f combined = new Matrix4f().set(standard3dTransform).mul(new Matrix4f().set(layer.modelTransform()));
 		for (BakedQuad quad : layer.quads()) {
-			GuiItemMeshQuad copied = copyQuad(quad, layer.tintLayers(), combined);
+			GuiItemMeshQuad copied = copyQuad(quad, layer.tintLayers(), sources);
 			if (copied == null) return "unsupported-quad";
 			quads.add(copied);
 		}
-		float[] modelTransform = new float[16];
-		combined.get(modelTransform);
-		output.add(new GuiItemMeshLayer(mode, layer.usesBlockLight(), modelTransform, quads));
+		float[] modelTransform = layer.modelTransform();
+		int sourceFoilType = layer.foilType() == ItemStackRenderState.FoilType.STANDARD ? 1 : 0;
+		output.add(new GuiItemMeshLayer(mode, layer.usesBlockLight(), modelTransform, quads, null, sourceFoilType));
 		if (layer.foilType() == ItemStackRenderState.FoilType.STANDARD) {
 			RustGalGuiRawImageAssets.Asset glint = RustGalGuiRawImageAssets.resolve(ItemRenderer.ENCHANTED_GLINT_ITEM);
 			if (glint == null) return "glint-texture-unavailable";
@@ -147,38 +108,9 @@ public final class GuiItemMeshSemanticCollector {
 			output.add(new GuiItemMeshLayer(MaterialMode.GLINT, false, modelTransform, glintQuads,
 				new net.vulkanic.bridge.VulkanicGalBridge.StandardItemFoilRecord(Util.getMillis(),
 					Minecraft.getInstance().options.glintSpeed().get(),
-					Minecraft.getInstance().options.glintStrength().get().floatValue())));
-		} else if (layer.foilType() == ItemStackRenderState.FoilType.SPECIAL) {
-			RustGalGuiRawImageAssets.Asset glint = RustGalGuiRawImageAssets.resolve(ItemRenderer.ENCHANTED_GLINT_ITEM);
-			List<GuiItemMeshQuad> glintQuads = new ArrayList<>(quads.size());
-			for (GuiItemMeshQuad quad : quads) glintQuads.add(specialFoilQuad(quad, glint.assetId(), combined));
-			output.add(new GuiItemMeshLayer(MaterialMode.GLINT, false, modelTransform, glintQuads));
+					Minecraft.getInstance().options.glintStrength().get().floatValue()), sourceFoilType));
 		}
 		return null;
-	}
-
-	private static GuiItemMeshQuad specialFoilQuad(GuiItemMeshQuad source, long glintAssetId, Matrix4f pose) {
-		Matrix4f inversePose = new Matrix4f(pose).invert();
-		Matrix3f inverseNormal = new Matrix3f(pose).invert();
-		float[] positions = source.positions();
-		int[] normals = source.packedNormals();
-		float[] uvs = new float[8];
-		for (int vertex = 0; vertex < 4; vertex++) {
-			Vector3f projected = inversePose.transformPosition(
-				positions[vertex * 3], positions[vertex * 3 + 1], positions[vertex * 3 + 2], new Vector3f());
-			Vector3f normal = inverseNormal.transform(unpackNormal(normals[vertex]), new Vector3f());
-			Direction direction = Direction.getApproximateNearest(normal.x, normal.y, normal.z);
-			projected.rotateY((float)Math.PI).rotateX((float)(-Math.PI / 2.0)).rotate(direction.getRotation());
-			uvs[vertex * 2] = -projected.x * ItemRenderer.SPECIAL_FOIL_TEXTURE_SCALE;
-			uvs[vertex * 2 + 1] = -projected.y * ItemRenderer.SPECIAL_FOIL_TEXTURE_SCALE;
-		}
-		int strength = Mth.clamp((int)Math.round(Minecraft.getInstance().options.glintStrength().get() * 255.0F), 0, 255);
-		int[] colors = {ARGB.color(strength, 255, 255, 255), ARGB.color(strength, 255, 255, 255), ARGB.color(strength, 255, 255, 255), ARGB.color(strength, 255, 255, 255)};
-		return new GuiItemMeshQuad(glintAssetId, "minecraft:special-glint", positions, uvs, uvs, colors, normals, source.lightFace(), false);
-	}
-
-	private static Vector3f unpackNormal(int packed) {
-		return new Vector3f((byte)(packed & 0xff) / 127.0F, (byte)((packed >>> 8) & 0xff) / 127.0F, (byte)((packed >>> 16) & 0xff) / 127.0F);
 	}
 
 	/** Copies the original geometry/UVs; native material preparation owns foil math. */
@@ -197,24 +129,34 @@ public final class GuiItemMeshSemanticCollector {
 		return name.contains("item") || name.contains("solid") ? MaterialMode.OPAQUE : null;
 	}
 
-	private static GuiItemMeshQuad copyQuad(BakedQuad bakedQuad, int[] tintLayers, Matrix4f modelTransform) {
+	private static GuiItemMeshQuad copyQuad(BakedQuad bakedQuad, int[] tintLayers,
+		List<GuiItemTextureSource> sources) {
 		if (!(bakedQuad instanceof BakedQuadView quad)) return null;
 		TextureAtlasSprite sprite = quad.getSprite();
 		ResourceLocation spriteIdentity = sprite == null ? null : sprite.contents().name();
 		if (sprite == null || spriteIdentity == null) return null;
-		RustGalGuiRawImageAssets.Asset asset = sprite.contents().isAnimated()
-			? RustGalGuiRawImageAssets.resolveAnimatedSprite(sprite)
-			: RustGalGuiRawImageAssets.resolve(spriteIdentity);
-		if (asset == null) {
-			var texture = Minecraft.getInstance().getTextureManager().getTexture(spriteIdentity);
-			if (texture instanceof net.minecraft.client.renderer.texture.DynamicTexture dynamic) {
-				RustGalGuiRawImageAssets.registerDynamicTextureUnstaged(spriteIdentity, dynamic);
-				RustGalGuiRawImageAssets.prepareDynamicTexture(dynamic);
-				asset = RustGalGuiRawImageAssets.resolve(spriteIdentity);
+		long assetId;
+		if (net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
+			var region = net.vulkanic.world.RustGalTerrainRenderer.requireGuiAtlasSpritePayload(sprite);
+			assetId = RustGalGuiRawImageAssets.assetId("gui-atlas-region:"+sprite.atlasLocation()+":"+spriteIdentity);
+			if (sources.stream().noneMatch(source -> source.assetId() == assetId)) {
+				sources.add(new GuiItemTextureSource.Atlas(new GuiAtlasRegion(assetId,region.texture(),
+					region.atlasWidth(),region.atlasHeight(),region.x(),region.y(),region.width(),region.height())));
 			}
+		} else {
+			if (sprite.contents().isAnimated()) return null;
+			RustGalGuiRawImageAssets.Asset asset = RustGalGuiRawImageAssets.resolve(spriteIdentity);
+			if (asset == null) {
+				var texture = Minecraft.getInstance().getTextureManager().getTexture(spriteIdentity);
+				if (texture instanceof net.minecraft.client.renderer.texture.DynamicTexture dynamic) {
+					RustGalGuiRawImageAssets.registerDynamicTextureUnstaged(spriteIdentity, dynamic);
+					RustGalGuiRawImageAssets.prepareDynamicTexture(dynamic);
+					asset = RustGalGuiRawImageAssets.resolve(spriteIdentity);
+				}
+			}
+			if (asset == null) return null;
+			assetId = asset.assetId();
 		}
-		if (asset == null) return null;
-		long assetId = asset.assetId();
 		float[] positions = new float[12];
 		float[] atlasUvs = new float[8];
 		float[] localUvs = new float[8];
@@ -237,38 +179,21 @@ public final class GuiItemMeshSemanticCollector {
 			int uv = index * 2;
 			atlasUvs[uv] = u;
 			atlasUvs[uv + 1] = v;
-			localUvs[uv] = localU(sprite, u);
-			localUvs[uv + 1] = localV(sprite, v);
+			localUvs[uv] = RustGalGuiItemRenderer.itemLocalUv(u,sprite.getU0(),sprite.getU1());
+			localUvs[uv + 1] = RustGalGuiItemRenderer.itemLocalUv(v,sprite.getV0(),sprite.getV1());
 			// Keep this aligned with ItemRenderer's Sodium fast path. Fabric's
 			// current item path does not multiply the baked per-vertex color, so
 			// applying it here would add face shading that Java never renders.
 			colors[index] = standard3dVertexColor(
 				quad.getColor(index), tint, BakedModelEncoder.shouldMultiplyAlpha()
 			);
-			// Match the normal matrix used by the Java item encoder before this
-			// semantic record crosses FFI. Position transforms remain explicit in
-			// the mesh request; normals are already in the item-lighting space.
-			normals[index] = transformGuiNormal(modelTransform, quad.getAccurateNormal(index));
+			// Native layout receives original model-space normals, never a Java raster basis.
+			normals[index] = quad.getAccurateNormal(index);
 		}
 		return new GuiItemMeshQuad(
 			assetId, spriteIdentity.toString(), positions, atlasUvs, localUvs, colors, normals,
 			quad.getLightFace().get3DDataValue(), quad.hasShade()
 		);
-	}
-
-	static int transformGuiNormal(Matrix4f modelTransform, int packedNormal) {
-		Matrix3f normalTransform = new Matrix3f(modelTransform).invert().transpose();
-		return MatrixHelper.transformNormal(normalTransform, false, packedNormal);
-	}
-
-	private static float localU(TextureAtlasSprite sprite, float atlasU) {
-		float width = sprite.getU1() - sprite.getU0();
-		return width == 0.0F ? 0.0F : Mth.clamp((atlasU - sprite.getU0()) / width, 0.0F, 1.0F);
-	}
-
-	private static float localV(TextureAtlasSprite sprite, float atlasV) {
-		float height = sprite.getV1() - sprite.getV0();
-		return height == 0.0F ? 0.0F : Mth.clamp((atlasV - sprite.getV0()) / height, 0.0F, 1.0F);
 	}
 
 	private static int itemTint(BakedQuad quad, int[] tintLayers) {
@@ -315,17 +240,15 @@ public final class GuiItemMeshSemanticCollector {
 
 	public record GuiItemMesh(
 		String itemIdentity, int itemX, int itemY, int left, int top, int right, int bottom,
-		float[] guiPose, int renderWidth, int renderHeight, int guardPixels, float[] offscreenModelTransform,
-		List<GuiItemMeshLayer> layers, List<RustGalGuiRawImageAssets.Asset> assets
+		float[] guiPose,
+		List<GuiItemMeshLayer> layers, List<GuiItemTextureSource> sources,
+		net.vulkanic.bridge.VulkanicGalBridge.GuiBlockItemRasterRecord blockItemRaster
 	) {
 		public GuiItemMesh {
 			guiPose = checkedCopy(guiPose, 6, "GUI item pose");
-			if (renderWidth <= 0 || renderHeight <= 0 || guardPixels < 0 || guardPixels * 2 >= renderWidth || guardPixels * 2 >= renderHeight) {
-				throw new IllegalArgumentException("GUI item mesh has an invalid standard-3D target extent");
-			}
-			offscreenModelTransform = checkedCopy(offscreenModelTransform, 16, "GUI item offscreen model transform");
+			if (blockItemRaster == null) throw new IllegalArgumentException("GUI block mesh requires native model bounds and scale");
 			layers = List.copyOf(layers);
-			assets = List.copyOf(assets);
+			sources = List.copyOf(sources);
 		}
 
 		@Override
@@ -333,29 +256,19 @@ public final class GuiItemMeshSemanticCollector {
 			return this.guiPose.clone();
 		}
 
-		@Override
-		public float[] offscreenModelTransform() {
-			return this.offscreenModelTransform.clone();
-		}
-	}
-
-	private record Standard3dTarget(int width, int height, int guardPixels, float[] modelTransform) {
-		private Standard3dTarget {
-			modelTransform = checkedCopy(modelTransform, 16, "standard-3D item model transform");
-		}
-
-		@Override
-		public float[] modelTransform() {
-			return this.modelTransform.clone();
-		}
 	}
 
 	public record GuiItemMeshLayer(MaterialMode materialMode, boolean blockLight, float[] modelTransform, List<GuiItemMeshQuad> quads,
-		net.vulkanic.bridge.VulkanicGalBridge.StandardItemFoilRecord itemFoil) {
+		net.vulkanic.bridge.VulkanicGalBridge.StandardItemFoilRecord itemFoil, int sourceFoilType) {
+		public GuiItemMeshLayer(MaterialMode materialMode, boolean blockLight, float[] modelTransform, List<GuiItemMeshQuad> quads,
+			net.vulkanic.bridge.VulkanicGalBridge.StandardItemFoilRecord itemFoil) {
+			this(materialMode, blockLight, modelTransform, quads, itemFoil, 0);
+		}
 		public GuiItemMeshLayer(MaterialMode materialMode, boolean blockLight, float[] modelTransform, List<GuiItemMeshQuad> quads) {
 			this(materialMode, blockLight, modelTransform, quads, null);
 		}
 		public GuiItemMeshLayer {
+			if (sourceFoilType < 0 || sourceFoilType > 1) throw new IllegalArgumentException("unsupported source item foil type");
 			if (itemFoil != null && materialMode != MaterialMode.GLINT) throw new IllegalArgumentException("foil requires glint layer");
 			modelTransform = checkedCopy(modelTransform, 16, "GUI item model transform");
 			quads = List.copyOf(quads);

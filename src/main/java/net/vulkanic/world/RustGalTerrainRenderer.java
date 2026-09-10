@@ -1640,10 +1640,7 @@ public final class RustGalTerrainRenderer {
 	}
 
 	/** Semantic region in the same copied atlas used by terrain; no per-item image copy. */
-	public record GuiAtlasSpritePayload(VulkanicGalBridge.WorldMeshTextureAssetRecord texture,
-		int atlasWidth, int atlasHeight, int x, int y, int width, int height) {}
-
-	public static GuiAtlasSpritePayload requireGuiAtlasSpritePayload(TextureAtlasSprite sprite) {
+	public static AtlasSpritePayload requireGuiAtlasSpritePayload(TextureAtlasSprite sprite) {
 		TextureAtlas atlas = Minecraft.getInstance().getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS);
 		if (sprite == null || atlas.getSprite(sprite.contents().name()) != sprite) {
 			throw new IllegalStateException("GUI sprite does not belong to the current block atlas");
@@ -1656,7 +1653,7 @@ public final class RustGalTerrainRenderer {
 				|| atlas.getSprite(sprite.contents().name()) != sprite) {
 				throw new IllegalStateException("GUI atlas changed during semantic collection");
 			}
-			return new GuiAtlasSpritePayload(publishedWorldMeshAtlasPayload, atlas.width, atlas.height,
+			return new AtlasSpritePayload(publishedWorldMeshAtlasPayload, atlas.width, atlas.height,
 				sprite.getX(), sprite.getY(), sprite.contents().width(), sprite.contents().height());
 		}
 	}
@@ -1847,7 +1844,7 @@ public final class RustGalTerrainRenderer {
 				// that the Rust frontend cannot consume.
 				long atlasGenerationForRegistration = atlasGeneration;
 				RustGalWorldPrimitiveRenderer.registerStaticTerrainMeshAsset(
-					asset.asset(), atlasTextureUpdatePayload(), layer == ChunkSectionLayer.TRANSLUCENT
+					asset.asset(), atlasTextureUpdatePayload(waterTextureBinding(WorldRenderRoutePolicy.currentStaticTerrainRoute())), layer == ChunkSectionLayer.TRANSLUCENT
 				);
 				confirmAtlasPayloadRegistered(atlasGenerationForRegistration);
 				SECTION_ASSETS.put(new LayerKey(output.render.getPosition().asLong(), layer), asset);
@@ -2122,9 +2119,7 @@ public final class RustGalTerrainRenderer {
 				mesh.getPrimitiveMetadata(),
 				vertices,
 				vertexCount,
-				AtlasAnimationResource.privateTickDeliveryEnabled()
-					&& WorldRenderRoutePolicy.currentStaticTerrainRoute().usesRustWholeFrameVulkan()
-					? WaterTextureBinding.BLOCK_ATLAS : WaterTextureBinding.SEPARATE_SHEETS
+				waterTextureBinding(WorldRenderRoutePolicy.currentStaticTerrainRoute())
 			);
 			if (orderedTranslucentMesh.retainedIndexCount() == 0) {
 				return null;
@@ -2359,6 +2354,14 @@ public final class RustGalTerrainRenderer {
 
 	/** Resource binding only: animation clocks and uploads remain owned by Rust. */
 	enum WaterTextureBinding { BLOCK_ATLAS, SEPARATE_SHEETS }
+
+	static WaterTextureBinding waterTextureBinding(WorldRenderRoutePolicy.Route route) {
+		// The whole-frame route publishes the owned block atlas unconditionally.
+		// Water must consume that same resource, with its declared mip chain and
+		// visibility-driven animation, rather than an independently animated sheet.
+		return route.usesRustWholeFrameVulkan()
+			? WaterTextureBinding.BLOCK_ATLAS : WaterTextureBinding.SEPARATE_SHEETS;
+	}
 
 	static OrderedTranslucentMesh buildOrderedTranslucentMesh(byte[] sourceSortedIndexBytes,
 			int[] primitiveMetadata, List<VulkanicGalBridge.WorldMeshVertexRecord> vertices, int vertexCount) {
@@ -3632,7 +3635,7 @@ public final class RustGalTerrainRenderer {
 		return hash == 0L ? 1L : hash;
 	}
 
-	private static List<VulkanicGalBridge.WorldMeshTextureAssetRecord> atlasTextureUpdatePayload() {
+	static List<VulkanicGalBridge.WorldMeshTextureAssetRecord> atlasTextureUpdatePayload(WaterTextureBinding waterBinding) {
 		byte[] payload = atlasPayload;
 		long generation = atlasGeneration;
 		if (payload == null || registeredAtlasGeneration == generation) {
@@ -3666,13 +3669,15 @@ public final class RustGalTerrainRenderer {
 					specularAtlasPayload
 				));
 			}
-			if (waterStillAsset != null) {
+			// Atlas-bound water shares the explicit terrain resource. Do not
+			// publish unused separate sheets into the Rust GPU resource registry.
+			if (waterBinding == WaterTextureBinding.SEPARATE_SHEETS && waterStillAsset != null) {
 				records.add(waterStillAsset.textureRecord());
 			}
-			if (waterFlowAsset != null) {
+			if (waterBinding == WaterTextureBinding.SEPARATE_SHEETS && waterFlowAsset != null) {
 				records.add(waterFlowAsset.textureRecord());
 			}
-			if (waterOverlayAsset != null) {
+			if (waterBinding == WaterTextureBinding.SEPARATE_SHEETS && waterOverlayAsset != null) {
 				records.add(waterOverlayAsset.textureRecord());
 			}
 			return records;

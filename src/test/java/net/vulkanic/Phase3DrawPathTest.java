@@ -7665,14 +7665,17 @@ public class Phase3DrawPathTest {
     }
 
     @Test
-    public void testRustExperienceOrbRejectsNonFiniteBillboardTransform() throws IOException {
+    public void testRustExperienceOrbValidatesTypedPlacementWithoutJavaGeometry() throws IOException {
         String renderer = readSource(SRC_MAIN_JAVA.resolve(
                 "net/vulkanic/world/RustGalWorldPrimitiveRenderer.java"));
-        int orb = renderer.indexOf("public static boolean enqueueExperienceOrb(");
-        int pose = renderer.indexOf("!pose.pose().isFinite()", orb);
-        int transformed = renderer.indexOf("Rust experience-orb transformed billboard vertices must be finite", pose);
-        assertTrue(orb >= 0 && pose > orb && transformed > pose,
-                "Rust experience-orb semantic publication must validate copied transforms and transformed vertices");
+        String bridge = readSource(SRC_MAIN_JAVA.resolve("net/vulkanic/bridge/VulkanicGalBridge.java"));
+        assertTrue(renderer.contains("ORB_SEMANTICS.enqueue(state.icon, red, blue, state.lightCoords,"));
+        assertFalse(renderer.contains("public static boolean enqueueExperienceOrb("));
+        int record = bridge.indexOf("public record WorldExperienceOrbInstanceRecord(");
+        int pose = bridge.indexOf("orb entity transform must be finite", record);
+        int rotation = bridge.indexOf("orb camera orientation must be finite", pose);
+        assertTrue(record >= 0 && pose > record && rotation > pose,
+                "typed semantic publication must reject non-finite parent transforms and camera rotations");
     }
 
     @Test

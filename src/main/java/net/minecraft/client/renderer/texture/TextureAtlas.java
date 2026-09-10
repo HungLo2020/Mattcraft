@@ -140,13 +140,16 @@ public class TextureAtlas extends AbstractTexture implements Dumpable, Tickable,
 			this.animatedTextures = List.copyOf(list2);
 			if (rustWholeFrame && (LOCATION_BLOCKS.equals(this.location)
 				|| LOCATION_PARTICLES.equals(this.location)
-					&& net.vulkanic.world.AtlasAnimationResource.privateTickDeliveryEnabled())) {
+				|| net.vulkanic.world.AtlasAnimationResource.privateShieldLifecycleEnabled()
+					&& net.minecraft.client.renderer.Sheets.SHIELD_SHEET.equals(this.location))) {
 				// The incarnation starts with atlas upload, before any resource lookup
 				// or world publication can lose its semantic sprite-use events.
 				var resource = new net.vulkanic.world.AtlasAnimationResource(this.location,
 					LOCATION_BLOCKS.equals(this.location)
 						? net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_TERRAIN_BLOCK_ATLAS
-						: net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_PARTICLE_ATLAS,
+						: LOCATION_PARTICLES.equals(this.location)
+							? net.vulkanic.world.RustGalWorldPrimitiveRenderer.MATERIAL_TEXTURE_PARTICLE_ATLAS
+							: net.vulkanic.world.RustGalWorldPrimitiveRenderer.shieldAtlasTextureId(),
 					this.semanticAnimationSource());
 				for (var declaration : resource.source().sprites()) {
 					this.texturesByName.get(declaration.name()).bindSemanticAnimationResource(resource);
@@ -237,9 +240,9 @@ public class TextureAtlas extends AbstractTexture implements Dumpable, Tickable,
 			|| net.vulkanic.VulkanicAPI.isVulkanBackendSelected()) {
 			// Vulkan animation clocks belong to Rust. Even a stale OpenGL ticker
 			// must not select Java frames after backend selection changes. Live
-			// semantic tick delivery remains private while consumer parity is tested.
-			if (net.vulkanic.world.AtlasAnimationResource.privateTickDeliveryEnabled()
-				&& this.semanticAnimationResource != null) {
+			// block-atlas events progress independently of which draw consumes them.
+			if (this.semanticAnimationResource != null
+				&& this.semanticAnimationResource.tickDeliveryEnabled()) {
 				this.semanticAnimationResource.enqueueNextTick(
 					net.sodium.client.SodiumClientMod.options().performance.animateOnlyVisibleTextures);
 			}

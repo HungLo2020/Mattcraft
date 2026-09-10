@@ -19,6 +19,7 @@ import net.vulkanic.gui.RustGalGuiRenderer;
 import net.vulkanic.world.RustGalWorldPrimitiveRenderer;
 import net.vulkanic.world.WorldRenderRoutePolicy;
 import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -1659,7 +1660,7 @@ class VulkanicGalBridgeAbiTest {
 	}
 
 	@Test
-	void experienceOrbRouteUsesOnlyTheSharedSemanticMaterialPath() throws Exception {
+	void experienceOrbRouteUsesOnlyTypedRustGeometry() throws Exception {
 		String routePolicy = Files.readString(Path.of("src/main/java/net/vulkanic/world/WorldRenderRoutePolicy.java"));
 		String orbRenderer = Files.readString(Path.of("src/main/java/net/minecraft/client/renderer/entity/ExperienceOrbRenderer.java"));
 		String levelRenderer = Files.readString(Path.of("src/main/java/net/minecraft/client/renderer/LevelRenderer.java"));
@@ -1670,17 +1671,21 @@ class VulkanicGalBridgeAbiTest {
 		assertTrue(routePolicy.contains("currentExperienceOrbRoute()"));
 		assertTrue(routePolicy.contains("mattmc.dev.rustGalWorldExperienceOrb.disabled"));
 		assertTrue(routePolicy.contains("selectShaderAffectedRoute(VulkanicAPI.isVulkanBackendSelected(), rustWholeFrameShellActive())"));
-		assertTrue(orbRenderer.contains("enqueueExperienceOrb("));
-		assertTrue(orbRenderer.contains("boolean rustWholeFrame = route.usesRustWholeFrameVulkan()"));
-		assertTrue(orbRenderer.contains("!submitNodeCollector.isSemanticCoverageOnly() && rustWholeFrame"));
-		assertTrue(orbRenderer.contains("Rust whole-frame experience-orb route selected without a semantic material request"));
+		assertTrue(orbRenderer.contains("enqueueNativeExperienceOrb(poseStack.last(), experienceOrbRenderState,"));
+		assertTrue(orbRenderer.indexOf("enqueueNativeExperienceOrb(") < orbRenderer.indexOf("poseStack.pushPose()"),
+			"Rust must receive the parent transform before Java billboard expansion");
+		assertFalse(orbRenderer.contains("enqueueExperienceOrb("));
+		assertFalse(worldRenderer.contains("enqueueExperienceOrb("));
+		assertFalse(worldRenderer.contains("\"mattmc.dev.nativeExperienceOrbGeometry\""),
+			"the former private flag must not reopen Java-expanded Vulkan rendering");
+		assertTrue(orbRenderer.contains("Rust whole-frame experience-orb route is unavailable while Rust owns presentation"));
 		assertTrue(orbRenderer.contains("RustGalVulkanWholeFrameMode.enabled()"));
 		assertTrue(orbRenderer.contains("!submitNodeCollector.isSemanticCoverageOnly()"));
 		assertTrue(levelRenderer.contains("boolean experienceOrbs = net.vulkanic.world.WorldRenderRoutePolicy.currentExperienceOrbRoute().usesRustWholeFrameVulkan();"));
 		assertTrue(levelRenderer.contains("experienceOrbs && entityRenderState instanceof ExperienceOrbRenderState"));
 		assertTrue(worldRenderer.contains("MATERIAL_TEXTURE_EXPERIENCE_ORB"));
 		assertTrue(worldRenderer.contains("MATERIAL_MODE_TRANSLUCENT"));
-		assertTrue(worldRenderer.contains("Rust VulkanicGAL ExperienceOrb requires a seeded bounded world primitive frame"));
+		assertTrue(worldRenderer.contains("ensureBoundedWorldPrimitiveViewportLocked(\"native orb requires a seeded frame\")"));
 		assertTrue(worldRenderer.contains("recordWholeFrameExperienceOrbExecution"));
 		assertTrue(coordinator.contains("recordWholeFrameExperienceOrbExecution("));
 		assertTrue(capture.contains("setupExperienceOrbScenario"));
@@ -2010,7 +2015,13 @@ class VulkanicGalBridgeAbiTest {
 		assertTrue(rustMeshFrontend.contains("(WORLD_CULL_BACK, WORLD_WINDING_CW) => Ok(CullMode::Front)"));
 		assertTrue(rustOpenGlLowering.contains(".front_face(if front_face_ccw { glow::CCW } else { glow::CW })"),
 			"OpenGL backend must apply the explicit GAL front-face convention instead of inheriting Java/Iris state");
-		assertTrue(rustVulkanResources.contains(".front_face(front_face(desc.front_face))"));
+		assertTrue(rustVulkanResources.contains(".front_face(front_face(match (desc.front_face, desc.raster_y_direction)"),
+			"Vulkan must lower the explicit logical front face together with the declared raster direction");
+		assertTrue(rustVulkanResources.contains("(face, RasterYDirection::Up) => face"),
+			"the existing Up convention must preserve logical winding");
+		assertTrue(rustVulkanResources.contains("(crate::render::vulkanic::resources::FrontFace::Clockwise, RasterYDirection::Down) => crate::render::vulkanic::resources::FrontFace::CounterClockwise"));
+		assertTrue(rustVulkanResources.contains("(crate::render::vulkanic::resources::FrontFace::CounterClockwise, RasterYDirection::Down) => crate::render::vulkanic::resources::FrontFace::Clockwise"),
+			"Down must compensate both windings so logical culling does not change");
 		assertTrue(rustVulkanResources.contains("FrontFace::CounterClockwise"));
 		assertTrue(rustVulkanResources.contains("vk::FrontFace::COUNTER_CLOCKWISE"));
 	}
@@ -2371,10 +2382,10 @@ class VulkanicGalBridgeAbiTest {
 		assertTrue(terrainRenderer.contains("acceptChunkSortOutput"));
 		assertTrue(renderSectionManager.contains("RustGalTerrainRenderer.acceptChunkSortOutput(sortOutput)"));
 		assertTrue(terrainRenderer.contains("registeredAtlasGeneration"));
-		assertTrue(terrainRenderer.contains("atlasTextureUpdatePayload()"));
+		assertTrue(terrainRenderer.contains("atlasTextureUpdatePayload(waterTextureBinding(WorldRenderRoutePolicy.currentStaticTerrainRoute()))"));
 		assertTrue(terrainRenderer.contains("the same semantic atlas cannot acquire a different"),
 			"eager and section-triggered terrain atlas publication must retain one explicit sampled-row contract");
-		assertFalse(terrainRenderer.substring(terrainRenderer.indexOf("private static List<VulkanicGalBridge.WorldMeshTextureAssetRecord> atlasTextureUpdatePayload()"))
+		assertFalse(terrainRenderer.substring(terrainRenderer.indexOf("static List<VulkanicGalBridge.WorldMeshTextureAssetRecord> atlasTextureUpdatePayload(WaterTextureBinding waterBinding)"))
 			.contains("WORLD_MESH_TEXTURE_COORDINATE_ORIGIN_MINECRAFT_TOP_LEFT"),
 			"section-triggered terrain atlas publication must not invert rows relative to eager whole-frame publication");
 			assertTrue(terrainRenderer.contains("vertex.colorArgb()"));
@@ -2474,8 +2485,10 @@ class VulkanicGalBridgeAbiTest {
 				"TerrainParticle must track alpha-test semantics separately from Iris opaque particle-layer routing");
 			assertTrue(terrainParticle.contains("|| type == net.minecraft.client.renderer.chunk.ChunkSectionLayer.CUTOUT_MIPPED"),
 				"cutout and cutout-mipped block particles must be recognized before Rust material submission");
-			assertTrue(terrainParticle.contains("!this.alphaTested"),
-				"leaf/cutout TerrainParticles must submit Rust cutout material mode so transparent texels discard instead of rendering black");
+			assertTrue(terrainParticle.contains("this.alphaTested ? net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_CUTOUT")
+				&& terrainParticle.contains("this.isOpaque ? net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_OPAQUE")
+				&& terrainParticle.contains(": net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_TRANSLUCENT"),
+				"terrain callsites must distinguish cutout, opaque and translucent block semantics before Rust policy selection");
 		}
 
 	@Test
@@ -3745,11 +3758,14 @@ class VulkanicGalBridgeAbiTest {
 	void rustWholeFrameItemHandoffCannotReachJavaSpecialRendererBeforeSelection() throws Exception {
 		String source = Files.readString(Path.of("src/main/java/net/minecraft/client/renderer/item/ItemStackRenderState.java"));
 		int submit = source.indexOf("void submit(PoseStack poseStack");
-		int gate = source.indexOf("if (selectedVulkan || rustWholeFrameHandoff || indexedItemScope)", submit);
+		int gate = source.indexOf("if (!submitNodeCollector.isSemanticCoverageOnly()", submit);
+		int ownershipInputs = source.indexOf("&& (selectedVulkan || rustWholeFrameHandoff || indexedItemScope)", gate);
 		int handoff = source.indexOf("Rust whole-frame item route requires Vulkan selection", gate);
 		int special = source.indexOf("this.specialRenderer.submit(", handoff);
 		assertTrue(submit >= 0 && gate > submit && handoff > gate && special > handoff,
 			"item submission must reject the pre-selection handoff before any Java special renderer call");
+		assertTrue(ownershipInputs > gate && ownershipInputs < handoff,
+			"only non-drawing coverage replay may bypass native item ownership");
 	}
 
 	@Test
@@ -4102,7 +4118,7 @@ class VulkanicGalBridgeAbiTest {
 		String experienceBar = Files.readString(Path.of("src/main/java/net/minecraft/client/gui/contextualbar/ExperienceBarRenderer.java"));
 		String bossOverlay = Files.readString(Path.of("src/main/java/net/minecraft/client/gui/components/BossHealthOverlay.java"));
 
-		assertEquals(42, VulkanicGalBridge.ABI_VERSION);
+		assertEquals(54, VulkanicGalBridge.ABI_VERSION);
 		assertTrue(bridge.contains("GUI_TILED_QUAD_REQUEST(101)"));
 		assertTrue(bridge.contains("Struct.WHOLE_FRAME_SUBMIT.setFloat(request, 34, guiProjection.width())"));
 		assertTrue(bridge.contains("Struct.GUI_FRAME_SUBMIT.setFloat(request, 10, guiProjection.width())"));

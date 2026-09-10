@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.nio.file.Files;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -417,6 +418,31 @@ public class RustGalTerrainRendererLightingContractTest {
 	}
 
 	@Test
+	public void normalVulkanWaterBindingDoesNotDependOnPrivateAnimationAdmission() throws Exception {
+		String property = "mattmc.dev.rustGalAtlasAnimation";
+		String previous = System.getProperty(property);
+		try {
+			for (String value : new String[] { "false", "true" }) {
+				System.setProperty(property, value);
+				for (var route : WorldRenderRoutePolicy.Route.values()) {
+					assertEquals(route.usesRustWholeFrameVulkan()
+						? RustGalTerrainRenderer.WaterTextureBinding.BLOCK_ATLAS
+						: RustGalTerrainRenderer.WaterTextureBinding.SEPARATE_SHEETS,
+						RustGalTerrainRenderer.waterTextureBinding(route));
+				}
+			}
+			System.clearProperty(property);
+			assertEquals(RustGalTerrainRenderer.WaterTextureBinding.BLOCK_ATLAS,
+				RustGalTerrainRenderer.waterTextureBinding(WorldRenderRoutePolicy.Route.RUST_VULKAN_WHOLE_FRAME));
+			String source = Files.readString(Path.of("src/main/java/net/vulkanic/world/RustGalTerrainRenderer.java"));
+			assertTrue(source.contains("waterTextureBinding(WorldRenderRoutePolicy.currentStaticTerrainRoute())"));
+			assertFalse(source.contains("AtlasAnimationResource.privateTickDeliveryEnabled()"));
+		} finally {
+			if (previous == null) System.clearProperty(property); else System.setProperty(property, previous);
+		}
+	}
+
+	@Test
 	public void atlasWaterPreservesSortedGeometryAndMaterialWithoutSheetUvRemapping() {
 		RustGalTerrainRenderer.installTestingFluidSpriteAssetsForUnitTests();
 		List<VulkanicGalBridge.WorldMeshVertexRecord> vertices = testVertices(3);
@@ -426,7 +452,7 @@ public class RustGalTerrainRendererLightingContractTest {
 			NativeSectionMeshBuilder.PRIMITIVE_KIND_BUILTIN_WATER,
 			NativeSectionMeshBuilder.PRIMITIVE_KIND_NON_FLUID_TRANSLUCENT,
 			NativeSectionMeshBuilder.PRIMITIVE_KIND_BUILTIN_WATER), vertices, 12,
-			RustGalTerrainRenderer.WaterTextureBinding.BLOCK_ATLAS);
+			RustGalTerrainRenderer.waterTextureBinding(WorldRenderRoutePolicy.Route.RUST_VULKAN_WHOLE_FRAME));
 		assertArrayEquals(sorted, mesh.indexBytes());
 		assertEquals(3, mesh.sections().size());
 		assertEquals(1, mesh.waterStillPrimitiveCount());

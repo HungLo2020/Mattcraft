@@ -8,6 +8,55 @@ import gui_foil_reference as reference
 
 
 class TemporalFoilReferenceTests(unittest.TestCase):
+    def test_filter_discrimination_rejects_insensitive_fixture_without_relaxing_pixels(self):
+        # Actual Frozen source receipts: r325 small and r321 wide sprites.
+        source={"positions":[0,1,.53125,0,0,.53125,1,0,.53125,1,1,.53125],
+                "atlasUvs":[.375,.8359375,.375,.8515625,.3828125,.8515625,.3828125,.8359375]}
+        self.assertFalse(reference.sampler_filter_discrimination(source,2)["passed"])
+        source["atlasUvs"]=[.28125,.4140625,.28125,.6640625,.40625,.6640625,.40625,.4140625]
+        result=reference.sampler_filter_discrimination(source,2)
+        self.assertTrue(result["passed"])
+        self.assertEqual(7,max(p["max_difference"] for p in result["probes"]))
+
+    def test_sampler_modes_at_centers_edges_and_outside_texture(self):
+        pixel = lambda x, y: reference.pattern_pixel(x, y)[:3]
+        for blur in (False, True):
+            for clamp in (False, True):
+                for x, y in ((0, 0), (7, 8), (15, 15)):
+                    self.assertEqual(pixel(x, y), reference.sample_pattern(
+                        ((x+.5)/16, (y+.5)/16), blur=blur, clamp=clamp))
+            self.assertEqual(pixel(0, 15), reference.sample_pattern(
+                (-100, 100), blur=blur, clamp=True))
+            self.assertEqual(reference.sample_pattern((.125, .375), blur=blur),
+                             reference.sample_pattern((-1.875, 3.375), blur=blur))
+        self.assertEqual(pixel(0, 0), reference.sample_pattern((0, 0), blur=False))
+        self.assertEqual(pixel(15, 15), reference.sample_pattern((1, 1), blur=False, clamp=True))
+        # Repeat bilinear at the origin mixes all four corners; clamp does not.
+        average = tuple(sum(pixel(x, y)[c] for x, y in
+            ((0, 0), (0, 15), (15, 0), (15, 15)))/4 for c in range(3))
+        self.assertEqual(average, reference.sample_pattern((0, 0)))
+        self.assertEqual(pixel(0, 0), reference.sample_pattern((0, 0), clamp=True))
+        self.assertNotEqual(average, pixel(0, 0))
+
+    def test_sampler_rejects_nonfinite_coordinates_and_untyped_metadata(self):
+        for uv in ((float('nan'), 0), (0, float('inf')), (0,)):
+            with self.assertRaises(ValueError):
+                reference.sample_pattern(uv)
+        for metadata in ({'blur': 1}, {'clamp': 'false'}, {'blur': None}):
+            with self.assertRaises(ValueError):
+                reference.sample_pattern((0, 0), **metadata)
+
+    def test_hand_timing_requires_one_capture_local_in_phase_observation(self):
+        import copy
+        receipt={"hand":{"enabled":True,"complete":True,"frameSequence":12,"scaledTicks":[340128]}}
+        self.assertEqual(340128,reference.hand_timing_evidence(receipt,10000))
+        for key,value in (("enabled",False),("complete",False),("frameSequence",0),
+                          ("scaledTicks",[]),("scaledTicks",[340128,340129]),
+                          ("scaledTicks",[10513]),("scaledTicks",[9999]),("scaledTicks",[True])):
+            invalid=copy.deepcopy(receipt); invalid["hand"][key]=value
+            with self.assertRaises(ValueError): reference.hand_timing_evidence(invalid,10000)
+        with self.assertRaises(ValueError): reference.hand_timing_evidence({},10000)
+
     def test_moving_pixel_oracle_rejects_two_identical_stale_frames(self):
         import tempfile
         from PIL import Image

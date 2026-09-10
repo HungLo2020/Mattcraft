@@ -14,6 +14,11 @@ public final class GraphicsAuditAtlasParticleFixture {
     public static final ResourceLocation SPRITE = ResourceLocation.withDefaultNamespace("flame");
     private GraphicsAuditAtlasParticleFixture() {}
     public static boolean requested() { return Boolean.getBoolean("mattmc.dev.graphicsAuditAtlasParticle"); }
+    public static int requestedSizeSign() {
+        int sign = Integer.parseInt(System.getProperty("mattmc.dev.graphicsAuditAtlasParticleSizeSign", "1"));
+        if (sign != -1 && sign != 1) throw new IllegalArgumentException("particle fixture size sign must be -1 or 1");
+        return sign;
+    }
     public static boolean staticRequested() {
         return requested() && Boolean.getBoolean("mattmc.dev.graphicsAuditAtlasParticleStatic");
     }
@@ -50,7 +55,7 @@ public final class GraphicsAuditAtlasParticleFixture {
         particle.gravity = 0; particle.friction = 1; particle.hasPhysics = false;
         // Keep ordinary float lifetime scaling exactly unchanged throughout a
         // bounded capture; a million ticks still changes its last size bit.
-        particle.quadSize = 0.35F; particle.lifetime = Integer.MAX_VALUE;
+        particle.quadSize = 0.35F * requestedSizeSign(); particle.lifetime = Integer.MAX_VALUE;
         particle.rCol = particle.gCol = particle.bCol = particle.alpha = 1;
     }
 
@@ -68,6 +73,8 @@ public final class GraphicsAuditAtlasParticleFixture {
         position.add(particle.x); position.add(particle.y); position.add(particle.z);
         result.add("position", position);
         result.addProperty("size", particle.getQuadSize(1));
+        result.addProperty("sizeSign", requestedSizeSign());
+        result.addProperty("layer", particle.getLayer() == SingleQuadParticle.Layer.OPAQUE ? "OPAQUE" : "OTHER");
         result.addProperty("light", particle.getLightColor(1));
         result.addProperty("color", 0xffffffff);
         if (staticRequested()) {

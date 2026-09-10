@@ -293,8 +293,8 @@ impl OpenGlObjects {
     }
 
     fn create_buffer(&self, desc: &BufferDesc, token: BackendToken) -> GalResult<BufferObject> {
-        let size = usize::try_from(desc.size)
-            .map_err(|_| GalError::backend("OpenGL buffer size exceeds addressable memory"))?;
+        let size = i32::try_from(desc.size)
+            .map_err(|_| GalError::backend("OpenGL buffer size exceeds i32"))?;
         let buffer = unsafe { self.gl.create_buffer() }.map_err(|error| {
             GalError::backend(format!("failed to create OpenGL buffer: {error}"))
         })?;
@@ -302,8 +302,7 @@ impl OpenGlObjects {
             self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, Some(buffer));
             self.gl.buffer_data_size(
                 glow::COPY_WRITE_BUFFER,
-                i32::try_from(size)
-                    .map_err(|_| GalError::backend("OpenGL buffer size exceeds i32"))?,
+                size,
                 glow::DYNAMIC_DRAW,
             );
             self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
@@ -312,7 +311,6 @@ impl OpenGlObjects {
             token,
             buffer,
             size: desc.size,
-            shadow: vec![0; size],
         })
     }
 
@@ -534,6 +532,8 @@ impl OpenGlObjects {
             topology: desc.topology,
             cull_mode: desc.cull_mode,
             front_face: desc.front_face,
+            provoking_vertex: desc.provoking_vertex,
+            raster_y_direction: desc.raster_y_direction,
             blend: desc.blend,
             depth_compare: desc.depth_compare,
             depth_write: desc.depth_write,
@@ -613,7 +613,11 @@ impl OpenGlObjects {
                 let texture = self.texture(view_object.texture)?;
                 self.gl.framebuffer_texture_2d(
                     glow::FRAMEBUFFER,
-                    glow::DEPTH_ATTACHMENT,
+                    if texture.format == TextureFormat::Depth24Stencil8 {
+                        glow::DEPTH_STENCIL_ATTACHMENT
+                    } else {
+                        glow::DEPTH_ATTACHMENT
+                    },
                     glow::TEXTURE_2D,
                     Some(texture.texture),
                     i32::try_from(view_object.base_mip)
@@ -859,7 +863,6 @@ pub(super) struct BufferObject {
     pub(super) token: BackendToken,
     pub(super) buffer: glow::Buffer,
     pub(super) size: u64,
-    pub(super) shadow: Vec<u8>,
 }
 
 #[allow(dead_code)]
@@ -936,6 +939,8 @@ pub(super) struct GraphicsPipelineObject {
     pub(super) topology: PrimitiveTopology,
     pub(super) cull_mode: CullMode,
     pub(super) front_face: crate::render::vulkanic::resources::FrontFace,
+    pub(super) provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex,
+    pub(super) raster_y_direction: crate::render::vulkanic::resources::RasterYDirection,
     pub(super) blend: BlendMode,
     pub(super) depth_compare: Option<CompareOp>,
     pub(super) depth_write: bool,
@@ -1228,6 +1233,7 @@ layout(binding = 4) uniform sampler2D ShadowDepthTex;
 
     #[test]
     fn opengl_program_interface_aliases_include_owned_mesh_blocks() {
+        assert!(uniform_block_names(1).iter().any(|name| name == "GuiMeshFrame"));
         assert!(
             storage_block_names(0)
                 .iter()
@@ -1248,6 +1254,18 @@ layout(binding = 4) uniform sampler2D ShadowDepthTex;
                 .iter()
                 .any(|name| name == "CompositeShadowUniforms")
         );
+    }
+
+    #[test]
+    fn opengl_depth24_stencil8_preserves_packed_attachment_format() {
+        let format = texture_format(TextureFormat::Depth24Stencil8).unwrap();
+        assert_eq!(format.internal, glow::DEPTH24_STENCIL8 as i32);
+        assert_eq!(format.external, glow::DEPTH_STENCIL);
+        assert_eq!(format.ty, glow::UNSIGNED_INT_24_8);
+        assert_eq!(format.bytes_per_pixel, 4);
+        assert!(!format.integer);
+        // Host transfers still require an explicit aspect contract in GAL.
+        assert_eq!(TextureFormat::Depth24Stencil8.copy_bytes_per_texel(), None);
     }
 }
 
@@ -1287,6 +1305,13 @@ pub(super) fn texture_format(format: TextureFormat) -> GalResult<GlTextureFormat
             internal: glow::DEPTH_COMPONENT32F as i32,
             external: glow::DEPTH_COMPONENT,
             ty: glow::FLOAT,
+            bytes_per_pixel: 4,
+            integer: false,
+        }),
+        TextureFormat::Depth24Stencil8 => Ok(GlTextureFormat {
+            internal: glow::DEPTH24_STENCIL8 as i32,
+            external: glow::DEPTH_STENCIL,
+            ty: glow::UNSIGNED_INT_24_8,
             bytes_per_pixel: 4,
             integer: false,
         }),
@@ -1332,7 +1357,7 @@ pub(super) fn texture_format(format: TextureFormat) -> GalResult<GlTextureFormat
             bytes_per_pixel: 4,
             integer: false,
         }),
-        TextureFormat::Bgra8Unorm | TextureFormat::Depth24Stencil8 => Err(GalError::backend(
+        TextureFormat::Bgra8Unorm => Err(GalError::backend(
             format!("OpenGL texture format {format:?} is not supported in the isolated path"),
         )),
     }
@@ -1586,6 +1611,7 @@ fn uniform_block_names(binding: u32) -> Vec<String> {
             "Projection".to_string(),
         ],
         1 => vec![
+            "GuiMeshFrame".to_string(),
             "WorldMeshInstance".to_string(),
             "DistantHorizonsLodFrame".to_string(),
             "Uniforms1".to_string(),

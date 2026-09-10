@@ -28,7 +28,12 @@ public class TridentSpecialRenderer implements NoDataSpecialModelRenderer {
 	public void submit(ItemDisplayContext itemDisplayContext, PoseStack poseStack, SubmitNodeCollector submitNodeCollector, int i, int j, boolean bl, int k) {
 		poseStack.pushPose();
 		poseStack.scale(1.0F, -1.0F, -1.0F);
-		if (!bl) {
+		if (submitNodeCollector.isSemanticCoverageOnly()) {
+			// Coverage/text replay observes the original submission, never enqueues
+			// another native foil draw or captures Iris rendering state.
+			submitNodeCollector.submitModelPartSemantic(this.model.root(), poseStack,
+				this.model.renderType(TridentModel.TEXTURE), i, j, null, false, bl, -1, null, k);
+		} else if (!bl) {
 			// The special-item path has no atlas sprite, but the copied TridentModel
 			// already carries a complete direct texture identity. Keep non-foil
 			// tridents on the shared semantic model route.

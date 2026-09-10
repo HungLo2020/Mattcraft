@@ -765,6 +765,7 @@ public class GameRenderer implements Projector, AutoCloseable, FogStorage {
 	}
 
 	public void render(DeltaTracker deltaTracker, boolean bl) {
+		net.minecraft.client.dev.GraphicsAuditHandFoilTiming.beginFrame();
 		boolean rustWholeFrame = net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled();
 		if (rustWholeFrame) {
 			// Minecraft's render loop selects the Rust whole-frame shell for this
@@ -945,6 +946,7 @@ public class GameRenderer implements Projector, AutoCloseable, FogStorage {
 	}
 
 	public boolean renderRustVulkanWholeFrameShell(DeltaTracker deltaTracker, boolean bl) {
+		net.minecraft.client.dev.GraphicsAuditHandFoilTiming.beginFrame();
 		if (!net.vulkanic.gui.RustGalGuiRenderer.isWholeFrameVulkanActive()) {
 			return false;
 		}
@@ -1195,7 +1197,7 @@ public class GameRenderer implements Projector, AutoCloseable, FogStorage {
 					clientLevel.spawnDeterministicTerrainParticlesForCapture();
 					this.minecraft.particleEngine.flushPendingParticlesForCapture();
 				}
-				this.minecraft.particleEngine.enqueueRustGalBlockMarkers(this.mainCamera, f);
+				// Markers are extracted once with the visible particle group.
 				this.minecraft.particleEngine.enqueueRustGalParticles(
 					rustFrameFrustum, this.mainCamera, f
 				);

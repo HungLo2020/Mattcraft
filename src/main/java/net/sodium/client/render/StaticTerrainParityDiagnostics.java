@@ -1336,7 +1336,18 @@ public final class StaticTerrainParityDiagnostics {
 
     /** Capture-bound observation of the latest completed CPU mesh, not GPU state. */
     public static void recordAppearanceSourceAtCapture() {
-        recordAppearanceSourceProbe("capture-observed-source", "translucent", true);
+        String layer = appearanceCaptureLayer(System.getProperty(
+            "mattmc.dev.staticTerrainParityDiagnostics.appearanceCaptureLayer", "translucent"));
+        if (layer != null) recordAppearanceSourceProbe("capture-observed-source", layer, true);
+    }
+
+    /** Observation selection only; invalid diagnostic input never changes rendering. */
+    static String appearanceCaptureLayer(String requested) {
+        if (requested == null) return null;
+        return switch (requested) {
+            case "solid", "cutout", "translucent" -> requested;
+            default -> null;
+        };
     }
 
     private static void recordAppearanceSourceProbe(String stage, String layer, boolean capture) {
@@ -1350,13 +1361,14 @@ public final class StaticTerrainParityDiagnostics {
             return;
         }
         int eventIndex = (capture ? CAPTURE_APPEARANCE_TRACE_EVENTS : APPEARANCE_TRACE_EVENTS).incrementAndGet();
-        if (eventIndex > (capture ? 4 : 8)) {
+        if (eventIndex > (capture ? 5 : 8)) {
             return;
         }
         try {
             StringBuilder json = new StringBuilder(8192);
             json.append("{");
             appendField(json, "schema", "mattmc-static-terrain-appearance-source-v1").append(", ");
+            json.append("\"cpuTerrainInputs\":").append(net.minecraft.client.dev.GraphicsAuditTerrainInputs.json()).append(", ");
             appendField(json, "eventIndex", eventIndex).append(", ");
             appendField(json, "backend", backendName()).append(", ");
             appendField(json, "stage", stage).append(", ");
@@ -2111,7 +2123,8 @@ public final class StaticTerrainParityDiagnostics {
                     wordAt(buffer, offset, stride, 24),
                     wordAt(buffer, offset, stride, 28),
                     wordAt(buffer, offset, stride, 32),
-                    wordAt(buffer, offset, stride, 36)
+                    wordAt(buffer, offset, stride, 36),
+                    buffer.getInt(offset), buffer.getInt(offset + 4), texture
             );
         }
         return new AppearanceSource(layer, stride, separateAo, samples);
@@ -2450,6 +2463,9 @@ public final class StaticTerrainParityDiagnostics {
             AppearanceSample sample = samples[i];
             json.append("{");
             appendField(json, "vertexIndex", sample.vertexIndex()).append(", ");
+            appendField(json, "compactPositionHi", String.format(Locale.ROOT, "%08x", sample.compactPositionHi())).append(", ");
+            appendField(json, "compactPositionLo", String.format(Locale.ROOT, "%08x", sample.compactPositionLo())).append(", ");
+            appendField(json, "compactTexture", String.format(Locale.ROOT, "%08x", sample.compactTexture())).append(", ");
             appendField(json, "primitiveIndex", sample.primitiveIndex()).append(", ");
             appendField(json, "faceCode", sample.faceCode()).append(", ");
             appendField(json, "worldPosition", vector3(sample.worldX(), sample.worldY(), sample.worldZ())).append(", ");
@@ -2935,7 +2951,8 @@ public final class StaticTerrainParityDiagnostics {
             int extensionWord24,
             int extensionWord28,
             int extensionWord32,
-            int extensionWord36
+            int extensionWord36,
+            int compactPositionHi, int compactPositionLo, int compactTexture
     ) {
     }
 

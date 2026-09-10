@@ -42,6 +42,7 @@ public final class GraphicsAuditPhaseWait {
         try {
             phase = Long.parseLong(System.getProperty(
                 GraphicsAuditBlockDisplayFixture.guiItemAnimationRequested() ? "mattmc.dev.graphicsAuditGuiItemCapturePhase" :
+                net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.requested() ? "mattmc.dev.graphicsAuditVibrationCapturePhase" :
                 net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested() ? "mattmc.dev.graphicsAuditAtlasParticleCapturePhase" :
                 GraphicsAuditLavaFixture.requested() ? "mattmc.dev.graphicsAuditLavaCapturePhase" :
                 GraphicsAuditBlockDisplayFixture.waterAnimationRequested()

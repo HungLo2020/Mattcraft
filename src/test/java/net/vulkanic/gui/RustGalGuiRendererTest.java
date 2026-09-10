@@ -204,14 +204,23 @@ class RustGalGuiRendererTest {
 	}
 
 	@Test
-	void flatItemFoilUsesTheCopiedGlintAssetAndProjectedUvTransform() throws Exception {
+	void flatItemFoilUsesNativeSemanticsWithoutPrivateGateOrJavaUvPreparation() throws Exception {
 		String source = java.nio.file.Files.readString(java.nio.file.Path.of(
 			"src/main/java/net/vulkanic/gui/RustGalGuiItemRenderer.java"
 		));
-		assertTrue(source.contains("layer.foilType() == ItemStackRenderState.FoilType.STANDARD"));
-		assertTrue(source.contains("quad.source().stage()"),
-			"flat-item quads must stage their explicitly typed texture source");
-		assertTrue(source.contains("new GuiItemTextureSource.Raw(glint)"),
+		assertTrue(source.contains("return tryEnqueueNativeFlatItem(item, guiWidth, guiHeight, dynamicLayerOrder)"));
+		assertFalse(source.contains("mattmc.dev.rustGalGuiAtlasItems"));
+		assertFalse(source.contains("mattmc.dev.rustGalGuiItemTransforms"));
+		assertFalse(source.contains("copyFlatQuad"), "non-foil items must not bypass native mesh lighting");
+		assertFalse(source.contains("mattmc.dev.rustGalGuiItemFoil"));
+		assertFalse(source.contains("ticks % 110000L"));
+		assertFalse(source.contains("specialFoilQuad"));
+		assertTrue(source.contains("new VulkanicGalBridge.StandardItemFoilRecord("));
+		assertTrue(source.contains("snapshot.sources().forEach(GuiItemTextureSource::stage)"),
+			"flat-item meshes must stage their explicitly typed texture sources");
+		String collector = java.nio.file.Files.readString(java.nio.file.Path.of(
+			"src/main/java/net/vulkanic/gui/GuiFlatItemMeshCollector.java"));
+		assertTrue(collector.contains("new GuiItemTextureSource.Raw(glint)"),
 			"glint must remain an explicit copied image source");
 		String textureSource = java.nio.file.Files.readString(java.nio.file.Path.of(
 			"src/main/java/net/vulkanic/gui/GuiItemTextureSource.java"));
@@ -219,10 +228,14 @@ class RustGalGuiRendererTest {
 			"typed raw sources must still publish copied pixels");
 		assertTrue(textureSource.contains("RustGalFrameCoordinator.stageGuiAtlasReference(region)"),
 			"atlas sources must publish declarations, not fabricated copied images");
-		assertTrue(source.contains("source.atlasU0()"));
-		assertTrue(source.contains("ENCHANTED_GLINT_ITEM"));
-		assertTrue(source.contains("specialFoilQuad"));
-		assertTrue(source.contains("SPECIAL_FOIL_TEXTURE_SCALE"));
+		assertTrue(collector.contains("quad.getTexU(vertex)"));
+		assertTrue(collector.contains("ENCHANTED_GLINT_ITEM"));
+		assertTrue(collector.contains("GuiDecalFoilRecord.forNativeItemLayout()"));
+		assertFalse(collector.contains("rustGalGuiSpecialFoil"), "validated flat special foil must not require a private gate");
+		String blockCollector = java.nio.file.Files.readString(java.nio.file.Path.of(
+			"src/main/java/net/vulkanic/gui/GuiItemMeshSemanticCollector.java"));
+		assertTrue(blockCollector.contains("special-foil-native-contract-unavailable"),
+			"flat special foil admission must not admit unvalidated block-lit special foil");
 	}
 
 	@Test
@@ -243,7 +256,14 @@ class RustGalGuiRendererTest {
 		assertTrue(itemSource.contains("BedSpecialRenderer"));
 		assertTrue(itemSource.contains("bed.headModel()"));
 		assertTrue(itemSource.contains("ShieldSpecialRenderer"));
-		assertTrue(itemSource.contains("Sheets.getShieldMaterial(layer.pattern())"));
+		String shieldSource = Files.readString(Path.of("src/main/java/net/vulkanic/gui/GuiShieldItemSemanticCollector.java"));
+		assertTrue(itemSource.contains("GuiShieldItemSemanticCollector.collect"));
+		assertFalse(itemSource.contains("mattmc.dev.rustGalShieldGui"), "validated plain shield GUI must not require an opt-in");
+		assertFalse(shieldSource.contains("mattmc.dev.rustGalShieldPatterns"));
+		assertTrue(shieldSource.contains("Sheets.getShieldMaterial"));
+		assertTrue(shieldSource.contains("sprite.contents().isAnimated()"));
+		assertTrue(shieldSource.contains("animated shield requires native atlas animation semantics"));
+		assertTrue(shieldSource.contains("ModelBakery.NO_PATTERN_SHIELD"));
 		assertTrue(itemSource.contains("BannerSpecialRenderer"));
 		assertTrue(itemSource.contains("renderer.standingModel()"));
 		assertTrue(itemSource.contains("renderer.standingFlagModel()"));
@@ -261,7 +281,10 @@ class RustGalGuiRendererTest {
 		assertTrue(itemSource.contains("special-renderer-unavailable"));
 		assertTrue(itemSource.contains("ItemRenderer.ENCHANTED_GLINT_ITEM"));
 		assertTrue(itemSource.contains("0xffffffff, 4"));
-		assertTrue(itemSource.contains("shield.model(), ItemRenderer.ENCHANTED_GLINT_ITEM"));
+		assertTrue(shieldSource.contains("ItemRenderer.ENCHANTED_GLINT_ITEM"));
+			assertTrue(shieldSource.contains("copyPart(layer.part()"));
+			assertTrue(shieldSource.contains("patterned ? model.root() : model.plate()"));
+		assertFalse(shieldSource.contains("tryEnqueueModelPip"));
 		assertTrue(itemSource.contains("flagModel, ItemRenderer.ENCHANTED_GLINT_ITEM"));
 		assertTrue(itemSource.contains("skull.model(), ItemRenderer.ENCHANTED_GLINT_ITEM"));
 		assertTrue(itemSource.contains("playerHead.model(), ItemRenderer.ENCHANTED_GLINT_ITEM"));

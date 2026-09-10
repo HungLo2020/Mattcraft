@@ -97,6 +97,16 @@ pub(crate) unsafe fn decode_world_material_asset_update(
     Ok((request.generation, assets))
 }
 
+unsafe fn read_world_mesh_asset_update_request(
+    request: *const FfiWorldMeshAssetUpdateRequest,
+) -> GalResult<FfiWorldMeshAssetUpdateRequest> {
+    // Read only the common header until the caller's full layout is proven.
+    // In particular, old ABI requests do not contain the appended orb slice.
+    let header = read_struct(request.cast::<FfiHeader>(), "world mesh asset update header")?;
+    validate_header::<FfiWorldMeshAssetUpdateRequest>(header)?;
+    read_struct(request, "world mesh asset update request")
+}
+
 pub(crate) unsafe fn decode_world_mesh_asset_update(
     request: *const FfiWorldMeshAssetUpdateRequest,
     capabilities: BackendCapabilities,
@@ -107,8 +117,7 @@ pub(crate) unsafe fn decode_world_mesh_asset_update(
     Vec<WorldMeshSortedIndexUpdate>,
     Vec<(u64, u64)>,
 )> {
-    let request = read_struct(request, "world mesh asset update request")?;
-    validate_header::<FfiWorldMeshAssetUpdateRequest>(request.header)?;
+    let request = read_world_mesh_asset_update_request(request)?;
     if request.header.version != FFI_ABI_VERSION {
         return Err(GalError::ffi(
             StatusCode::InvalidArgument,
@@ -256,8 +265,13 @@ pub(crate) unsafe fn decode_world_mesh_asset_update(
             ),
         ));
     }
+    // Check the combined residency before dereferencing the semantic array.
+    let total_meshes = (raw_meshes.len() as u64).checked_add(request.experience_orbs.count)
+        .filter(|&count| count <= WORLD_MESH_ASSET_RESIDENCY as u64)
+        .ok_or_else(|| GalError::invalid_argument("combined world mesh/orb asset count exceeds residency"))?;
+    let raw_orbs = read_limited_slice(request.experience_orbs, true, "experience orb assets")?;
     let mut seen_meshes = BTreeMap::new();
-    let mut meshes = Vec::with_capacity(raw_meshes.len());
+    let mut meshes = Vec::with_capacity(total_meshes as usize);
     for mesh in raw_meshes {
         validate_item_size::<FfiWorldMeshAssetRecord>(mesh.byte_size, "world mesh asset")?;
         if mesh.mesh_key == 0 || mesh.mesh_generation == 0 {
@@ -360,6 +374,18 @@ pub(crate) unsafe fn decode_world_mesh_asset_update(
             sections,
             entity_identity,
         });
+    }
+    for orb in raw_orbs {
+        validate_item_size::<FfiWorldExperienceOrbAssetRecord>(orb.byte_size, "experience orb asset")?;
+        if orb.reserved0 != 0 || orb.red > 255 || orb.blue > 255 {
+            return Err(GalError::invalid_argument("invalid experience orb appearance channels or reserved bits"));
+        }
+        if seen_meshes.insert(orb.mesh_key, ()).is_some() {
+            return Err(GalError::invalid_argument("duplicate world mesh/orb asset identity"));
+        }
+        meshes.push(crate::render::vulkanic::world_primitive_frontend::experience_orb::ExperienceOrbAppearance {
+            icon: orb.icon, red: orb.red as u8, blue: orb.blue as u8, packed_light: orb.packed_light,
+        }.mesh(orb.mesh_key, orb.mesh_generation)?);
     }
     let raw_sorted_indices = read_limited_slice(
         request.sorted_indices,
@@ -501,17 +527,16 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_world_mesh_update_assets(
             write_status_out(status_out, status_result_from_error(&error));
             return error.code as i32;
         };
-        let input_bytes = if request.is_null() {
-            0
-        } else {
-            input_bytes_for_world_mesh_asset_update(&*request)
-        };
+        let checked_request = read_world_mesh_asset_update_request(request);
+        let input_bytes = checked_request.as_ref()
+            .map(input_bytes_for_world_mesh_asset_update).unwrap_or(0);
         context.ffi_calls += 1;
         context.ffi_input_bytes = context.ffi_input_bytes.saturating_add(input_bytes);
         context.ffi_output_bytes = context
             .ffi_output_bytes
             .saturating_add(size_of::<FfiStatusResult>() as u64);
-        let result = decode_world_mesh_asset_update(request, context.gal.capabilities()).and_then(
+        let result = checked_request.and_then(|request|
+            decode_world_mesh_asset_update(&request, context.gal.capabilities())).and_then(
             |(generation, meshes, textures, sorted_indices, retirements)| {
                 context.gui_frontend.invalidate_atlas_texture_views(
                     &mut context.gal, textures.iter().map(|texture| texture.texture_id))?;

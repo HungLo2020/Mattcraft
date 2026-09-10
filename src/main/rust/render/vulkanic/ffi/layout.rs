@@ -509,7 +509,7 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
         90 => layout!(
             90,
             FfiGuiRawImageAssetPayload,
-            [byte_size, format, asset_id, width, height, pixels]
+            [byte_size, format, asset_id, width, height, pixels, sampling_filter, sampling_address]
         ),
         92 => layout!(
             92,
@@ -547,7 +547,7 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
         96 => layout!(
             96,
             FfiGuiMeshVertex,
-            [position, atlas_uv, local_uv, color_argb, normal_packed]
+            [position, atlas_uv, local_uv, color_argb, normal_packed, source_face, source_foil_type]
         ),
         97 => layout!(
             97,
@@ -584,7 +584,15 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 item_foil_clock_millis,
                 item_foil_speed,
                 item_foil_strength,
-                item_raster_scale
+                item_raster_scale,
+                decal_foil_mode,
+                decal_model_pose,
+                decal_normal_pose,
+                block_item_scale,
+                block_model_bounds,
+                block_item_layout,
+                item_cache_identity,
+                item_cache_mode
             ]
         ),
         91 => layout!(
@@ -741,7 +749,9 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 engine_game_ticks,
                 engine_partial_tick,
                 engine_glint_alpha,
-                engine_menu_blur_radius
+                engine_menu_blur_radius,
+                world_particle_quads,
+                world_experience_orbs
             ]
         ),
         89 => layout!(
@@ -1102,7 +1112,8 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
                 textures,
                 sorted_indices,
                 negotiated_feature_bits,
-                retirements
+                retirements,
+                experience_orbs
             ]
         ),
         69 => layout!(
@@ -1429,6 +1440,14 @@ pub(crate) fn layout_for_struct(struct_id: u32) -> GalResult<FfiStructLayout> {
             [header, revision, references, negotiated_feature_bits]),
         107 => layout!(107, FfiGuiItemRasterLayer,
             [byte_size, material_mode, asset_id, color_argb, corners, uv, model_transform]),
+        108 => layout!(108, FfiWorldParticleQuadRequest,
+            [byte_size, texture_id, surface_kind, material_index, center, rotation,
+             size, uv_bounds, color_argb, packed_light]),
+        109 => layout!(109, FfiWorldExperienceOrbAssetRecord,
+            [byte_size, icon, mesh_key, mesh_generation, red, blue, packed_light, reserved0]),
+        110 => layout!(110, FfiWorldExperienceOrbInstanceRecord,
+            [byte_size, mesh_index, mesh_key, mesh_generation, entity_transform,
+             camera_orientation, entity_id, reserved0]),
         _ => {
             return Err(GalError::ffi(
                 StatusCode::UnknownEnum,

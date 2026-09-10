@@ -21,7 +21,7 @@ final class AtlasAnimationTickDelivery {
     private record Event(long tick, int[] visible, boolean onlyVisible) {}
 
     AtlasAnimationTickDelivery(int textureId, long generation, long initialTick) {
-        if (textureId <= 0 || generation <= 0 || initialTick < 0) {
+        if (textureId == 0 || generation <= 0 || initialTick < 0) {
             throw new IllegalArgumentException("Invalid animation tick epoch");
         }
         this.textureId = textureId;

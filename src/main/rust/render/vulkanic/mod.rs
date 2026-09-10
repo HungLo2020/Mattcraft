@@ -15,8 +15,10 @@ pub mod gui_frontend;
 // Explicit same-context atlas references; private until native GUI sampling is wired.
 mod gui_atlas_reference;
 mod item_foil;
+mod special_item_foil;
 mod gui_item_material;
 mod gui_item_raster;
+mod gui_item_layout;
 /// Private semantic tiled-GUI lowering; not yet a frame/FFI-admitted route.
 mod gui_tiling;
 /// Backend-neutral GUI mesh semantics. This is not an FFI-admitted route

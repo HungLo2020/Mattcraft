@@ -10,6 +10,246 @@ use crate::render::vulkanic::{
     TextureUsage, TextureUsageState, TextureViewDesc,
 };
 
+/// Vignette is a destination-only blend: vanilla writes a grayscale mask and
+/// multiplies the already-composed frame by `1 - source.rgb`.  Keep an actual
+/// Vulkan readback here because descriptor/pipeline construction checks alone
+/// cannot prove that dynamic rendering preserves the loaded color attachment
+/// between the world and GUI passes.
+#[test]
+fn isolated_vulkan_vignette_blend_preserves_and_darkens_loaded_color() {
+    isolated_loaded_blend(BlendMode::Vignette,[0.75,0.75,0.75,1.0],
+        ClearColor {r:0.8,g:0.8,b:0.8,a:1.0},[51,51,51,255],1);
+}
+
+#[test]
+fn isolated_vulkan_glint_blend_matches_frozen_and_preserves_destination_alpha() {
+    // Frozen Java OpenGL BlendFunction.GLINT: SRC_COLOR, ONE, ZERO, ONE.
+    // Distinct RGB and nonopaque alpha distinguish it from multiply, alpha
+    // blend, source-alpha replacement and plain additive blending.
+    // Avoid the hardware's half-intensity blend-factor rounding boundary;
+    // quarter-intensity probes retain exact byte assertions on this fixture.
+    isolated_loaded_blend(BlendMode::Glint,[0.25,0.25,0.75,0.125],
+        ClearColor {r:0.125,g:0.375,b:0.0625,a:0.375},[48,112,159,96],0);
+}
+
+fn isolated_loaded_blend(blend:BlendMode, source:[f32;4], clear:ClearColor, expected:[u8;4], tolerance:i16) {
+    isolated_loaded_raster(blend, source, clear, expected, tolerance, false, None);
+}
+
+#[test]
+fn explicit_provoking_vertex_selects_the_declared_flat_value_on_both_backends() {
+    for opengl in [false, true] {
+        for (mode, red) in [(ProvokingVertex::First, 0), (ProvokingVertex::Last, 255)] {
+            isolated_loaded_raster(BlendMode::Disabled, [0.0;4],
+                ClearColor {r:0.0,g:1.0,b:0.0,a:1.0}, [red,0,0,255], 0, opengl, Some(mode));
+        }
+    }
+}
+
+fn isolated_loaded_raster(blend:BlendMode, source:[f32;4], clear:ClearColor, expected:[u8;4], tolerance:i16,
+    opengl: bool, provoking: Option<ProvokingVertex>) {
+    let mut gal = if opengl {
+        VulkanicGal::new_with_backend(Box::new(super::opengl::OpenGlBackend::new(
+            "explicit provoking vertex OpenGL conformance").expect("OpenGL required for provoking vertex readback")), false)
+    } else {
+    let backend = match super::vulkan::VulkanBackend::new("MattMC VulkanicGAL vignette conformance") {
+        Ok(backend) => backend,
+        Err(error) => {
+            assert!(provoking.is_none(), "Vulkan required for provoking vertex readback: {error}");
+            assert_ne!(blend,BlendMode::Glint,"Vulkan required for glint blend regression: {error}");
+            eprintln!("skipping Vulkan vignette conformance: {error}");
+            return;
+        }
+    };
+    VulkanicGal::new_with_backend(Box::new(backend), false)
+    };
+    let extent = Extent3d {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let color = gal
+        .create_texture(TextureDesc {
+            label: "vignette-conformance.color".to_owned(),
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            extent,
+            mip_levels: 1,
+            array_layers: 1,
+            usages: vec![TextureUsage::ColorAttachment, TextureUsage::TransferSrc],
+        })
+        .unwrap();
+    let color_view = gal
+        .create_texture_view(view(
+            "vignette-conformance.color-view",
+            color,
+            TextureFormat::Rgba8Unorm,
+        ))
+        .unwrap();
+    let target = gal
+        .create_render_target(RenderTargetDesc {
+            label: "vignette-conformance.target".to_owned(),
+            color_views: vec![color_view],
+            depth_stencil_view: None,
+            extent,
+        })
+        .unwrap();
+    let pass = gal
+        .create_render_pass(RenderPassDesc {
+            label: "vignette-conformance.pass".to_owned(),
+            target,
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            depth_format: None,
+        })
+        .unwrap();
+    let layout = gal
+        .create_pipeline_layout(PipelineLayoutDesc {
+            label: "vignette-conformance.layout".to_owned(),
+            resource_layouts: Vec::new(),
+        })
+        .unwrap();
+    let vertex = gal
+        .create_shader_module(ShaderModuleDesc {
+            label: "vignette-conformance.vertex".to_owned(),
+            stage: ShaderStage::Vertex,
+            code_format: ShaderCodeFormat::Glsl,
+            code: if provoking.is_some() {
+                let id = if opengl { "gl_VertexID" } else { "gl_VertexIndex" };
+                format!("#version 450\nlayout(location=0) flat out float selected;\nconst vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));\nvoid main() {{ gl_Position=vec4(p[{id}],0,1); selected=float({id})/2.0; }}").into_bytes()
+            } else { br#"#version 450
+const vec2 p[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+void main() { gl_Position = vec4(p[gl_VertexIndex], 0.0, 1.0); }
+"#
+            .to_vec() },
+            entry_point: "main".to_owned(),
+        })
+        .unwrap();
+    let fragment = gal
+        .create_shader_module(ShaderModuleDesc {
+            label: "vignette-conformance.fragment".to_owned(),
+            stage: ShaderStage::Fragment,
+            code_format: ShaderCodeFormat::Glsl,
+            code: if provoking.is_some() {
+                b"#version 450\nlayout(location=0) flat in float selected;\nlayout(location=0) out vec4 out_color;\nvoid main() { out_color=vec4(selected,0,0,1); }".to_vec()
+            } else { format!("#version 450\nlayout(location = 0) out vec4 out_color;\nvoid main() {{ out_color = vec4({}, {}, {}, {}); }}\n",
+                source[0],source[1],source[2],source[3]).into_bytes() },
+            entry_point: "main".to_owned(),
+        })
+        .unwrap();
+    let pipeline = gal
+        .create_graphics_pipeline(GraphicsPipelineDesc {
+            label: "vignette-conformance.pipeline".to_owned(),
+            layout,
+            vertex_shader: vertex,
+            fragment_shader: fragment,
+            topology: PrimitiveTopology::Triangles,
+            cull_mode: CullMode::None,
+            front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: provoking.unwrap_or(ProvokingVertex::Last),
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
+            blend,
+            depth_compare: None,
+            depth_write: false,
+            depth_bias: None,
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            depth_format: None,
+            stencil: None,
+        })
+        .unwrap();
+    let readback = gal
+        .create_buffer(BufferDesc {
+            label: "vignette-conformance.readback".to_owned(),
+            size: 4,
+            memory: MemoryDomain::Readback,
+            usages: vec![BufferUsage::TransferDst, BufferUsage::HostRead],
+        })
+        .unwrap();
+    let loaded = PassAttachment {
+        view: color_view,
+        load_op: AttachmentLoadOp::Load,
+        store_op: AttachmentStoreOp::Store,
+        clear_color: None,
+    };
+    let command_list = gal
+        .create_command_list(CommandListDesc {
+            label: "vignette-conformance.commands".to_owned(),
+            operations: vec![
+                texture_barrier(
+                    color,
+                    TextureUsageState::Undefined,
+                    TextureUsageState::ColorAttachment,
+                ),
+                CommandOp::BeginPass {
+                    pass,
+                    target,
+                    colors: vec![PassAttachment {
+                        view: color_view,
+                        load_op: AttachmentLoadOp::Clear,
+                        store_op: AttachmentStoreOp::Store,
+                        clear_color: Some(clear),
+                    }],
+                    depth_stencil: None,
+                },
+                CommandOp::EndPass,
+                CommandOp::BeginPass {
+                    pass,
+                    target,
+                    colors: vec![loaded],
+                    depth_stencil: None,
+                },
+                CommandOp::BindGraphicsPipeline(pipeline),
+                CommandOp::Draw {
+                    vertices: 3,
+                    instances: 1,
+                },
+                CommandOp::EndPass,
+                texture_barrier(
+                    color,
+                    TextureUsageState::ColorAttachment,
+                    TextureUsageState::TransferSrc,
+                ),
+                CommandOp::CopyTextureToBuffer(BufferImageCopyRegion {
+                    buffer: readback,
+                    buffer_offset: 0,
+                    bytes_per_row: 4,
+                    rows_per_image: 1,
+                    texture: color,
+                    texture_mip: 0,
+                    texture_layer: 0,
+                    texture_origin: TextureOrigin3d { x: 0, y: 0, z: 0 },
+                    extent,
+                }),
+                CommandOp::Barrier(ResourceBarrier { resource: readback, subresources: None, before: TextureUsageState::TransferDst, after: TextureUsageState::ShaderRead, src_queue: QueueClass::Graphics, dst_queue: QueueClass::Graphics }),
+                CommandOp::HostReadBuffer {
+                    buffer: readback,
+                    offset: 0,
+                    size: 4,
+                },
+            ],
+        })
+        .unwrap();
+    let token = gal
+        .submit(SubmissionBatch {
+            label: "vignette-conformance.submit".to_owned(),
+            command_lists: vec![command_list],
+        })
+        .unwrap();
+    gal.retire_through_for_test(token.submission).unwrap();
+    let bytes = gal
+        .completed_host_reads()
+        .iter()
+        .rev()
+        .find(|read| read.buffer == readback)
+        .expect("vignette conformance must produce a readback")
+        .bytes
+        .clone();
+    for channel in 0..3 {
+        assert!((i16::from(bytes[channel])-i16::from(expected[channel])).abs()<=tolerance,
+            "{blend:?} channel{channel}: actual={bytes:?}, expected={expected:?}");
+    }
+    assert_eq!(expected[3],bytes[3],"{blend:?} must preserve destination alpha");
+}
+
 const WIDTH: u32 = 96;
 const HEIGHT: u32 = 64;
 
@@ -892,6 +1132,8 @@ fn submit_d3_sampled_texel(gal: &mut VulkanicGal, backend_name: &str) -> Result<
         topology: PrimitiveTopology::Triangles,
         cull_mode: CullMode::None,
         front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+        provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+        raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
         blend: BlendMode::Disabled,
         depth_compare: None,
         depth_write: false,

@@ -320,6 +320,8 @@ pub unsafe fn decode_resource_batch(
             topology: primitive_topology(item.topology)?,
             cull_mode: cull_mode(item.cull_mode)?,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: blend_mode(item.blend)?,
             depth_compare,
             depth_write: depth_compare.is_some(),

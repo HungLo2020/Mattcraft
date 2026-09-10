@@ -125,6 +125,8 @@ struct GraphicsPipelineCacheKey {
     topology: u32,
     cull_mode: u32,
     front_face: u32,
+    provoking_vertex: u32,
+    raster_y_direction: u32,
     blend: u32,
     depth_compare: Option<u32>,
     depth_write: bool,
@@ -175,6 +177,8 @@ impl GraphicsPipelineCacheKey {
             topology: desc.topology as u32,
             cull_mode: desc.cull_mode as u32,
             front_face: desc.front_face as u32,
+            provoking_vertex: desc.provoking_vertex as u32,
+            raster_y_direction: desc.raster_y_direction as u32,
             blend: desc.blend as u32,
             depth_compare: desc.depth_compare.map(|compare| compare as u32),
             depth_write: desc.depth_write,
@@ -1419,6 +1423,12 @@ impl VulkanObjects {
             Some(VulkanObject::ResourceLayout(layout)) => layout,
             _ => return Err(GalError::backend("resource set references missing layout")),
         };
+        for binding in &desc.bindings {
+            if let Some(declaration) = layout_object.bindings.iter().find(|entry| entry.binding == binding.binding) {
+                validate_graphics_storage_access(declaration.kind, declaration.stages,
+                    binding.access, self.context.graphics_storage_writes)?;
+            }
+        }
         let mut sizes: BTreeMap<vk::DescriptorType, u32> = BTreeMap::new();
         for binding in &layout_object.bindings {
             *sizes
@@ -1676,6 +1686,8 @@ impl VulkanObjects {
                 label: desc.label.clone(),
                 pipeline,
                 layout: desc.layout,
+                provoking_vertex: desc.provoking_vertex,
+                raster_y_direction: desc.raster_y_direction,
             });
         }
         trace_glibc_allocator_checkpoint(&format!("graphics-pipeline.begin.{}", desc.label));
@@ -1690,14 +1702,27 @@ impl VulkanObjects {
             .viewport_count(1)
             .scissor_count(1);
         let depth_bias = desc.depth_bias;
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        let mut rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .line_width(1.0)
             .cull_mode(cull_mode(desc.cull_mode))
-            .front_face(front_face(desc.front_face))
+            .front_face(front_face(match (desc.front_face, desc.raster_y_direction) {
+                (crate::render::vulkanic::resources::FrontFace::Clockwise, RasterYDirection::Down) => crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                (crate::render::vulkanic::resources::FrontFace::CounterClockwise, RasterYDirection::Down) => crate::render::vulkanic::resources::FrontFace::Clockwise,
+                (face, RasterYDirection::Up) => face,
+            }))
             .depth_bias_enable(depth_bias.is_some())
             .depth_bias_constant_factor(depth_bias.map_or(0.0, |bias| bias.constant_factor))
             .depth_bias_slope_factor(depth_bias.map_or(0.0, |bias| bias.slope_factor));
+        let mut provoking = vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT::default()
+            .provoking_vertex_mode(vk::ProvokingVertexModeEXT::LAST_VERTEX);
+        if desc.provoking_vertex == crate::render::vulkanic::resources::ProvokingVertex::Last {
+            if !self.context.provoking_vertex_last {
+                return Err(GalError::unsupported_feature(
+                    "last provoking vertex requires Vulkan VK_EXT_provoking_vertex/provokingVertexLast"));
+            }
+            rasterization = rasterization.push_next(&mut provoking);
+        }
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let color_blend_attachments = desc
@@ -1783,6 +1808,8 @@ impl VulkanObjects {
             label: desc.label.clone(),
             pipeline,
             layout: desc.layout,
+            provoking_vertex: desc.provoking_vertex,
+            raster_y_direction: desc.raster_y_direction,
         })
     }
 
@@ -2055,6 +2082,27 @@ pub(super) struct ResourceLayoutObject {
     pub(super) bindings: Vec<ResourceBindingDesc>,
 }
 
+fn validate_graphics_storage_access(kind: ResourceBindingKind, stages: PipelineStageFlags,
+    access: AccessFlags, supported: bool) -> GalResult<()> {
+    if !supported && access.writes() && stages.0 & PipelineStageFlags::DRAW.0 != 0
+        && matches!(kind, ResourceBindingKind::StorageBuffer | ResourceBindingKind::StorageTexture) {
+        return Err(GalError::unsupported_feature(
+            "writable DRAW storage requires Vulkan vertexPipelineStoresAndAtomics and fragmentStoresAndAtomics"));
+    }
+    Ok(())
+}
+
+#[test]
+fn graphics_storage_access_rejects_unsupported_writes_without_rejecting_reads_or_compute() {
+    for kind in [ResourceBindingKind::StorageBuffer, ResourceBindingKind::StorageTexture] {
+        let rw = AccessFlags(AccessFlags::READ.0 | AccessFlags::WRITE.0);
+        assert!(validate_graphics_storage_access(kind, PipelineStageFlags::DRAW, rw, false).is_err());
+        assert!(validate_graphics_storage_access(kind, PipelineStageFlags::DRAW, rw, true).is_ok());
+        assert!(validate_graphics_storage_access(kind, PipelineStageFlags::DRAW, AccessFlags::READ, false).is_ok());
+        assert!(validate_graphics_storage_access(kind, PipelineStageFlags::COMPUTE, rw, false).is_ok());
+    }
+}
+
 pub(super) struct ResourceSetObject {
     pub(super) token: BackendToken,
     pool_block_id: u64,
@@ -2087,6 +2135,8 @@ pub(super) struct GraphicsPipelineObject {
     pub(super) label: String,
     pub(super) pipeline: Arc<NativeGraphicsPipeline>,
     pub(super) layout: Handle,
+    pub(super) provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex,
+    pub(super) raster_y_direction: RasterYDirection,
 }
 
 pub(super) struct ComputePipelineObject {
@@ -2438,6 +2488,15 @@ pub(super) fn color_blend_attachment(
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
+        BlendMode::AlphaPreserveAlpha => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA),
         BlendMode::Premultiplied => vk::PipelineColorBlendAttachmentState::default()
@@ -2799,6 +2858,8 @@ mod tests {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: None,
             depth_write: true,
@@ -2823,6 +2884,8 @@ mod tests {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: Some(CompareOp::LessOrEqual),
             depth_write: true,
@@ -2847,6 +2910,8 @@ mod tests {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::None,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: Some(CompareOp::LessOrEqual),
             depth_write: false,
@@ -2877,6 +2942,8 @@ mod tests {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Alpha,
             depth_compare: Some(CompareOp::LessOrEqual),
             depth_write: true,
@@ -2903,6 +2970,8 @@ mod tests {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: Some(CompareOp::LessOrEqual),
             depth_write: true,
@@ -2923,6 +2992,12 @@ mod tests {
             GraphicsPipelineCacheKey::from_desc(&first),
             GraphicsPipelineCacheKey::from_desc(&second)
         );
+        second = first.clone();
+        second.provoking_vertex = crate::render::vulkanic::resources::ProvokingVertex::First;
+        assert_ne!(GraphicsPipelineCacheKey::from_desc(&first), GraphicsPipelineCacheKey::from_desc(&second));
+        second = first.clone();
+        second.raster_y_direction = RasterYDirection::Down;
+        assert_ne!(GraphicsPipelineCacheKey::from_desc(&first), GraphicsPipelineCacheKey::from_desc(&second));
         second = first.clone();
         second.color_formats = vec![TextureFormat::Rgba16Float];
         assert_ne!(

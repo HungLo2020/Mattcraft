@@ -2297,6 +2297,10 @@ public class LevelRenderer implements ResourceManagerReloadListener, AutoCloseab
 		@Override public void submitItem(PoseStack poseStack, net.minecraft.world.item.ItemDisplayContext context, int light, int overlay, int outlineColor, int[] tints, List<net.minecraft.client.renderer.block.model.BakedQuad> quads, RenderType type, net.minecraft.client.renderer.item.ItemStackRenderState.FoilType foil) {}
 		@Override public void submitCustomGeometry(PoseStack poseStack, RenderType type, SubmitNodeCollector.CustomGeometryRenderer renderer) {}
 		@Override public void submitParticleGroup(SubmitNodeCollector.ParticleGroupRenderer renderer) {}
+		@Override public <S> void submitModelOutlineSemanticTexture(net.minecraft.client.model.Model<? super S> model, S state,
+			PoseStack poseStack, RenderType material, int light, net.minecraft.resources.ResourceLocation textureIdentity, int outlineColor) {
+			// Text-only replay must never enqueue a second body or outline.
+		}
 		@Override public <S> void submitModelSemanticTexture(net.minecraft.client.model.Model<? super S> model, S state, PoseStack poseStack, RenderType type, int light, int overlay, int color, net.minecraft.resources.ResourceLocation textureIdentity, int outlineColor, @Nullable net.minecraft.client.renderer.feature.ModelFeatureRenderer.CrumblingOverlay crumbling) {
 			// End Crystal is a complete, explicitly admitted model family in the
 			// Rust whole-frame route. Forward only that state from this text replay;
@@ -2336,6 +2340,13 @@ public class LevelRenderer implements ResourceManagerReloadListener, AutoCloseab
 	 * used only to make missing Rust frontends explicit before route admission.
 	 */
 	private static final class WorldFeatureCoverageCollector implements SubmitNodeCollector {
+		@Override public <S> void submitModelOutlineSemanticTexture(net.minecraft.client.model.Model<? super S> model, S state,
+			PoseStack poseStack, RenderType material, int light, net.minecraft.resources.ResourceLocation textureIdentity, int outlineColor) {
+			if (textureIdentity == null || !net.vulkanic.world.RustGalWorldPrimitiveRenderer.hasCurrentFrameRustModelMeshDecision(model, textureIdentity)
+				|| !net.vulkanic.world.WorldRenderRoutePolicy.currentModelMeshRoute(true).usesRustWholeFrameVulkan()) {
+				this.modelSubmits++;
+			}
+		}
 		private static final int MAX_DIAGNOSTIC_SAMPLES = 8;
 		private int modelSubmits;
 		private int modelPartSubmits;

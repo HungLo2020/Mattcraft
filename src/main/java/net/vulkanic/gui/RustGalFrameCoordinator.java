@@ -299,6 +299,8 @@ public final class RustGalFrameCoordinator {
 				&& previous.format() == asset.format()
 				&& previous.width() == asset.width()
 				&& previous.height() == asset.height()
+				&& previous.samplingFilter() == asset.samplingFilter()
+				&& previous.samplingAddress() == asset.samplingAddress()
 				&& Arrays.equals(previous.pixels(), asset.pixels())) {
 				return;
 			}
@@ -387,7 +389,7 @@ public final class RustGalFrameCoordinator {
 			&& primitiveFrame.segments().isEmpty()
 				&& primitiveFrame.crackQuads().isEmpty()
 				&& primitiveFrame.borderQuads().isEmpty()
-				&& primitiveFrame.materialQuads().isEmpty()
+				&& primitiveFrame.materialQuads().isEmpty() && primitiveFrame.particleQuads().isEmpty()
 				&& primitiveFrame.textQuads().isEmpty()
 				&& primitiveFrame.meshInstances().isEmpty()
 				&& primitiveFrame.lodInstances().isEmpty()
@@ -862,7 +864,7 @@ public final class RustGalFrameCoordinator {
 				if (!primitiveFrame.segments().isEmpty()
 					|| !primitiveFrame.crackQuads().isEmpty()
 					|| !primitiveFrame.borderQuads().isEmpty()
-					|| !primitiveFrame.materialQuads().isEmpty()
+					|| !primitiveFrame.materialQuads().isEmpty() || !primitiveFrame.particleQuads().isEmpty()
 					|| !primitiveFrame.meshInstances().isEmpty()) {
 					RenderDocCaptureHook.triggerNextFrameOnce(
 						"rust-vulkan-whole-frame-world#" + correlationId
@@ -1007,6 +1009,7 @@ public final class RustGalFrameCoordinator {
 				// comparator honest without pretending that Sodium or DH Java renderers
 				// ran on the Rust route.
 				RustGalWorldPrimitiveRenderer.requireAcceptedParticleTextures(primitiveFrame.materialQuads());
+				RustGalWorldPrimitiveRenderer.requireAcceptedSemanticParticleTextures(primitiveFrame.particleQuads());
 				wholeFrameResult = bridge.submitWholeFrameWithAffineGuiAndWorldTextAndFirstPerson(
 					generation,
 					frameId,
@@ -1040,7 +1043,9 @@ public final class RustGalFrameCoordinator {
 					postEffectId,
 					guiProjection,
 					tiledQuadRequests,
-					engineGlobals
+					engineGlobals,
+					primitiveFrame.particleQuads(),
+					primitiveFrame.orbInstances()
 				);
 				if (Boolean.getBoolean("mattmc.dev.graphicsAuditSliceMetrics")) {
 					auditMessage("Rust GUI whole-frame result mesh items=" + wholeFrameResult.guiMeshItemCount()
@@ -1177,7 +1182,7 @@ public final class RustGalFrameCoordinator {
 				RustGalWorldPrimitiveRenderer.recordWholeFrameExperienceOrbExecution(
 					frameId,
 					submissionId,
-					primitiveFrame.materialQuads()
+					primitiveFrame.materialQuads(), primitiveFrame.orbInstances()
 				);
 				RustGalWorldPrimitiveRenderer.recordWholeFrameBeaconBeamExecution(
 					frameId,
@@ -1454,7 +1459,7 @@ public final class RustGalFrameCoordinator {
 			+ " extent=" + frame.width() + "x" + frame.height()
 			+ " " + (primitiveFrame == null
 				? "material_marker_barrier_quads=0 material_marker_light_quads=0 material_marker_light_level_mask=0 material_marker_last_light_level=-1 material_marker_last_texture_id=0"
-				: RustGalWorldPrimitiveRenderer.materialMarkerSummary(primitiveFrame.materialQuads()))
+				: RustGalWorldPrimitiveRenderer.materialMarkerSummary(primitiveFrame.materialQuads(), primitiveFrame.particleQuads()))
 			+ " " + clearExpectation);
 		auditMessage("gal.frame.target.present-ready backend=vulkan frame=" + frame.frameId()
 			+ " image=" + frame.frameTargetIdentity());
@@ -1671,12 +1676,13 @@ public final class RustGalFrameCoordinator {
 		VulkanicGalBridge.WorldFeatureCoverageRecord coverage = frame.featureCoverage();
 		long particleQuads = frame.materialQuads().stream()
 			.filter(quad -> quad.sourceProgram() == RustGalWorldPrimitiveRenderer.MATERIAL_SOURCE_PARTICLES)
-			.count();
+			.count() + frame.particleQuads().size();
 		return "segments=" + frame.segments().size()
 			+ " crack_quads=" + frame.crackQuads().size()
 			+ " border_quads=" + frame.borderQuads().size()
 			+ " material_quads=" + frame.materialQuads().size()
 			+ " particle_quads=" + particleQuads
+			+ " particle_semantic_quads=" + frame.particleQuads().size()
 			+ " mesh_instances=" + frame.meshInstances().size()
 			+ " lod_instances=" + frame.lodInstances().size()
 			+ " lod_route_selected=" + lodRouteSelected(frame.lodRenderFrame())
@@ -2161,8 +2167,7 @@ public final class RustGalFrameCoordinator {
 
 	/** Resource traffic must progress even when no frame is drawn or presented. */
 	public static void pumpAtlasAnimationResources() {
-		if (!net.vulkanic.world.AtlasAnimationResource.privateTickDeliveryEnabled()
-			|| !RustGalVulkanWholeFrameMode.enabledForBackend(VulkanicAPI.isVulkanBackendSelected())) return;
+		if (!RustGalVulkanWholeFrameMode.enabledForBackend(VulkanicAPI.isVulkanBackendSelected())) return;
 		synchronized (LOCK) {
 			// The existing coordinator owns the sole native context. Never create
 			// a second presenter or consult a Java graphics context for this pump.
@@ -2180,6 +2185,7 @@ public final class RustGalFrameCoordinator {
 				net.vulkanic.world.RustGalTerrainRenderer.ensureTerrainAtlasAssetForWorldMesh();
 			}
 			RustGalWorldPrimitiveRenderer.ensureParticleAtlasAnimationAsset();
+			RustGalWorldPrimitiveRenderer.ensureShieldAtlasAnimationAsset();
 			var status = RustGalWorldPrimitiveRenderer.flushPendingWorldMeshAssets(bridge);
 			if (status != null) recordStatus(Operation.WORLD_MESH_ASSET_UPDATE, status);
 			RustGalWorldPrimitiveRenderer.flushPendingAtlasAnimationTicks(bridge);

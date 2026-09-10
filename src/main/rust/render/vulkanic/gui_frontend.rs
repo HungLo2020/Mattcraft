@@ -724,6 +724,7 @@ fn direct_gui_mesh_raster_key(
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GuiMeshCompositeKey {
+    item_identity: u64,
     width: u32,
     height: u32,
     color_format: ColorFormat,
@@ -761,7 +762,11 @@ pub struct GuiFrontend {
     mesh_composites: BTreeMap<GuiMeshCompositeKey, GuiMeshCompositeResources>,
     item_rasters: BTreeMap<GuiMeshCompositeKey, GuiItemRasterResources>,
     item_raster_slots: super::gui_item_raster::GuiItemRasterSlots,
-    mesh_geometry_cache: BTreeMap<(GuiMeshRasterKey, u64), GuiMeshGeometryResidency>,
+    // A prepared upload is reusable only within its command transaction.
+    // Older allocations remain reserved until completion, but preparation
+    // alone is never evidence that their bytes reached the GPU.
+    mesh_geometry_transaction: u64,
+    mesh_geometry_cache: BTreeMap<(GuiMeshRasterKey, u64, u64), GuiMeshGeometryResidency>,
     mesh_geometry_free_ranges: BTreeMap<GuiMeshRasterKey, Vec<GuiMeshGeometryResidency>>,
     mesh_composite_uniform_cursor: u64,
     blur_resources: Option<GuiBlurResources>,
@@ -1252,6 +1257,7 @@ pub struct GuiRawImageAssetPayload {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub sampling: Option<(SamplerFilter, SamplerAddressMode)>,
 }
 
 /// One immutable item-local layer: no screen placement or scheduler identity.
@@ -1459,6 +1465,7 @@ struct RawGuiImage {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+    sampling: Option<(SamplerFilter, SamplerAddressMode)>,
 }
 
 #[derive(Clone)]
@@ -1576,7 +1583,7 @@ impl GuiFrontend {
             let oldest = self
                 .mesh_geometry_cache
                 .iter()
-                .filter(|((key, _), _)| *key == raster_key)
+                .filter(|((key, _, _), _)| *key == raster_key)
                 .map(|(_, residency)| residency.last_submission)
                 .min()
                 .ok_or_else(|| {
@@ -1643,6 +1650,18 @@ impl GuiFrontend {
                 let _ = gal.destroy(handle);
             }
         }
+        for pipeline in std::mem::take(&mut self.shared_pipelines).into_values() {
+            for handle in pipeline.handles_in_destroy_order() {
+                let _ = gal.destroy(handle);
+            }
+        }
+        let mesh_rasters = std::mem::take(&mut self.mesh_rasters);
+        for resources in mesh_rasters.into_values() {
+            resources.destroy_asset_resources(gal);
+        }
+        // Mesh raster resource sets also reference these images/samplers.
+        // Release every consuming set before its owned image: otherwise GAL
+        // correctly rejects destruction and taking the map would orphan it.
         for texture in std::mem::take(&mut self.dynamic_textures).into_values() {
             for handle in [
                 texture.texture_view,
@@ -1653,15 +1672,6 @@ impl GuiFrontend {
             ] {
                 let _ = gal.destroy(handle);
             }
-        }
-        for pipeline in std::mem::take(&mut self.shared_pipelines).into_values() {
-            for handle in pipeline.handles_in_destroy_order() {
-                let _ = gal.destroy(handle);
-            }
-        }
-        let mesh_rasters = std::mem::take(&mut self.mesh_rasters);
-        for resources in mesh_rasters.into_values() {
-            resources.destroy_asset_resources(gal);
         }
         for program in std::mem::take(&mut self.mesh_shared_programs).into_values() {
             program.destroy(gal);
@@ -1870,6 +1880,7 @@ impl GuiFrontend {
                 .insert(
                     payload.asset_id,
                     RawGuiImage {
+                        sampling: payload.sampling,
                         format: payload.format,
                         width: payload.width,
                         height: payload.height,
@@ -2189,6 +2200,17 @@ impl GuiFrontend {
                 }
             }
         }
+        // Partial image replacement has the same dependency order as full
+        // teardown: mesh descriptor sets must release their sampled views
+        // and samplers before the shared texture ownership records are removed.
+        let mesh_rasters = std::mem::take(&mut self.mesh_rasters);
+        for (key, resources) in mesh_rasters {
+            if asset_ids.contains(&key.asset_id) {
+                resources.destroy_asset_resources(gal);
+            } else {
+                self.mesh_rasters.insert(key, resources);
+            }
+        }
         for texture_key in texture_keys {
             if let Some(texture) = self.dynamic_textures.remove(&texture_key) {
                 for handle in [
@@ -2202,16 +2224,8 @@ impl GuiFrontend {
                 }
             }
         }
-        let mesh_rasters = std::mem::take(&mut self.mesh_rasters);
-        for (key, resources) in mesh_rasters {
-            if asset_ids.contains(&key.asset_id) {
-                resources.destroy_asset_resources(gal);
-            } else {
-                self.mesh_rasters.insert(key, resources);
-            }
-        }
         self.mesh_geometry_cache
-            .retain(|(key, _), _| !asset_ids.contains(&key.asset_id));
+            .retain(|(key, _, _), _| !asset_ids.contains(&key.asset_id));
         self.mesh_geometry_free_ranges
             .retain(|key, _| !asset_ids.contains(&key.asset_id));
     }
@@ -3399,6 +3413,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: super::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -4896,7 +4912,7 @@ impl GuiFrontend {
         let mut next_slots = self.item_raster_slots.clone();
         let placements = next_slots.prepare_groups(scale,&unique_identities,4096)?;
         let [width,height] = placements[0].target_extent;
-        let key = GuiMeshCompositeKey {width,height,color_format:color,depth_format:depth};
+        let key = GuiMeshCompositeKey {item_identity:0,width,height,color_format:color,depth_format:depth};
         if !self.item_rasters.contains_key(&key) {
             let pixels: u64 = self.item_rasters.keys().map(|key| u64::from(key.width)*u64::from(key.height)).sum();
             if self.item_rasters.len() >= 4 || pixels + u64::from(width)*u64::from(height) > 32*1024*1024 {
@@ -4974,12 +4990,12 @@ impl GuiFrontend {
         batches: &[GuiMeshBatchRequest]) -> GalResult<()> {
         for batch in batches {
             let atlas = self.atlas_references.contains(batch.asset_id);
-            if batch.item_raster_scale != 0 && batch.material_mode != GuiMeshMaterialMode::Glint && !atlas {
-                return Err(GalError::invalid_argument("flat item mesh requires an owner-backed atlas base layer"));
+            if batch.item_raster_scale != 0 && !atlas && !self.raw_images.contains_key(&batch.asset_id) {
+                return Err(GalError::invalid_argument("native item mesh requires an explicitly owned atlas or image resource"));
             }
             if !atlas { continue; }
-            if batch.item_raster_scale == 0 || batch.material_mode == GuiMeshMaterialMode::Glint {
-                return Err(GalError::unsupported_feature("GUI mesh atlas sampling requires a native flat base layer"));
+            if !mesh_atlas_contract_supported(batch) {
+                return Err(GalError::unsupported_feature("GUI mesh atlas sampling requires an explicit inventory base or front-model overlay layer"));
             }
             let owner = world.ok_or_else(|| GalError::invalid_argument("GUI mesh atlas sampling requires its explicit Rust image owner"))?;
             owner.require_gui_atlas_upload_boundary()?;
@@ -5034,6 +5050,8 @@ impl GuiFrontend {
             );
         }
         let ordered = order_gui_requests_with_tiles(requests, affine_quads, mesh_batches, tiled_quads)?;
+        self.mesh_geometry_transaction = self.mesh_geometry_transaction.checked_add(1)
+            .ok_or_else(|| GalError::invalid_argument("GUI mesh transaction identity exhausted"))?;
         if generation != self.generation {
             self.destroy_render_resources(gal);
             self.generation = generation;
@@ -5303,8 +5321,8 @@ impl GuiFrontend {
         // The geometry keeps original sprite-local UVs until this native boundary.
         for (batch, draw) in mesh_batches.iter().zip(&mut prepared) {
             if !self.atlas_references.contains(draw.asset_id) { continue; }
-            if batch.item_raster_scale == 0 || draw.material_mode == GuiMeshMaterialMode::Glint {
-                return Err(GalError::unsupported_feature("GUI mesh atlas sampling requires a native flat base layer"));
+            if !mesh_atlas_contract_supported(batch) {
+                return Err(GalError::unsupported_feature("GUI mesh atlas sampling requires an explicit inventory base or front-model overlay layer"));
             }
             let owner = world.as_deref().ok_or_else(|| GalError::invalid_argument(
                 "GUI mesh atlas sampling requires its explicit Rust image owner"))?;
@@ -5381,7 +5399,7 @@ impl GuiFrontend {
                     self.mesh_rasters.insert(raster_key, raster);
                     stats.resource_creates = stats.resource_creates.saturating_add(1);
                 }
-                let geometry_key = (raster_key, gui_mesh_geometry_fingerprint(first));
+                let geometry_key = (raster_key, gui_mesh_geometry_fingerprint(first), self.mesh_geometry_transaction);
                 let vertex_bytes = (first.vertices.len() * super::gui_mesh_frontend::GUI_MESH_GPU_VERTEX_BYTES) as u64;
                 let index_bytes = (first.indices.len() * std::mem::size_of::<u32>()) as u64;
                 let (stream, reused) = if let Some(residency) = self.mesh_geometry_cache.get_mut(&geometry_key) {
@@ -5411,7 +5429,8 @@ impl GuiFrontend {
                 cursor = group_end;
                 continue;
             }
-            let mut target = self.mesh_targets.stage(
+            let item_identity = first.item_cache.map_or(0, |cache| cache.identity);
+            let mut target = self.mesh_targets.stage_item(
                 gal,
                 generation,
                 Extent3d {
@@ -5419,11 +5438,21 @@ impl GuiFrontend {
                     height: first.render_extent[1],
                     depth: 1,
                 },
+                item_identity,
             )?;
+            let accepted_raster = gal.render_pass_last_submission(target.pass)?;
+            // Preparation may be discarded. Persisted layout state is proven
+            // by this pass's accepted submission, or by an earlier item in
+            // the same command transaction, never by a previous preparation.
+            target.initialized = accepted_raster.is_some()
+                || stats.owned_intermediate_targets.contains(&target.target);
+            let reuse_pixels = first.item_cache.is_some_and(|cache| !cache.animated)
+                && accepted_raster.is_some();
             if !stats.owned_intermediate_targets.contains(&target.target) {
                 stats.owned_intermediate_targets.push(target.target);
             }
-            for draw in item_layers {
+            for (execution_index, layer_index) in mesh_item_layer_execution_order(item_layers).into_iter().enumerate().filter(|_| !reuse_pixels) {
+                let draw = &item_layers[layer_index];
                 let texture_group = dynamic_mesh_texture_group(draw);
                 if self.atlas_references.contains(draw.asset_id) {
                     self.prepare_owned_atlas_binding_group(gal, world.as_deref_mut().ok_or_else(||
@@ -5478,7 +5507,7 @@ impl GuiFrontend {
                     self.mesh_rasters.insert(raster_key, raster);
                     stats.resource_creates = stats.resource_creates.saturating_add(1);
                 }
-                let geometry_key = (raster_key, gui_mesh_geometry_fingerprint(draw));
+                let geometry_key = (raster_key, gui_mesh_geometry_fingerprint(draw), self.mesh_geometry_transaction);
                 let vertex_bytes = (draw.vertices.len()
                     * super::gui_mesh_frontend::GUI_MESH_GPU_VERTEX_BYTES)
                     as u64;
@@ -5507,7 +5536,7 @@ impl GuiFrontend {
                         target,
                         draw,
                         stream,
-                        draw.layer_index == 0,
+                        execution_index == 0,
                         &mut operations,
                     )?;
                 } else {
@@ -5515,16 +5544,16 @@ impl GuiFrontend {
                         target,
                         draw,
                         stream,
-                        draw.layer_index == 0,
+                        execution_index == 0,
                         &mut operations,
                     )?;
                 }
-                self.mesh_targets.mark_initialized(target.target);
                 target.initialized = true;
                 stats.mesh_batch_count = stats.mesh_batch_count.saturating_add(1);
                 stats.mesh_draw_count = stats.mesh_draw_count.saturating_add(1);
             }
             let composite_key = GuiMeshCompositeKey {
+                item_identity,
                 width: target.extent.width,
                 height: target.extent.height,
                 color_format,
@@ -5556,6 +5585,7 @@ impl GuiFrontend {
                 .ok_or_else(|| GalError::backend("GUI mesh compositor vanished before draw"))?;
             composite.append_composite(
                 target,
+                if reuse_pixels { TextureUsageState::ShaderRead } else { TextureUsageState::ColorAttachment },
                 frame_pass,
                 render_target,
                 color_attachment,
@@ -5755,6 +5785,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: group.blend(),
                 depth_compare: if key.depth_compare == 0 {
                     None
@@ -5964,14 +5996,18 @@ impl GuiFrontend {
                     (upload_buffer, texture, sampler, texture_view, false)
                 };
             let private_sampler = if matches!(group, TextureGroup::DynamicGlint(_)) {
+                let TextureGroup::DynamicGlint(asset_id) = group else { unreachable!() };
+                let (filter, address) = self.raw_images.get(&asset_id)
+                    .and_then(|image| image.sampling)
+                    .unwrap_or((SamplerFilter::Linear, SamplerAddressMode::Repeat));
                 let sampler = gal.create_sampler(SamplerDesc {
-                    label: format!("{label}.sampler.linear-repeat"),
-                    min_filter: SamplerFilter::Linear,
-                    mag_filter: SamplerFilter::Linear,
+                    label: format!("{label}.sampler.resource-glint"),
+                    min_filter: filter,
+                    mag_filter: filter,
                     mip_filter: SamplerFilter::Nearest,
-                    address_u: SamplerAddressMode::Repeat,
-                    address_v: SamplerAddressMode::Repeat,
-                    address_w: SamplerAddressMode::Repeat,
+                    address_u: address,
+                    address_v: address,
+                    address_w: address,
                     comparison: None,
                 })?;
                 created.push(sampler);
@@ -6361,6 +6397,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -6546,6 +6584,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -6563,6 +6603,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -6580,6 +6622,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -6602,6 +6646,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -6619,6 +6665,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -6636,6 +6684,8 @@ impl GuiFrontend {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -6957,6 +7007,29 @@ fn append_gui_batches_ops(
     Ok(())
 }
 
+fn mesh_atlas_contract_supported(batch: &GuiMeshBatchRequest) -> bool {
+    if batch.material_mode == GuiMeshMaterialMode::ModelOverlay {
+        return batch.item_raster_scale != 0
+            && batch.lighting_mode == GuiMeshLightingMode::FrontModel
+            && batch.alpha_cutoff == 0.0 && batch.item_foil.is_none();
+    }
+    (batch.item_raster_scale != 0 || batch.lighting_mode == GuiMeshLightingMode::InventoryBlock)
+        && matches!(batch.material_mode,
+            GuiMeshMaterialMode::Opaque | GuiMeshMaterialMode::Cutout | GuiMeshMaterialMode::Translucent)
+}
+
+/// Semantic model overlays finish before the item's depth-equal foil pass.
+/// Frozen's fixed entity-glint buffer is flushed after shield pattern buffers;
+/// express that dependency here without asking Java to sort GPU passes.
+/// Other item families keep their existing authored order.
+fn mesh_item_layer_execution_order(layers: &[GuiMeshPreparedDraw]) -> Vec<usize> {
+    let mut order: Vec<_> = (0..layers.len()).collect();
+    if layers.iter().any(|layer| layer.material_mode == GuiMeshMaterialMode::ModelOverlay) {
+        order.sort_by_key(|index| (layers[*index].material_mode == GuiMeshMaterialMode::Glint, *index));
+    }
+    order
+}
+
 fn validate_mesh_item_layers(layers: &[GuiMeshPreparedDraw]) -> GalResult<()> {
     let first = layers.first().ok_or_else(|| {
         GalError::ffi(
@@ -6966,6 +7039,7 @@ fn validate_mesh_item_layers(layers: &[GuiMeshPreparedDraw]) -> GalResult<()> {
     })?;
     for (expected_layer, layer) in layers.iter().enumerate() {
         if layer.layer_index != expected_layer as u32
+            || layer.item_cache != first.item_cache
             || layer.bounds != first.bounds
             || layer.gui_pose != first.gui_pose
             || layer.gui_extent != first.gui_extent
@@ -8839,7 +8913,7 @@ mod tests {
             .apply_raw_image_update(
                 &mut gal,
                 1,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 41,
                     format: GuiRawImageFormat::Rgba8,
                     width: (pixels.len() / 4) as u32 / height,
@@ -8890,7 +8964,7 @@ mod tests {
         } else { (vec![template], Vec::new()) };
         let mut quads = quads;
         if mixed {
-            frontend.apply_raw_image_update(&mut gal, 1, vec![GuiRawImageAssetPayload {
+            frontend.apply_raw_image_update(&mut gal, 1, vec![GuiRawImageAssetPayload { sampling: None,
                 asset_id: 42, format: GuiRawImageFormat::Rgba8, width: 1, height: 1,
                 pixels: vec![0, 0, 255, 128],
             }]).unwrap();
@@ -10556,11 +10630,83 @@ void main() { fragColor = texture(InSampler, texCoord); }
         }
     }
 
+    #[test]
+    fn native_model_item_uses_registered_owned_image_without_borrowing_an_atlas() {
+        let mut gal = mock_gal();
+        let target = frame_target(&mut gal);
+        let mut frontend = GuiFrontend::default();
+        let mut request = mesh_batch(0);
+        request.item_raster_scale = 2;
+        request.render_extent = [0,0];
+        request.guard_pixels = 0;
+        request.model_transform = [0.8,0.,-0.6,0., 0.,1.,0.,0., 0.6,0.,0.8,0., 0.,0.,0.,1.];
+        request.lighting_mode = GuiMeshLightingMode::Flat;
+        request.item_lighting = Some(super::super::gui_mesh_frontend::GuiFlatItemLighting {
+            lightmap_generation: 1, rgb: [1.;3],
+        });
+        let before = gal.metrics().resource_creates;
+        assert!(frontend.append_mesh_items_to_target(&mut gal, None, 1, SubmissionId(1),
+            target, target, None, None, None, vec![request.clone()], &mut GuiSubmitStats::default()).is_err());
+        assert_eq!(before, gal.metrics().resource_creates);
+        frontend.apply_raw_image_update(&mut gal, 1, vec![GuiRawImageAssetPayload { sampling: None,
+            asset_id: 7, format: GuiRawImageFormat::Rgba8, width: 2, height: 2, pixels: vec![255;16],
+        }]).unwrap();
+        let mut stats = GuiSubmitStats::default();
+        let ops = frontend.append_mesh_items_to_target(&mut gal, None, 1, SubmissionId(1),
+            target, target, None, None, None, vec![request.clone()], &mut stats).unwrap();
+        assert!(!ops.is_empty());
+        assert_eq!(stats.mesh_item_count, 1);
+        assert!(frontend.resources.values().all(|binding| !matches!(binding.image_ownership, GuiImageOwnership::AtlasView)));
+        request.asset_id = 8;
+        assert!(frontend.preflight_mesh_atlas_commands(None, &[request]).is_err());
+        frontend.reset(&mut gal).unwrap();
+        gal.destroy(target).unwrap();
+        // Creating the owned image submitted an upload. Destruction must
+        // remain deferred until that actual submission has completed.
+        let completed = gal.latest_submission_id();
+        gal.mock_backend_mut().unwrap().complete_through(completed);
+        gal.retire_through(completed).unwrap();
+        assert_eq!(gal.metrics().resource_creates, gal.metrics().resource_destroys);
+    }
+
+    #[test]
+    fn model_overlay_passes_finish_before_foil_without_changing_authored_layers() {
+        let requests: Vec<_> = (0..6).map(|i| {
+            let mut request=mesh_batch(i);
+            request.item_raster_scale=3; request.render_extent=[0,0];request.guard_pixels=0;
+            request.model_transform=[1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.];
+            request.material_mode=if i==2 {GuiMeshMaterialMode::Glint}
+                else if i>=3 {GuiMeshMaterialMode::ModelOverlay} else {GuiMeshMaterialMode::Opaque};
+            request.lighting_mode=if i==2 {GuiMeshLightingMode::Flat} else {GuiMeshLightingMode::FrontModel};
+            request.alpha_cutoff=if i==2 {0.1} else {0.0};
+            if i==2 {
+                request.item_foil=Some(super::super::item_foil::StandardItemFoil {
+                    kind:super::super::item_foil::StandardFoilKind::Entity,clock_millis:0,speed:0.,strength:0.5 });
+            } else {
+                request.item_lighting=Some(super::super::gui_mesh_frontend::GuiFlatItemLighting {
+                    lightmap_generation:1,rgb:[1.;3] });
+            }
+            request
+        }).collect();
+        let mut draws=prepare_gui_mesh_draws(&requests).unwrap();
+        validate_mesh_item_layers(&draws).unwrap();
+        assert_eq!(mesh_item_layer_execution_order(&draws),vec![0,1,3,4,5,2]);
+        assert_eq!(draws.iter().map(|draw|draw.layer_index).collect::<Vec<_>>(),vec![0,1,2,3,4,5]);
+        // This dependency must not reorder unrelated authored item layers.
+        for draw in &mut draws { if draw.material_mode==GuiMeshMaterialMode::ModelOverlay {
+            draw.material_mode=GuiMeshMaterialMode::Translucent;
+        }}
+        assert_eq!(mesh_item_layer_execution_order(&draws),vec![0,1,2,3,4,5]);
+    }
+
     fn mesh_batch(layer_index: u32) -> GuiMeshBatchRequest {
         GuiMeshBatchRequest {
+            item_cache: None,
+            block_item_raster: None,
             item_raster_scale: 0,
             item_lighting: None,
             item_foil: None,
+            decal_foil: None,
             stratum: 420,
             layer_index,
             sequence: 9,
@@ -10589,21 +10735,21 @@ void main() { fragColor = texture(InSampler, texCoord); }
                     atlas_uv: [0.0, 0.0],
                     local_uv: [0.0, 0.0],
                     color_argb: 0xffff_ffff,
-                    normal_packed: 0x007f_0000,
+                    normal_packed: 0x007f_0000, source_face: 0, source_foil_type: 0,
                 },
                 GuiMeshVertex {
                     position: [1.0, 0.0, 0.0],
                     atlas_uv: [1.0, 0.0],
                     local_uv: [1.0, 0.0],
                     color_argb: 0xffff_ffff,
-                    normal_packed: 0x007f_0000,
+                    normal_packed: 0x007f_0000, source_face: 0, source_foil_type: 0,
                 },
                 GuiMeshVertex {
                     position: [0.0, 1.0, 0.0],
                     atlas_uv: [0.0, 1.0],
                     local_uv: [0.0, 1.0],
                     color_argb: 0xffff_ffff,
-                    normal_packed: 0x007f_0000,
+                    normal_packed: 0x007f_0000, source_face: 0, source_foil_type: 0,
                 },
             ],
             indices: vec![0, 1, 2],
@@ -10623,11 +10769,11 @@ void main() { fragColor = texture(InSampler, texCoord); }
         let first = frontend
             .allocate_mesh_geometry(&mut gal, key, 1_024, 256, SubmissionId(3))
             .expect("first private stream range");
-        frontend.mesh_geometry_cache.insert((key, 1), first);
+        frontend.mesh_geometry_cache.insert((key, 1, 0), first);
         let second = frontend
             .allocate_mesh_geometry(&mut gal, key, 1_024, 256, SubmissionId(4))
             .expect("second private stream range");
-        frontend.mesh_geometry_cache.insert((key, 2), second);
+        frontend.mesh_geometry_cache.insert((key, 2, 0), second);
 
         frontend.reclaim_completed_mesh_geometry(SubmissionId(2));
         let while_in_flight = frontend
@@ -10664,7 +10810,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
                 reserved,
             )
             .expect("the fixed stream admits one full allocation");
-        frontend.mesh_geometry_cache.insert((key, 1), full);
+        frontend.mesh_geometry_cache.insert((key, 1, 0), full);
         let accepted = gal.submit(SubmissionBatch {
             label: "accepted-stream-reservation".into(),
             command_lists: vec![CommandList::from(CommandListDesc {
@@ -10700,7 +10846,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
                 SubmissionId(3),
             )
             .expect("the current frame can reserve the stream");
-        frontend.mesh_geometry_cache.insert((key, 1), reservation);
+        frontend.mesh_geometry_cache.insert((key, 1, 0), reservation);
 
         let error = frontend
             .allocate_mesh_geometry(&mut gal, key, 48, 4, SubmissionId(3))
@@ -10722,7 +10868,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 1,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 7,
                     format: GuiRawImageFormat::Rgba8,
                     width: 1,
@@ -10750,21 +10896,21 @@ void main() { fragColor = texture(InSampler, texCoord); }
                     atlas_uv: [0.0, 0.0],
                     local_uv: [-1.0, -1.0],
                     color_argb: 0xffff_ffff,
-                    normal_packed: 0x007f_0000,
+                    normal_packed: 0x007f_0000, source_face: 0, source_foil_type: 0,
                 },
                 GuiMeshVertex {
                     position: [2.0, 1.0, frame as f32 / 10.0],
                     atlas_uv: [0.0, 0.0],
                     local_uv: [3.0, -1.0],
                     color_argb: 0xffff_ffff,
-                    normal_packed: 0x007f_0000,
+                    normal_packed: 0x007f_0000, source_face: 0, source_foil_type: 0,
                 },
                 GuiMeshVertex {
                     position: [0.0, -1.0, frame as f32 / 10.0],
                     atlas_uv: [0.0, 0.0],
                     local_uv: [-1.0, 3.0],
                     color_argb: 0xffff_ffff,
-                    normal_packed: 0x007f_0000,
+                    normal_packed: 0x007f_0000, source_face: 0, source_foil_type: 0,
                 },
             ];
             panorama.indices = vec![0, 1, 2];
@@ -10834,7 +10980,8 @@ void main() { fragColor = texture(InSampler, texCoord); }
     }
 
     #[test]
-    fn flat_mesh_atlas_uses_explicit_owner_and_native_sprite_uv_mapping() {
+    fn inventory_mesh_atlas_uses_explicit_owner_and_native_sprite_uv_mapping() {
+        for (block_lit, overlay) in [(false, false), (true, false), (false, true)] {
         use super::super::world_primitive_frontend::{WorldPrimitiveFrontend, WorldMeshTextureAssetPayload, WORLD_MATERIAL_TEXTURE_STONE};
         let mut gal = mock_gal();
         let target = frame_target(&mut gal);
@@ -10865,9 +11012,32 @@ void main() { fragColor = texture(InSampler, texCoord); }
         request.item_lighting = Some(super::super::gui_mesh_frontend::GuiFlatItemLighting {
             lightmap_generation: 1, rgb: [1.0; 3],
         });
+        if block_lit {
+            request.item_raster_scale = 0;
+            request.render_extent = [34,34];
+            request.guard_pixels = 1;
+            request.lighting_mode = GuiMeshLightingMode::InventoryBlock;
+        }
+        if overlay {
+            request.material_mode = GuiMeshMaterialMode::ModelOverlay;
+            request.lighting_mode = GuiMeshLightingMode::FrontModel;
+            request.alpha_cutoff = 0.0;
+            let mut wrong_lighting = request.clone();
+            wrong_lighting.lighting_mode = GuiMeshLightingMode::Flat;
+            assert!(frontend.preflight_mesh_atlas_commands(Some(&world), &[wrong_lighting]).is_err());
+            let mut wrong_cutout = request.clone();
+            wrong_cutout.alpha_cutoff = 0.1;
+            assert!(frontend.preflight_mesh_atlas_commands(Some(&world), &[wrong_cutout]).is_err());
+        }
         let before = gal.metrics().resource_creates;
         let mut invalid = request.clone(); invalid.asset_id = 999;
-        assert!(frontend.preflight_mesh_atlas_commands(Some(&world), &[invalid]).is_err());
+        if !block_lit { assert!(frontend.preflight_mesh_atlas_commands(Some(&world), &[invalid]).is_err()); }
+        let mut unsupported = request.clone();
+        unsupported.item_raster_scale = 0;
+        unsupported.lighting_mode = GuiMeshLightingMode::Block;
+        assert!(frontend.preflight_mesh_atlas_commands(Some(&world), &[unsupported]).is_err());
+        let mut foil = request.clone(); foil.material_mode = GuiMeshMaterialMode::Glint;
+        assert!(frontend.preflight_mesh_atlas_commands(Some(&world), &[foil]).is_err());
         assert!(frontend.append_frame_ops_with_owned_atlases_and_blur_boundary(&mut gal, None,
             1, target, target, Vec::new(), Vec::new(), vec![request.clone()], Vec::new(),
             400, 2, false).is_err());
@@ -10894,6 +11064,179 @@ void main() { fragColor = texture(InSampler, texCoord); }
         assert!(frontend.atlas_views.is_empty());
         assert!(frontend.mesh_rasters.is_empty());
         frontend.reset(&mut gal).unwrap();
+        }
+    }
+
+    #[test]
+    fn vulkan_item_cache_retains_pixels_moves_composition_and_invalidates_identity_and_reload() {
+        use crate::render::vulkanic::gui_mesh_frontend::GuiItemCache;
+        use crate::render::vulkanic::gui_item_raster::GuiItemRasterTarget;
+        for animated in [false, true] {
+            let backend = VulkanBackend::new("GUI item cache pixel lifetime").unwrap();
+            let mut gal = VulkanicGal::new_with_backend(Box::new(backend), false);
+            let mut frontend = GuiFrontend::default();
+            let extent = Extent3d { width: 32, height: 16, depth: 1 };
+            let target = GuiItemRasterTarget::create(&mut gal, extent).unwrap();
+            let readback = gal.create_buffer(BufferDesc {
+                label: "item-cache.readback".into(), size: 32 * 16 * 4,
+                memory: MemoryDomain::Readback,
+                usages: vec![BufferUsage::TransferDst, BufferUsage::HostRead],
+            }).unwrap();
+            let mut first_pixels = Vec::new();
+            let mut second_pixels = Vec::new();
+            for step in 0..=4 {
+                let generation = if step == 4 { 2 } else { 1 };
+                if step == 0 || step == 4 {
+                    frontend.apply_raw_image_update(&mut gal, generation, vec![GuiRawImageAssetPayload {
+                        sampling: None, asset_id: 7, format: GuiRawImageFormat::Rgba8,
+                        width: 1, height: 1,
+                        pixels: if step == 0 { vec![255,0,0,255] } else { vec![0,0,255,255] },
+                    }]).unwrap();
+                }
+                if step == 1 {
+                    // Simulate an in-place owned-atlas animation upload. This
+                    // must not invalidate a static item's already rasterized pixels.
+                    let source = frontend.dynamic_textures[&(7, GuiRawImageFormat::Rgba8)];
+                    gal.submit(SubmissionBatch { label: "source mutation".into(),
+                        command_lists: vec![CommandList::from(CommandListDesc {
+                            label: "owned texture mutation".into(), operations: vec![
+                                CommandOp::Barrier(buffer_barrier(source.upload_buffer,
+                                    TextureUsageState::TransferSrc, TextureUsageState::TransferDst)),
+                                CommandOp::HostWriteBuffer { buffer: source.upload_buffer, offset: 0,
+                                    data: vec![0,255,0,255] },
+                                CommandOp::Barrier(buffer_barrier(source.upload_buffer,
+                                    TextureUsageState::TransferDst, TextureUsageState::TransferSrc)),
+                                CommandOp::Barrier(texture_barrier(source.texture,
+                                    TextureUsageState::ShaderRead, TextureUsageState::TransferDst)),
+                                CommandOp::CopyBufferToTexture(BufferImageCopyRegion {
+                                    buffer: source.upload_buffer, buffer_offset: 0, bytes_per_row: 4,
+                                    rows_per_image: 1, texture: source.texture, texture_mip: 0,
+                                    texture_layer: 0, texture_origin: TextureOrigin3d {x:0,y:0,z:0},
+                                    extent: Extent3d {width:1,height:1,depth:1},
+                                }),
+                                CommandOp::Barrier(texture_barrier(source.texture,
+                                    TextureUsageState::TransferDst, TextureUsageState::ShaderRead)),
+                            ],
+                        })],
+                    }).unwrap();
+                }
+                let mut request = mesh_batch(0);
+                request.item_cache = Some(GuiItemCache { identity: if step == 3 { 2 } else { 1 }, animated });
+                request.item_raster_scale = 1;
+                request.render_extent = [0,0];
+                request.guard_pixels = 0;
+                request.lighting_mode = GuiMeshLightingMode::FrontModel;
+                request.item_lighting = Some(crate::render::vulkanic::gui_item_material::GuiFlatItemLighting {
+                    lightmap_generation: 1, rgb: [1.0;3],
+                });
+                request.model_transform = [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.];
+                for (vertex, position) in request.vertices.iter_mut().zip([
+                    [-0.5,-0.5,0.], [0.5,-0.5,0.], [-0.5,0.5,0.],
+                ]) { vertex.position = position; }
+                request.bounds = if step == 2 { [16,0,32,16] } else { [0,0,16,16] };
+                request.gui_extent = [32,16];
+                request.projection_extent = [32.,16.];
+                let (draws, stats) = frontend.append_frame_ops_with_affine_quads_and_mesh_batches_to_target(
+                    &mut gal, generation, target.target, target.view, Some(target.pass),
+                    None, None, false, vec![], vec![], vec![request]).unwrap();
+                let mut ops = vec![
+                    CommandOp::Barrier(texture_barrier(target.color,
+                        if step == 0 { TextureUsageState::Undefined } else { TextureUsageState::TransferSrc },
+                        TextureUsageState::ColorAttachment)),
+                    CommandOp::BeginPass {pass:target.pass,target:target.target,
+                        colors:vec![PassAttachment {view:target.view,load_op:AttachmentLoadOp::Clear,
+                            store_op:AttachmentStoreOp::Store,
+                            clear_color:Some(ClearColor {r:0.,g:0.,b:0.,a:1.})}],depth_stencil:None},
+                    CommandOp::EndPass,
+                ];
+                ops.extend(draws);
+                ops.extend([
+                    CommandOp::Barrier(texture_barrier(target.color,
+                        TextureUsageState::ColorAttachment, TextureUsageState::TransferSrc)),
+                    CommandOp::CopyTextureToBuffer(BufferImageCopyRegion {
+                        buffer:readback,buffer_offset:0,bytes_per_row:32*4,rows_per_image:16,
+                        texture:target.color,texture_mip:0,texture_layer:0,
+                        texture_origin:TextureOrigin3d{x:0,y:0,z:0},extent,
+                    }),
+                    CommandOp::Barrier(buffer_barrier(readback,
+                        TextureUsageState::TransferDst,TextureUsageState::ShaderRead)),
+                    CommandOp::HostReadBuffer{buffer:readback,offset:0,size:32*16*4},
+                ]);
+                let token = gal.submit(SubmissionBatch {label:"cached item frame".into(),
+                    command_lists:vec![CommandList::from(CommandListDesc {label:"cached item commands".into(),operations:ops})],
+                }).unwrap();
+                gal.retire_through_for_test(token.submission).unwrap();
+                let pixels = gal.completed_host_reads().iter().rev()
+                    .find(|read|read.buffer==readback).unwrap().bytes.clone();
+                let channel = if step == 4 { 2 } else if step == 3 || animated && step > 0 { 1 } else { 0 };
+                assert!(pixels.chunks_exact(4).filter(|p|p[channel]>32).count()>40,
+                    "step {step} animated={animated}: actual raster must contain the expected colored geometry");
+                assert!(pixels.chunks_exact(4).all(|p|(0..3).all(|c|c==channel || p[c]==0)));
+                assert_eq!(stats.mesh_batch_count, u64::from(animated || step==0 || step>=3),
+                    "static pixels must be reused; animated/identity/reload paths must redraw");
+                if step == 0 { first_pixels = pixels.clone(); }
+                if step == 1 {
+                    if !animated { assert_eq!(pixels,first_pixels); }
+                    second_pixels = pixels.clone();
+                }
+                if step == 2 {
+                    for y in 0..16 { for x in 0..16 {
+                        assert_eq!(&pixels[(y*32+x+16)*4..][..4],&second_pixels[(y*32+x)*4..][..4]);
+                        assert_eq!(&pixels[(y*32+x)*4..][..3], &[0,0,0]);
+                    }}
+                }
+            }
+            frontend.reset(&mut gal).unwrap();
+            target.destroy(&mut gal).unwrap();
+            gal.destroy(readback).unwrap();
+            gal.retire_through(gal.latest_submission_id()).unwrap();
+            assert_eq!(gal.metrics().resource_creates,gal.metrics().resource_destroys);
+        }
+    }
+
+    #[test]
+    fn discarded_mesh_preparation_does_not_publish_attachment_layout() {
+        let mut gal = mock_gal();
+        let target = frame_target(&mut gal);
+        let mut frontend = GuiFrontend::default();
+        frontend.apply_raw_image_update(&mut gal, 1, vec![GuiRawImageAssetPayload {
+            sampling: None, asset_id: 7, format: GuiRawImageFormat::Rgba8,
+            width: 1, height: 1, pixels: vec![255; 4],
+        }]).unwrap();
+        let prepare = |frontend: &mut GuiFrontend, gal: &mut VulkanicGal| {
+            frontend.append_frame_ops_with_affine_quads_and_mesh_batches_to_target(
+                gal, 1, target, target, None, None, None, false,
+                Vec::new(), Vec::new(), vec![mesh_batch(0)]).unwrap().0
+        };
+        let discarded = prepare(&mut frontend, &mut gal);
+        let depth = discarded.iter().find_map(|op| match op {
+            CommandOp::Barrier(barrier) if barrier.after == TextureUsageState::DepthStencilAttachment
+                => Some(barrier.resource),
+            _ => None,
+        }).expect("private raster depth attachment");
+        drop(discarded);
+        let unsubmitted_retry = prepare(&mut frontend, &mut gal);
+        assert!(unsubmitted_retry.iter().any(|op| matches!(op,
+            CommandOp::HostWriteBuffer { data, .. } if data.len() == 3 * 48)),
+            "a discarded preparation cannot satisfy the retry's vertex upload");
+        assert!(unsubmitted_retry.iter().any(|op| matches!(op,
+            CommandOp::HostWriteBuffer { data, .. } if data.len() == 3 * 4)),
+            "a discarded preparation cannot satisfy the retry's index upload");
+        drop(unsubmitted_retry);
+        // Even consuming its predicted ID elsewhere proves nothing about
+        // this target's texture layouts.
+        gal.submit(SubmissionBatch {
+            label: "unrelated accepted submission".into(),
+            command_lists: vec![CommandList::from(CommandListDesc {
+                label: "empty unrelated list".into(), operations: vec![],
+            })],
+        }).unwrap();
+        let retry = prepare(&mut frontend, &mut gal);
+        assert!(retry.iter().any(|op| matches!(op,
+            CommandOp::Barrier(barrier) if barrier.resource == depth
+                && barrier.before == TextureUsageState::Undefined
+                && barrier.after == TextureUsageState::DepthStencilAttachment)));
+        frontend.reset(&mut gal).unwrap();
     }
 
     #[test]
@@ -10905,7 +11248,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 1,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 7,
                     format: GuiRawImageFormat::Rgba8,
                     width: 1,
@@ -11085,14 +11428,14 @@ void main() { fragColor = texture(InSampler, texCoord); }
                 &mut gal,
                 1,
                 vec![
-                    GuiRawImageAssetPayload {
+                    GuiRawImageAssetPayload { sampling: None,
                         asset_id: 7,
                         format: GuiRawImageFormat::Rgba8,
                         width: 1,
                         height: 1,
                         pixels: vec![255, 255, 255, 255],
                     },
-                    GuiRawImageAssetPayload {
+                    GuiRawImageAssetPayload { sampling: None,
                         asset_id: 8,
                         format: GuiRawImageFormat::Rgba8,
                         width: 1,
@@ -11649,7 +11992,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 3,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 41,
                     format: GuiRawImageFormat::Alpha8,
                     width: 2,
@@ -11711,7 +12054,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
     fn unchanged_raw_image_generation_retains_dynamic_gpu_resources() {
         let mut gal = mock_gal();
         let mut frontend = GuiFrontend::default();
-        let payload = GuiRawImageAssetPayload {
+        let payload = GuiRawImageAssetPayload { sampling: None,
             asset_id: 41,
             format: GuiRawImageFormat::Rgba8,
             width: 1,
@@ -11748,14 +12091,14 @@ void main() { fragColor = texture(InSampler, texCoord); }
                 &mut gal,
                 3,
                 vec![
-                    GuiRawImageAssetPayload {
+                    GuiRawImageAssetPayload { sampling: None,
                         asset_id: 41,
                         format: GuiRawImageFormat::Alpha8,
                         width: 2,
                         height: 2,
                         pixels: vec![255; 4],
                     },
-                    GuiRawImageAssetPayload {
+                    GuiRawImageAssetPayload { sampling: None,
                         asset_id: 42,
                         format: GuiRawImageFormat::Alpha8,
                         width: 2,
@@ -11804,7 +12147,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 1,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 41,
                     format: GuiRawImageFormat::Rgba8,
                     width: 2,
@@ -11909,7 +12252,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
         for glint_first in [false, true] {
             let mut gal = mock_gal();
             let mut frontend = GuiFrontend::default();
-            frontend.apply_raw_image_update(&mut gal, 1, vec![GuiRawImageAssetPayload {
+            frontend.apply_raw_image_update(&mut gal, 1, vec![GuiRawImageAssetPayload { sampling: None,
                 asset_id: 41, format: GuiRawImageFormat::Rgba8, width: 2, height: 2,
                 pixels: vec![127; 16],
             }]).unwrap();
@@ -11939,7 +12282,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             assert_eq!(gal.sampler_descriptor_for_test(clamp.sampler).unwrap().address_u,
                 SamplerAddressMode::ClampToEdge);
             let old_sampler = repeat.sampler;
-            frontend.apply_raw_image_update(&mut gal, 2, vec![GuiRawImageAssetPayload {
+            frontend.apply_raw_image_update(&mut gal, 2, vec![GuiRawImageAssetPayload { sampling: None,
                 asset_id: 41, format: GuiRawImageFormat::Rgba8, width: 2, height: 2,
                 pixels: vec![255; 16],
             }]).unwrap();
@@ -11952,13 +12295,52 @@ void main() { fragColor = texture(InSampler, texCoord); }
     }
 
     #[test]
+    fn gui_glint_resource_sampling_metadata_only_reload_rebinds_without_changing_shared_sampler() {
+        let mut gal = mock_gal();
+        let mut frontend = GuiFrontend::default();
+        let mut generation = 0;
+        let mut previous_sampler = None;
+        for filter in [SamplerFilter::Nearest, SamplerFilter::Linear] {
+            for address in [SamplerAddressMode::Repeat, SamplerAddressMode::ClampToEdge] {
+                generation += 1;
+                frontend.apply_raw_image_update(&mut gal, generation, vec![GuiRawImageAssetPayload {
+                    asset_id: 41, format: GuiRawImageFormat::Rgba8, width: 2, height: 2,
+                    pixels: vec![127; 16], sampling: Some((filter, address)),
+                }]).unwrap();
+                for group in [TextureGroup::Dynamic(41), TextureGroup::DynamicGlint(41)] {
+                    frontend.ensure_resources(&mut gal, group, ColorFormat::Rgba8Unorm,
+                        None, &mut GuiSubmitStats::default()).unwrap();
+                }
+                let glint = &frontend.resources[&ResourceKey::new(TextureGroup::DynamicGlint(41), ColorFormat::Rgba8Unorm, None)];
+                let ordinary = &frontend.resources[&ResourceKey::new(TextureGroup::Dynamic(41), ColorFormat::Rgba8Unorm, None)];
+                let desc = gal.sampler_descriptor_for_test(glint.sampler).unwrap();
+                assert_eq!(filter, desc.min_filter);
+                assert_eq!(filter, desc.mag_filter);
+                assert_eq!(address, desc.address_u);
+                assert_eq!(address, desc.address_v);
+                assert_eq!(glint.texture, ordinary.texture);
+                assert_eq!(SamplerAddressMode::ClampToEdge, gal.sampler_descriptor_for_test(ordinary.sampler).unwrap().address_u);
+                if let Some(old) = previous_sampler {
+                    assert_ne!(old, glint.sampler);
+                    gal.retire_through(gal.latest_submission_id()).unwrap();
+                    assert!(gal.sampler_descriptor_for_test(old).is_err());
+                }
+                previous_sampler = Some(glint.sampler);
+            }
+        }
+        frontend.reset(&mut gal).unwrap();
+        gal.retire_through(gal.latest_submission_id()).unwrap();
+        assert_eq!(gal.metrics().resource_creates, gal.metrics().resource_destroys);
+    }
+
+    #[test]
     fn vulkan_gui_shared_image_reload_retires_every_binding_and_upload_buffer() {
         let backend = VulkanBackend::new("GUI shared image resource bound regression").unwrap();
         let mut gal = VulkanicGal::new_with_backend(Box::new(backend), false);
         let mut frontend = GuiFrontend::default();
         let mut stable_live_count = None;
         for generation in 1..=16 {
-            frontend.apply_raw_image_update(&mut gal, generation, vec![GuiRawImageAssetPayload {
+            frontend.apply_raw_image_update(&mut gal, generation, vec![GuiRawImageAssetPayload { sampling: None,
                 asset_id: 41, format: GuiRawImageFormat::Rgba8, width: 2, height: 2,
                 pixels: vec![generation as u8; 16],
             }]).unwrap();
@@ -11990,7 +12372,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
         frontend.stage_atlas_references(1, &[reference], |_| Some(reference.atlas)).unwrap();
         assert_eq!(frontend.texture_source(TextureGroup::Dynamic(101)).err().unwrap().code,
             StatusCode::UnsupportedFeature);
-        let payload = || GuiRawImageAssetPayload {
+        let payload = || GuiRawImageAssetPayload { sampling: None,
             asset_id: 101, format: GuiRawImageFormat::Rgba8, width: 1, height: 1, pixels: vec![255; 4],
         };
         assert!(frontend.apply_raw_image_update(&mut gal, 1, vec![payload()]).is_err());
@@ -12014,7 +12396,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 1,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 41,
                     format: GuiRawImageFormat::Rgba8,
                     width: 2,
@@ -12047,7 +12429,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 2,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 41,
                     format: GuiRawImageFormat::Rgba8,
                     width: 2,
@@ -12154,7 +12536,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 4,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 7,
                     format: GuiRawImageFormat::Rgba8,
                     width: 1,
@@ -12167,7 +12549,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 5,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 8,
                     format: GuiRawImageFormat::Alpha8,
                     width: 2,
@@ -12190,7 +12572,7 @@ void main() { fragColor = texture(InSampler, texCoord); }
             .apply_raw_image_update(
                 &mut gal,
                 1,
-                vec![GuiRawImageAssetPayload {
+                vec![GuiRawImageAssetPayload { sampling: None,
                     asset_id: 99,
                     format: GuiRawImageFormat::Alpha8,
                     width: 8192,

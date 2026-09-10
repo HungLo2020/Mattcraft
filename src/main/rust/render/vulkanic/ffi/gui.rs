@@ -432,6 +432,7 @@ pub(crate) unsafe fn decode_gui_mesh_batches(
             3 => GuiMeshMaterialMode::Translucent,
             4 => GuiMeshMaterialMode::Glint,
             GUI_MESH_MATERIAL_PANORAMA => GuiMeshMaterialMode::Panorama,
+            6 => GuiMeshMaterialMode::ModelOverlay,
             other => {
                 return Err(GalError::ffi(
                     StatusCode::UnknownEnum,
@@ -443,6 +444,7 @@ pub(crate) unsafe fn decode_gui_mesh_batches(
             1 => GuiMeshLightingMode::Flat,
             2 => GuiMeshLightingMode::Block,
             3 => GuiMeshLightingMode::InventoryBlock,
+            4 => GuiMeshLightingMode::FrontModel,
             other => {
                 return Err(GalError::ffi(
                     StatusCode::UnknownEnum,
@@ -466,9 +468,16 @@ pub(crate) unsafe fn decode_gui_mesh_batches(
                 local_uv: vertex.local_uv,
                 color_argb: vertex.color_argb,
                 normal_packed: vertex.normal_packed,
+                source_face: vertex.source_face,
+                source_foil_type: vertex.source_foil_type,
             })
             .collect();
         let request = GuiMeshBatchRequest {
+            item_cache: super::super::gui_mesh_frontend::GuiItemCache::decode(batch.item_cache_identity, batch.item_cache_mode)?,
+            block_item_raster: super::super::gui_mesh_frontend::GuiBlockItemRaster::decode(
+                batch.block_item_scale, batch.block_model_bounds, batch.block_item_layout)?,
+            decal_foil: super::super::gui_mesh_frontend::GuiDecalFoilProjection::decode(
+                batch.decal_foil_mode, batch.decal_model_pose, batch.decal_normal_pose)?,
             item_raster_scale: batch.item_raster_scale,
             item_lighting: None,
             item_foil: super::super::item_foil::StandardItemFoil::decode(
@@ -766,6 +775,13 @@ pub(crate) unsafe fn decode_gui_raw_image_update(
             "raw GUI image pixels",
         )?;
         owned.push(GuiRawImageAssetPayload {
+            sampling: match (asset.sampling_filter, asset.sampling_address) {
+                (0, 0) => None,
+                (filter @ 1..=2, address @ 1..=2) => Some((
+                    if filter == 1 { super::super::resources::SamplerFilter::Nearest } else { super::super::resources::SamplerFilter::Linear },
+                    if address == 1 { super::super::resources::SamplerAddressMode::Repeat } else { super::super::resources::SamplerAddressMode::ClampToEdge })),
+                _ => return Err(GalError::invalid_argument("invalid explicit raw GUI image sampling")),
+            },
             asset_id: asset.asset_id,
             format,
             width,

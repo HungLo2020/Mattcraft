@@ -233,6 +233,12 @@ public class SubmitNodeStorage implements SubmitNodeCollector, OrderedSubmitNode
 	}
 
 	@Override
+	public <S> void submitModelOutlineSemanticTexture(Model<? super S> model, S state,
+		PoseStack poseStack, RenderType material, int light, ResourceLocation textureIdentity, int outlineColor) {
+		this.order(0).submitModelOutlineSemanticTexture(model, state, poseStack, material, light, textureIdentity, outlineColor);
+	}
+
+	@Override
 	public void submitModelPart(
 		ModelPart modelPart,
 		PoseStack poseStack,

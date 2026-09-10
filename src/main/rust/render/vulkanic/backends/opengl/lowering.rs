@@ -34,6 +34,8 @@ pub(in crate::render::vulkanic) struct CompletedHostRead {
 
 pub(super) struct OpenGlLowerer {
     gl: Rc<glow::Context>,
+    provoking_vertex: super::context::ProvokingVertexFn,
+    clip_control: super::context::ClipControlFn,
     pending: VecDeque<ValidatedSubmissionBatch>,
     submitted: VecDeque<PendingFence>,
     completed: SubmissionId,
@@ -44,9 +46,11 @@ pub(super) struct OpenGlLowerer {
 }
 
 impl OpenGlLowerer {
-    pub(super) fn new(gl: Rc<glow::Context>) -> Self {
+    pub(super) fn new(gl: Rc<glow::Context>, provoking_vertex: super::context::ProvokingVertexFn, clip_control: super::context::ClipControlFn) -> Self {
         Self {
             gl,
+            provoking_vertex,
+            clip_control,
             pending: VecDeque::new(),
             submitted: VecDeque::new(),
             completed: SubmissionId(0),
@@ -245,18 +249,8 @@ impl OpenGlLowerer {
             } => self.host_write(objects, *buffer, *offset, data),
             CommandOp::CopyBuffer { src, dst, size } => {
                 let _zone = trace::Zone::new("opengl.lowering.copy-buffer");
-                let (src_gl_buffer, bytes) = {
-                    let src = objects.buffer(*src)?;
-                    (
-                        src.buffer,
-                        src.shadow[..usize::try_from(*size)
-                            .map_err(|_| GalError::backend("copy size exceeds usize"))?]
-                            .to_vec(),
-                    )
-                };
-                let dst_object = objects.buffer_mut(*dst)?;
-                let copy_len = bytes.len().min(dst_object.shadow.len());
-                dst_object.shadow[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                let src_gl_buffer = objects.buffer(*src)?.buffer;
+                let dst_object = objects.buffer(*dst)?;
                 unsafe {
                     self.gl
                         .bind_buffer(glow::COPY_READ_BUFFER, Some(src_gl_buffer));
@@ -295,11 +289,25 @@ impl OpenGlLowerer {
                             .map_err(|_| GalError::backend("read size exceeds usize"))?,
                     )
                     .ok_or_else(|| GalError::backend("read range overflows"))?;
+                if end > buffer_object.size as usize {
+                    return Err(GalError::backend("host read exceeds buffer size"));
+                }
+                let mut bytes = vec![0u8; end - start];
+                // The CPU upload shadow is not authoritative after shader
+                // writes or GPU copies. HostReadBuffer explicitly requests
+                // GPU completion/readback; GL's get operation waits for the
+                // preceding commands instead of manufacturing stale results.
+                unsafe {
+                    self.gl.bind_buffer(glow::COPY_READ_BUFFER, Some(buffer_object.buffer));
+                    self.gl.get_buffer_sub_data(glow::COPY_READ_BUFFER,
+                        i32::try_from(*offset).map_err(|_| GalError::backend("OpenGL read offset exceeds i32"))?,
+                        &mut bytes);
+                }
                 self.completed_host_reads.push(CompletedHostRead {
                     submission: id,
                     buffer: *buffer,
                     offset: *offset,
-                    bytes: buffer_object.shadow[start..end].to_vec(),
+                    bytes,
                 });
                 Ok(())
             }
@@ -379,6 +387,11 @@ impl OpenGlLowerer {
                             self.gl.depth_mask(true);
                             self.gl.clear_depth_f32(1.0);
                             mask |= glow::DEPTH_BUFFER_BIT;
+                            if pass_object.depth_format == Some(TextureFormat::Depth24Stencil8) {
+                                self.gl.stencil_mask(0xff);
+                                self.gl.clear_stencil(0);
+                                mask |= glow::STENCIL_BUFFER_BIT;
+                            }
                         }
                     }
                     if mask != 0 {
@@ -407,6 +420,19 @@ impl OpenGlLowerer {
                 self.trace_draw_state("before-bind-graphics-pipeline", state);
                 self.bind_program(Some(pipeline.program));
                 self.bind_vao(Some(pipeline.vao));
+                unsafe {
+                    (self.provoking_vertex)(match pipeline.provoking_vertex {
+                        crate::render::vulkanic::resources::ProvokingVertex::First => glow::FIRST_VERTEX_CONVENTION,
+                        crate::render::vulkanic::resources::ProvokingVertex::Last => glow::LAST_VERTEX_CONVENTION,
+                    });
+                    if self.cache.raster_y_direction != Some(pipeline.raster_y_direction) {
+                        (self.clip_control)(match pipeline.raster_y_direction {
+                            crate::render::vulkanic::resources::RasterYDirection::Up => glow::LOWER_LEFT,
+                            crate::render::vulkanic::resources::RasterYDirection::Down => glow::UPPER_LEFT,
+                        }, glow::NEGATIVE_ONE_TO_ONE);
+                        self.cache.raster_y_direction = Some(pipeline.raster_y_direction);
+                    }
+                }
                 self.apply_fixed_state(
                     pipeline.cull_mode,
                     pipeline.front_face,
@@ -560,7 +586,9 @@ impl OpenGlLowerer {
         let end = start
             .checked_add(data.len())
             .ok_or_else(|| GalError::backend("write range overflows"))?;
-        buffer_object.shadow[start..end].copy_from_slice(data);
+        if end > buffer_object.size as usize {
+            return Err(GalError::backend("host write exceeds buffer size"));
+        }
         unsafe {
             self.gl
                 .bind_buffer(glow::COPY_WRITE_BUFFER, Some(buffer_object.buffer));
@@ -582,107 +610,50 @@ impl OpenGlLowerer {
         let source = objects.buffer(region.buffer)?;
         let texture = objects.texture(region.texture)?;
         let format = texture_format(texture.format)?;
-        let bytes_per_row = usize::try_from(region.bytes_per_row)
-            .map_err(|_| GalError::backend("bytes_per_row exceeds usize"))?;
-        let rows = usize::try_from(region.extent.height)
-            .map_err(|_| GalError::backend("copy row count exceeds usize"))?;
-        let depth = usize::try_from(region.extent.depth)
-            .map_err(|_| GalError::backend("copy depth exceeds usize"))?;
-        let rows_per_image = usize::try_from(region.rows_per_image)
-            .map_err(|_| GalError::backend("rows_per_image exceeds usize"))?;
-        let row_bytes = usize::try_from(region.extent.width)
-            .map_err(|_| GalError::backend("copy width exceeds usize"))?
-            .checked_mul(format.bytes_per_pixel as usize)
-            .ok_or_else(|| GalError::backend("buffer texture copy row size overflows"))?;
-        let src_start = usize::try_from(region.buffer_offset)
-            .map_err(|_| GalError::backend("buffer offset exceeds usize"))?;
-        let src_end = src_start
-            .checked_add(
-                bytes_per_row
-                    .checked_mul(
-                        rows_per_image
-                            .checked_mul(depth.saturating_sub(1))
-                            .and_then(|before_last| before_last.checked_add(rows))
-                            .ok_or_else(|| {
-                                GalError::backend("buffer texture copy rows overflow")
-                            })?,
-                    )
-                    .ok_or_else(|| GalError::backend("buffer texture copy byte count overflows"))?,
-            )
-            .ok_or_else(|| GalError::backend("buffer texture copy range overflows"))?;
-        let bytes = &source.shadow[src_start..src_end];
-        let upload_len = row_bytes
-            .checked_mul(rows)
-            .and_then(|slice_bytes| slice_bytes.checked_mul(depth))
-            .ok_or_else(|| GalError::backend("buffer texture upload size overflows"))?;
-        let mut upload = vec![0; upload_len];
-        for z in 0..depth {
-            for row in 0..rows {
-                let src = z
-                    .checked_mul(rows_per_image)
-                    .and_then(|slice_start| {
-                        slice_start.checked_add(copy_upload_row_index(texture.dimension, row, rows))
-                    })
-                    .and_then(|source_row| source_row.checked_mul(bytes_per_row))
-                    .ok_or_else(|| GalError::backend("buffer texture source row overflows"))?;
-                let dst = z
-                    .checked_mul(rows)
-                    .and_then(|slice_start| slice_start.checked_add(row))
-                    .and_then(|output_row| output_row.checked_mul(row_bytes))
-                    .ok_or_else(|| GalError::backend("buffer texture destination row overflows"))?;
-                upload[dst..dst + row_bytes].copy_from_slice(&bytes[src..src + row_bytes]);
-            }
-        }
-        let gl_y = gl_y_for_copy_region(texture, region)?;
+        let offset = u32::try_from(region.buffer_offset)
+            .map_err(|_| GalError::backend("pixel-unpack buffer offset exceeds u32"))?;
+        let row_length = pixel_unpack_row_length(region.bytes_per_row, format.bytes_per_pixel)?;
+        let image_height = i32::try_from(region.rows_per_image)
+            .map_err(|_| GalError::backend("pixel-unpack image height exceeds i32"))?;
+        let mip = i32::try_from(region.texture_mip)
+            .map_err(|_| GalError::backend("texture mip exceeds i32"))?;
+        let x = i32::try_from(region.texture_origin.x)
+            .map_err(|_| GalError::backend("texture origin x exceeds i32"))?;
+        let y = gl_y_for_copy_region(texture, region)?;
+        let z = i32::try_from(region.texture_origin.z)
+            .map_err(|_| GalError::backend("texture origin z exceeds i32"))?;
+        let width = i32::try_from(region.extent.width)
+            .map_err(|_| GalError::backend("texture width exceeds i32"))?;
+        let height = i32::try_from(region.extent.height)
+            .map_err(|_| GalError::backend("texture height exceeds i32"))?;
+        let depth = i32::try_from(region.extent.depth)
+            .map_err(|_| GalError::backend("texture depth exceeds i32"))?;
         unsafe {
+            // Consume the explicit GPU buffer, including shader-written data.
+            // Pixel-store strides preserve the existing source row order and
+            // padding without a CPU shadow or a second packed upload copy.
+            let prior = std::num::NonZeroU32::new(
+                self.gl.get_parameter_i32(glow::PIXEL_UNPACK_BUFFER_BINDING) as u32
+            ).map(glow::NativeBuffer);
+            self.gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(source.buffer));
             self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            self.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            self.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, row_length);
+            self.gl.pixel_store_i32(glow::UNPACK_IMAGE_HEIGHT, image_height);
             self.gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
             self.gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
-            self.gl.pixel_store_i32(glow::UNPACK_IMAGE_HEIGHT, 0);
+            self.gl.pixel_store_i32(glow::UNPACK_SKIP_IMAGES, 0);
             let target = texture_target(texture.dimension);
             self.gl.bind_texture(target, Some(texture.texture));
             match texture.dimension {
-                crate::render::vulkanic::resources::TextureDimension::D2 => {
-                    self.gl.tex_sub_image_2d(
-                        target,
-                        i32::try_from(region.texture_mip)
-                            .map_err(|_| GalError::backend("texture mip exceeds i32"))?,
-                        i32::try_from(region.texture_origin.x)
-                            .map_err(|_| GalError::backend("texture origin x exceeds i32"))?,
-                        gl_y,
-                        i32::try_from(region.extent.width)
-                            .map_err(|_| GalError::backend("texture width exceeds i32"))?,
-                        i32::try_from(region.extent.height)
-                            .map_err(|_| GalError::backend("texture height exceeds i32"))?,
-                        format.external,
-                        format.ty,
-                        glow::PixelUnpackData::Slice(Some(&upload)),
-                    )
-                }
-                crate::render::vulkanic::resources::TextureDimension::D3 => {
-                    self.gl.tex_sub_image_3d(
-                        target,
-                        i32::try_from(region.texture_mip)
-                            .map_err(|_| GalError::backend("texture mip exceeds i32"))?,
-                        i32::try_from(region.texture_origin.x)
-                            .map_err(|_| GalError::backend("texture origin x exceeds i32"))?,
-                        gl_y,
-                        i32::try_from(region.texture_origin.z)
-                            .map_err(|_| GalError::backend("texture origin z exceeds i32"))?,
-                        i32::try_from(region.extent.width)
-                            .map_err(|_| GalError::backend("texture width exceeds i32"))?,
-                        i32::try_from(region.extent.height)
-                            .map_err(|_| GalError::backend("texture height exceeds i32"))?,
-                        i32::try_from(region.extent.depth)
-                            .map_err(|_| GalError::backend("texture depth exceeds i32"))?,
-                        format.external,
-                        format.ty,
-                        glow::PixelUnpackData::Slice(Some(&upload)),
-                    )
-                }
+                TextureDimension::D2 => self.gl.tex_sub_image_2d(
+                    target, mip, x, y, width, height, format.external, format.ty,
+                    glow::PixelUnpackData::BufferOffset(offset)),
+                TextureDimension::D3 => self.gl.tex_sub_image_3d(
+                    target, mip, x, y, z, width, height, depth, format.external, format.ty,
+                    glow::PixelUnpackData::BufferOffset(offset)),
                 _ => unreachable!("GAL validated texture dimension"),
             }
+            self.gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, prior);
         }
         Ok(())
     }
@@ -792,23 +763,26 @@ impl OpenGlLowerer {
             .map_err(|_| GalError::backend("readback bytes_per_row exceeds usize"))?;
         let rows_per_image = usize::try_from(region.rows_per_image)
             .map_err(|_| GalError::backend("readback rows_per_image exceeds usize"))?;
-        for slice in 0..depth {
-            for row in 0..height {
-                let src = slice * slice_bytes + row * row_bytes;
-                let dst = dst_start + (slice * rows_per_image + row) * bytes_per_row;
-                target.shadow[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
-            }
-        }
         unsafe {
             self.gl
                 .bind_buffer(glow::COPY_WRITE_BUFFER, Some(target.buffer));
-            self.gl.buffer_sub_data_u8_slice(
-                glow::COPY_WRITE_BUFFER,
-                i32::try_from(region.buffer_offset)
-                    .map_err(|_| GalError::backend("readback buffer offset exceeds i32"))?,
-                &target.shadow[dst_start
-                    ..dst_start + bytes_per_row * (rows_per_image * (depth - 1) + height)],
-            );
+            if bytes_per_row == row_bytes && rows_per_image == height {
+                self.gl.buffer_sub_data_u8_slice(glow::COPY_WRITE_BUFFER,
+                    i32::try_from(dst_start).map_err(|_| GalError::backend("readback buffer offset exceeds i32"))?,
+                    &pixels);
+            } else {
+                // Update only the declared texel bytes. Padding and adjacent
+                // GPU-written data must not be replaced with an upload cache.
+                for slice in 0..depth {
+                    for row in 0..height {
+                        let src = slice * slice_bytes + row * row_bytes;
+                        let dst = dst_start + (slice * rows_per_image + row) * bytes_per_row;
+                        self.gl.buffer_sub_data_u8_slice(glow::COPY_WRITE_BUFFER,
+                            i32::try_from(dst).map_err(|_| GalError::backend("readback row offset exceeds i32"))?,
+                            &pixels[src..src + row_bytes]);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1365,6 +1339,7 @@ struct ExecutionState {
 
 #[derive(Default)]
 struct StateCache {
+    raster_y_direction: Option<crate::render::vulkanic::resources::RasterYDirection>,
     program: Option<glow::Program>,
     vao: Option<glow::VertexArray>,
     framebuffer: Option<glow::Framebuffer>,
@@ -1508,6 +1483,12 @@ fn opengl_blend_state(blend: BlendMode) -> OpenGlBlendState {
             src_alpha: glow::ONE,
             dst_alpha: glow::ONE_MINUS_SRC_ALPHA,
         }),
+        BlendMode::AlphaPreserveAlpha => Some(OpenGlBlendFactors {
+            src_color: glow::SRC_ALPHA,
+            dst_color: glow::ONE_MINUS_SRC_ALPHA,
+            src_alpha: glow::ZERO,
+            dst_alpha: glow::ONE,
+        }),
         BlendMode::Premultiplied => Some(OpenGlBlendFactors {
             src_color: glow::ONE,
             dst_color: glow::ONE_MINUS_SRC_ALPHA,
@@ -1570,21 +1551,24 @@ fn gl_memory_barrier_bits(before: TextureUsageState, after: TextureUsageState) -
     match (before, after) {
         (TextureUsageState::ShaderWrite, TextureUsageState::ShaderRead) => {
             glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT
+                | glow::SHADER_STORAGE_BARRIER_BIT | glow::UNIFORM_BARRIER_BIT | glow::BUFFER_UPDATE_BARRIER_BIT
         }
         (TextureUsageState::ShaderWrite, TextureUsageState::ShaderStorageRead)
         | (TextureUsageState::ShaderStorageRead, TextureUsageState::ShaderStorageRead) => {
-            glow::SHADER_IMAGE_ACCESS_BARRIER_BIT
+            glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::SHADER_STORAGE_BARRIER_BIT
         }
         (TextureUsageState::ShaderWrite, TextureUsageState::ShaderWrite) => {
-            glow::SHADER_IMAGE_ACCESS_BARRIER_BIT
+            glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::SHADER_STORAGE_BARRIER_BIT
         }
         (TextureUsageState::ShaderWrite, TextureUsageState::TransferSrc) => {
             glow::SHADER_IMAGE_ACCESS_BARRIER_BIT
                 | glow::TEXTURE_UPDATE_BARRIER_BIT
                 | glow::FRAMEBUFFER_BARRIER_BIT
+                | glow::BUFFER_UPDATE_BARRIER_BIT
         }
         (TextureUsageState::TransferDst, TextureUsageState::ShaderWrite) => {
             glow::TEXTURE_UPDATE_BARRIER_BIT | glow::SHADER_IMAGE_ACCESS_BARRIER_BIT
+                | glow::SHADER_STORAGE_BARRIER_BIT | glow::BUFFER_UPDATE_BARRIER_BIT
         }
         (TextureUsageState::TransferDst, TextureUsageState::ShaderRead) => {
             glow::TEXTURE_FETCH_BARRIER_BIT | glow::SHADER_STORAGE_BARRIER_BIT
@@ -1682,12 +1666,14 @@ fn gl_y_for_texture_copy_values(
     i32::try_from(gl_y).map_err(|_| GalError::backend("translated GL y exceeds i32"))
 }
 
-/// `gl_y_for_copy_region` is the sole OpenGL coordinate conversion for a
-/// top-left semantic texture upload. Reversing source rows here as well would
-/// vertically swap every D2 atlas region. D3 volume uploads use the same
-/// source order without a screen-space conversion.
-fn copy_upload_row_index(_dimension: TextureDimension, row: usize, _height: usize) -> usize {
-    row
+/// Both D2 and D3 copies keep source row order and express padding through
+/// pixel-store stride; gl_y_for_copy_region remains the coordinate conversion.
+fn pixel_unpack_row_length(bytes_per_row: u32, bytes_per_pixel: u32) -> GalResult<i32> {
+    if bytes_per_row == 0 || bytes_per_pixel == 0 || bytes_per_row % bytes_per_pixel != 0 {
+        return Err(GalError::backend("pixel-unpack pitch must contain complete pixels"));
+    }
+    i32::try_from(bytes_per_row / bytes_per_pixel)
+        .map_err(|_| GalError::backend("pixel-unpack row length exceeds i32"))
 }
 
 #[cfg(test)]
@@ -1729,13 +1715,13 @@ mod tests {
     }
 
     #[test]
-    fn uploads_preserve_semantic_row_order_for_d2_and_d3() {
-        assert_eq!(0, copy_upload_row_index(TextureDimension::D2, 0, 3));
-        assert_eq!(1, copy_upload_row_index(TextureDimension::D2, 1, 3));
-        assert_eq!(2, copy_upload_row_index(TextureDimension::D2, 2, 3));
-        assert_eq!(0, copy_upload_row_index(TextureDimension::D3, 0, 3));
-        assert_eq!(1, copy_upload_row_index(TextureDimension::D3, 1, 3));
-        assert_eq!(2, copy_upload_row_index(TextureDimension::D3, 2, 3));
+    fn pixel_unpack_pitch_preserves_declared_padding_and_rejects_partial_pixels() {
+        assert_eq!(5, pixel_unpack_row_length(20, 4).unwrap());
+        assert_eq!(3, pixel_unpack_row_length(24, 8).unwrap());
+        assert!(pixel_unpack_row_length(17, 4).is_err());
+        assert!(pixel_unpack_row_length(0, 4).is_err());
+        assert!(pixel_unpack_row_length(4, 0).is_err());
+        assert!(pixel_unpack_row_length(u32::MAX, 1).is_err());
     }
 
     #[test]

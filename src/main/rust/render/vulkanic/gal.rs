@@ -569,7 +569,7 @@ impl VulkanicGal {
             extent: desc.extent,
             mip_levels: 1,
             array_layers: 1,
-            usages: vec![TextureUsage::DepthStencilAttachment, TextureUsage::Sampled],
+            usages: vec![TextureUsage::DepthStencilAttachment, TextureUsage::Sampled, TextureUsage::TransferDst],
         })?;
         let depth_view = match self.create_texture_view(TextureViewDesc {
             label: format!("{}.depth-view", desc.label),
@@ -1965,6 +1965,12 @@ impl VulkanicGal {
         self.latest_accepted_submission
     }
 
+    pub(in crate::render::vulkanic) fn render_pass_last_submission(
+        &self, pass: Handle,
+    ) -> GalResult<Option<SubmissionId>> {
+        Ok(self.render_passes.get(pass)?.last_submission)
+    }
+
     /// Exposes the id that the immediately following submission will receive.
     /// Frontends use this to protect transient stream ranges until that
     /// submission completes; taking this value must be followed by one submit.
@@ -3046,14 +3052,24 @@ impl VulkanicGal {
                             self.record_access(&mut accesses, event, profile.as_deref_mut())?;
                         }
                     }
-                    CommandOp::BindResourceSet { set, .. } => {
+                    CommandOp::BindResourceSet { set, dynamic_offsets, .. } => {
                         let binding_count = self.resource_sets.get(*set)?.desc.bindings.len();
+                        let mut offset_index = 0;
                         for index in 0..binding_count {
-                            let event = {
-                                let binding = &self.resource_sets.get(*set)?.desc.bindings[index];
-                                self.resource_binding_access(binding)?
-                            };
-                            self.record_access(&mut accesses, event, profile.as_deref_mut())?;
+                            let count = self.resource_sets.get(*set)?.desc.bindings[index].dynamic_offsets.len();
+                            // Keep normal binding validation allocation-free;
+                            // each declared range contributes one access event.
+                            for slot in 0..count.max(1) {
+                                let event = {
+                                    let binding = &self.resource_sets.get(*set)?.desc.bindings[index];
+                                    let offset = if count == 0 { 0 }
+                                        else if dynamic_offsets.is_empty() { binding.dynamic_offsets[slot] }
+                                        else { dynamic_offsets[offset_index + slot] };
+                                    self.resource_binding_access(binding, offset)?
+                                };
+                                self.record_access(&mut accesses, event, profile.as_deref_mut())?;
+                            }
+                            offset_index += count;
                         }
                     }
                     CommandOp::SetVertexBuffer { buffer, offset, .. } => {
@@ -3393,22 +3409,29 @@ impl VulkanicGal {
         Ok(())
     }
 
-    fn resource_binding_access(&self, binding: &ResourceBinding) -> GalResult<AccessEvent> {
+    fn resource_binding_access(&self, binding: &ResourceBinding, offset: u64) -> GalResult<AccessEvent> {
         let mode = if binding.access.writes() {
             AccessMode::Write
         } else {
             AccessMode::Read
         };
+        let buffer_size = || -> GalResult<u64> {
+            let size = self.buffers.get(binding.resource)?.desc.size;
+            Ok(binding.buffer_range.unwrap_or_else(|| {
+                let max_default_offset = binding.dynamic_offsets.iter().copied().max().unwrap_or(0);
+                size.saturating_sub(max_default_offset)
+            }))
+        };
         match binding.kind {
             ResourceBindingKind::UniformBuffer => Ok(AccessEvent {
-                target: self.buffer_access_target(binding.resource, 0, None)?,
+                target: self.buffer_access_target(binding.resource, offset, Some(buffer_size()?))?,
                 mode: AccessMode::Read,
                 family: AccessFamily::Uniform,
                 attachment_load_op: None,
                 attachment_store_op: None,
             }),
             ResourceBindingKind::StorageBuffer => Ok(AccessEvent {
-                target: self.buffer_access_target(binding.resource, 0, None)?,
+                target: self.buffer_access_target(binding.resource, offset, Some(buffer_size()?))?,
                 mode,
                 family: AccessFamily::Storage,
                 attachment_load_op: None,

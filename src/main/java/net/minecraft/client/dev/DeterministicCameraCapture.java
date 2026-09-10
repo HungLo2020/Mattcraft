@@ -899,7 +899,7 @@ public final class DeterministicCameraCapture {
 			|| wholeFrameAttachmentCaptureRequestIssued) {
 			return -1L;
 		}
-		if (GraphicsAuditBlockDisplayFixture.guiItemAnimationRequested()) {
+		{
 			Minecraft minecraft = Minecraft.getInstance();
 			try {
 				if (!GraphicsAuditBlockDisplayFixture.readyForCapture(minecraft)) return -1L;
@@ -907,6 +907,8 @@ public final class DeterministicCameraCapture {
 				fail(timeout.getMessage());
 				return -1L;
 			}
+			// Apply the same fixture readiness to every final-output capture,
+			// including magma, fluids and particles, not only flat GUI items.
 			// Normal final-output capture can bypass the ordinary screenshot
 			// callback. Bind this observation to the frame being claimed, not
 			// a later tick at metadata serialization time.
@@ -923,6 +925,7 @@ public final class DeterministicCameraCapture {
 			return -1L;
 		}
 		wholeFrameAttachmentCaptureDeterministicFrame = currentInProgressRenderedFrameIndex();
+		captureSurfaceObservations();
 		wholeFrameGuiFoilTiming = GraphicsAuditGuiFoilTiming.snapshot();
 		return wholeFrameAttachmentCaptureDeterministicFrame;
 	}
@@ -1258,6 +1261,7 @@ public final class DeterministicCameraCapture {
 			? poses[translucentWarmupPoseIndex]
 			: poses[poseIndex];
 		applyPose(minecraft.player, activePose);
+		GraphicsAuditDroppedItemFoilFixture.beforeRender(minecraft);
 	}
 
 	private static java.lang.ref.WeakReference<MinecraftServer> fixedCaptureClockServer = new java.lang.ref.WeakReference<>(null);
@@ -1559,6 +1563,13 @@ public final class DeterministicCameraCapture {
 			settledReadyGateSatisfied = false;
 			renderedFramesAtPose = 0;
 			writeMetadata(minecraft, "waiting_for_world_gui_scale");
+			return;
+		}
+		if (!GraphicsAuditExperienceOrbFixture.ready(minecraft)) {
+			resetWholeFrameAttachmentCaptureState();
+			settledReadyGateSatisfied = false;
+			renderedFramesAtPose = 0;
+			writeMetadata(minecraft, "waiting_for_orb_occluder_light");
 			return;
 		}
 		if (!GraphicsAuditResourceReload.prepareWorldCapture(minecraft, renderedFrameIndex)) {
@@ -5171,6 +5182,12 @@ public final class DeterministicCameraCapture {
 			} else if (!FALLING_BLOCK_SCENARIO.isEmpty() && !"hidden".equals(FALLING_BLOCK_SCENARIO)) {
 				fullSequence = movingMeshPoseSequence("falling", initialPose, 5);
 			}
+			if (GraphicsAuditExperienceOrbFixture.requested()) {
+				fullSequence = new Pose[] {initialPose,
+					new Pose("right", initialPose.yaw() + YAW_DELTA, initialPose.pitch()),
+					new Pose("left", initialPose.yaw() - YAW_DELTA, initialPose.pitch()),
+					new Pose("return", initialPose.yaw(), initialPose.pitch()), initialPose};
+			}
 			poses = java.util.Arrays.copyOf(fullSequence, Math.min(POSE_COUNT, fullSequence.length));
 		startedGameTime = level.getGameTime();
 		windowWidth = minecraft.getWindow().getWidth();
@@ -5810,12 +5827,17 @@ public final class DeterministicCameraCapture {
 
 	private static String blockAnimationAtCapture = "null";
 
-	private static void requestCurrentPoseScreenshot(Minecraft minecraft) {
-		blockAnimationAtCapture = GraphicsAuditBlockDisplayFixture.animationObservation(minecraft);
+	/** Freeze existing CPU observations at the selected frame, never during metadata writing. */
+	static void captureSurfaceObservations() {
 		GraphicsAuditFlowingWaterFixture.captureSurface();
 		GraphicsAuditLavaFixture.captureSurface();
 		GraphicsAuditMixedFluidFixture.captureBottomSurface();
 		net.sodium.client.render.StaticTerrainParityDiagnostics.recordAppearanceSourceAtCapture();
+	}
+
+	private static void requestCurrentPoseScreenshot(Minecraft minecraft) {
+		blockAnimationAtCapture = GraphicsAuditBlockDisplayFixture.animationObservation(minecraft);
+		captureSurfaceObservations();
 		// Correlate the copied Rust semantic source with the ordinary screenshot
 		// request after this pose's rendering completed. This has no route or
 		// renderer effect; it only writes bounded diagnostic evidence.
@@ -6090,7 +6112,11 @@ public final class DeterministicCameraCapture {
 		player.yBodyRotO = pose.yaw();
 		if ("translucent-overlap".equals(STATIC_TERRAIN_SCENARIO)) GraphicsAuditCameraHistory.settle(player);
 		net.minecraft.client.particle.GraphicsAuditTerrainParticleFixture.install(Minecraft.getInstance());
+		net.minecraft.client.particle.GraphicsAuditBlockMarkerFixture.install(Minecraft.getInstance());
+		GraphicsAuditExperienceOrbFixture.install(Minecraft.getInstance(), poseIndex);
 		net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.install(Minecraft.getInstance());
+		net.minecraft.client.particle.GraphicsAuditShriekParticleFixture.install(Minecraft.getInstance());
+		net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.install(Minecraft.getInstance());
 	}
 
 	private static ForcedBlockOutlineTarget findForcedBlockOutlineTarget(ClientLevel level, LocalPlayer player) {
@@ -6251,6 +6277,10 @@ public final class DeterministicCameraCapture {
 				new ItemStack(net.minecraft.world.item.Items.ARROW),
 				new ItemStack(net.minecraft.world.item.Items.COAL));
 			case "animated-block" -> GraphicsAuditAnimatedItemFixture.items();
+			case "model-foil" -> GraphicsAuditModelFoilFixture.items();
+			case "shield", "shield-foil" -> GraphicsAuditShieldFoilFixture.items("shield-foil".equals(HOTBAR_ITEM_FIXTURE));
+			case "shield-patterns", "shield-patterns-foil" -> GraphicsAuditPatternedShieldFixture.items("shield-patterns-foil".equals(HOTBAR_ITEM_FIXTURE));
+			case "special-foil" -> GraphicsAuditSpecialFoilFixture.items();
 			case "standard-3d", "standard-3d-logs" -> List.of(
 				new ItemStack(Blocks.STONE),
 				new ItemStack(Blocks.GRASS_BLOCK),
@@ -6272,6 +6302,10 @@ public final class DeterministicCameraCapture {
 		}
 		if (Boolean.getBoolean("mattmc.dev.graphicsAuditGuiItemFoilBlend")) {
 			Minecraft.getInstance().options.glintSpeed().set(GraphicsAuditGuiFoilTiming.movingRequested() ? 0.5 : 0.0);
+			Minecraft.getInstance().options.glintStrength().set(0.5);
+		}
+		if ("model-foil".equals(HOTBAR_ITEM_FIXTURE) || "shield".equals(HOTBAR_ITEM_FIXTURE) || "shield-foil".equals(HOTBAR_ITEM_FIXTURE) || "shield-patterns-foil".equals(HOTBAR_ITEM_FIXTURE)) {
+			Minecraft.getInstance().options.glintSpeed().set(0.0);
 			Minecraft.getInstance().options.glintStrength().set(0.5);
 		}
 	}
@@ -7003,6 +7037,7 @@ public final class DeterministicCameraCapture {
 	}
 
 	private static void setupBlockDisplayAndWorldTextScenarios(Minecraft minecraft, LocalPlayer player) {
+		GraphicsAuditMixedItemFoilFixture.install(minecraft);
 		if (!GraphicsAuditBlockDisplayFixture.requested()) GraphicsAuditLavaFixture.install(minecraft);
 		if (GraphicsAuditFlowingWaterFixture.requested() && !GraphicsAuditBlockDisplayFixture.requested()) {
 			GraphicsAuditFlowingWaterFixture.install(minecraft);
@@ -7774,7 +7809,8 @@ public final class DeterministicCameraCapture {
 					int rendererEntityId = clientEntity == null
 						? observedExpectedModelMeshRendererEntityId()
 						: clientEntity.getId();
-					modelMeshSetupClientEntityPresent = rendererEntityId >= 0;
+					modelMeshSetupClientEntityPresent = rendererEntityId >= 0
+						&& GraphicsAuditCowOutlineFixture.ready(clientEntity);
 					modelMeshSetupClientEntityId = rendererEntityId;
 					modelMeshSetupStatus = modelMeshSetupClientEntityPresent ? "spawned" : "waiting-client-entity";
 				}
@@ -7848,6 +7884,7 @@ public final class DeterministicCameraCapture {
 				cow.setYHeadRot(cow.getYRot());
 				cow.setNoAi(true);
 				cow.setNoGravity(true);
+				GraphicsAuditCowOutlineFixture.configure(cow);
 				cow.setDeltaMovement(Vec3.ZERO);
 				igniteEntityFlameCarrier(cow);
 				serverLevel.addFreshEntity(cow);
@@ -8145,6 +8182,7 @@ public final class DeterministicCameraCapture {
 				}
 			}
 			entity.setYRot(playerYaw + (scenario.equals("llama-spit") || scenario.equals("wither-skull") ? 0.0F : 180.0F));
+			if (entity instanceof Cow cow) GraphicsAuditCowOutlineFixture.configure(cow);
 			entity.setDeltaMovement(Vec3.ZERO);
 			igniteEntityFlameCarrier(entity);
 			configureEntityLeashCarrier(entity, server, playerId);
@@ -8947,6 +8985,8 @@ public final class DeterministicCameraCapture {
 		json.append("  \"worldWindowResize\": ").append(GraphicsAuditWorldResize.worldReceipt()).append(",\n");
 		json.append("  \"worldGuiScale\": ").append(GraphicsAuditWorldGuiScale.worldReceipt()).append(",\n");
 		json.append("  \"worldResourceReload\": ").append(GraphicsAuditResourceReload.worldReceipt()).append(",\n");
+		json.append("  \"mixedItemFoilFixture\": ").append(GraphicsAuditMixedItemFoilFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"droppedItemFoilFixture\": ").append(GraphicsAuditDroppedItemFoilFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"flowingWaterFixture\": ").append(GraphicsAuditFlowingWaterFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"lavaFixture\": ").append(GraphicsAuditLavaFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"lavaSurfaceAtCapture\": ").append(GraphicsAuditLavaFixture.capturedSurface()).append(",\n");
@@ -8957,6 +8997,12 @@ public final class DeterministicCameraCapture {
 		json.append("  \"worldMenuFixture\": ").append(GraphicsAuditWorldMenuFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"animatedItemFixture\": ").append("animated-block".equals(HOTBAR_ITEM_FIXTURE)
 			? GraphicsAuditAnimatedItemFixture.receipt(minecraft) : "null").append(",\n");
+		json.append("  \"modelFoilFixture\": ").append("model-foil".equals(HOTBAR_ITEM_FIXTURE)
+			? GraphicsAuditModelFoilFixture.receipt(minecraft) : "null").append(",\n");
+		json.append("  \"shieldFoilFixture\": ").append("shield".equals(HOTBAR_ITEM_FIXTURE) || "shield-foil".equals(HOTBAR_ITEM_FIXTURE)
+			? GraphicsAuditShieldFoilFixture.receipt(minecraft, "shield-foil".equals(HOTBAR_ITEM_FIXTURE)) : "null").append(",\n");
+		json.append("  \"shieldPatternFixture\": ").append("shield-patterns".equals(HOTBAR_ITEM_FIXTURE) || "shield-patterns-foil".equals(HOTBAR_ITEM_FIXTURE)
+			? GraphicsAuditPatternedShieldFixture.receipt(minecraft,"shield-patterns-foil".equals(HOTBAR_ITEM_FIXTURE)) : "null").append(",\n");
 		json.append("  \"staticTerrainFixtureScenario\": \"").append(STATIC_TERRAIN_SCENARIO).append("\",\n");
 		json.append("  \"mixedFluidFixture\": ").append("translucent-mixed".equals(STATIC_TERRAIN_SCENARIO)
 			? GraphicsAuditMixedFluidFixture.receipt(minecraft) : "null").append(",\n");
@@ -8998,7 +9044,11 @@ public final class DeterministicCameraCapture {
 		appendField(json, "blockDisplayScenario", BLOCK_DISPLAY_SCENARIO).append(",\n");
 		json.append("  \"blockDisplayFixture\": ").append(GraphicsAuditBlockDisplayFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"terrainParticleFixture\": ").append(net.minecraft.client.particle.GraphicsAuditTerrainParticleFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"blockMarkerFixture\": ").append(net.minecraft.client.particle.GraphicsAuditBlockMarkerFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"experienceOrbFixture\": ").append(GraphicsAuditExperienceOrbFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"atlasParticleFixture\": ").append(net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"shriekParticleFixture\": ").append(net.minecraft.client.particle.GraphicsAuditShriekParticleFixture.receipt(minecraft)).append(",\n");
+		json.append("  \"vibrationParticleFixture\": ").append(net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.receipt(minecraft)).append(",\n");
 		json.append("  \"blockDisplayAnimationObservation\": ").append(GraphicsAuditBlockDisplayFixture.animationObservation(minecraft)).append(",\n");
 		json.append("  \"blockDisplayAnimationAtCapture\": ").append(blockAnimationAtCapture).append(",\n");
 		appendWorldTextDiagnostics(json).append(",\n");
@@ -9038,6 +9088,8 @@ public final class DeterministicCameraCapture {
 		appendItemEntityDiagnostics(json).append(",\n");
 		appendItemEntityRouteDecisions(json).append(",\n");
 		appendField(json, "rustGalWorldModelMeshScenario", MODEL_MESH_SCENARIO).append(",\n");
+		json.append("  \"cowOutlineFixture\": ").append(GraphicsAuditCowOutlineFixture.receipt(
+			minecraft.level == null ? null : minecraft.level.getEntity(modelMeshSetupClientEntityId))).append(",\n");
 		json.append("  \"rustGalWorldModelMeshSetup\": { ");
 		appendField(json, "status", modelMeshSetupStatus, 0).append(", ");
 		appendField(json, "blockId", modelMeshSetupBlockId, 0).append(", ");
@@ -9184,6 +9236,9 @@ public final class DeterministicCameraCapture {
 			appendField(json, "bossBarOverlay", FORCED_BOSS_BAR_OVERLAY).append(",\n");
 			json.append("  \"selectedHotbarSlot\": ").append(player == null ? -1 : currentSelectedHotbarSlot(player)).append(",\n");
 			appendField(json, "hotbarItemFixture", HOTBAR_ITEM_FIXTURE).append(",\n");
+			json.append("  \"guiItemPlacement\": ").append(GraphicsAuditGuiItemPlacementFixture.receipt()).append(",\n");
+			json.append("  \"specialFoilFixture\": ").append("special-foil".equals(HOTBAR_ITEM_FIXTURE)
+				? GraphicsAuditSpecialFoilFixture.receipt(minecraft) : "null").append(",\n");
 			json.append("  \"guiItemFoilSources\": ");
 			GraphicsAuditGuiFoilSource.appendJson(json);
 			json.append(",\n");
@@ -10397,6 +10452,17 @@ public final class DeterministicCameraCapture {
 			json.append("\"gameplayFrameId\": ").append(diagnostic.gameplayFrameId()).append(", ");
 			json.append("\"submissionId\": ").append(diagnostic.submissionId()).append(", ");
 			json.append("\"quads\": ").append(diagnostic.quads());
+			json.append(", \"nativeOrbCount\": ").append(diagnostic.nativeOrbCount());
+			json.append(", \"nativeResourcesComplete\": ").append(diagnostic.nativeResourcesComplete());
+			json.append(", \"nativeResources\": [");
+			for (int resourceIndex = 0; resourceIndex < diagnostic.nativeResources().size(); resourceIndex++) {
+				var resource = diagnostic.nativeResources().get(resourceIndex);
+				if (resourceIndex > 0) json.append(",");
+				json.append("{\"meshKey\":\"").append(Long.toUnsignedString(resource.meshKey()))
+					.append("\",\"meshGeneration\":\"").append(Long.toUnsignedString(resource.meshGeneration()))
+					.append("\",\"entityId\":").append(resource.entityId()).append("}");
+			}
+			json.append("]");
 			json.append(" }");
 		}
 		if (!diagnostics.isEmpty()) {

@@ -8,6 +8,29 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class TranslucentMeshRasterSemanticsTest {
     @Test
+    void solidModelMaterialsRemainOpaqueAndCutoutModelsRemainDistinct() throws Exception {
+        net.minecraft.SharedConstants.tryDetectVersion();
+        net.minecraft.server.Bootstrap.bootStrap();
+        ResourceLocation texture = ResourceLocation.withDefaultNamespace("textures/entity/shield_base_nopattern.png");
+        Method extract = RustGalWorldPrimitiveRenderer.class.getDeclaredMethod("modelMeshRenderSemantics", RenderType.class);
+        extract.setAccessible(true);
+        for (RenderType type : new RenderType[]{RenderType.entitySolid(texture),
+                RenderType.entitySolidZOffsetForward(texture)}) {
+            Object semantics = extract.invoke(null, type);
+            assertEquals(RustGalWorldPrimitiveRenderer.MATERIAL_MODE_OPAQUE, field(semantics, "materialMode"));
+            assertEquals(RustGalWorldPrimitiveRenderer.MATERIAL_ID_OPAQUE_TEXTURED, field(semantics, "materialId"));
+            assertRasterMatchesPipeline(type);
+        }
+        for (RenderType type : new RenderType[]{RenderType.entityCutout(texture),
+                RenderType.entityCutoutNoCull(texture), RenderType.entityCutoutNoCullZOffset(texture)}) {
+            Object semantics = extract.invoke(null, type);
+            assertEquals(RustGalWorldPrimitiveRenderer.MATERIAL_MODE_CUTOUT, field(semantics, "materialMode"));
+            assertEquals(RustGalWorldPrimitiveRenderer.MATERIAL_ID_CUTOUT_TEXTURED, field(semantics, "materialId"));
+            assertRasterMatchesPipeline(type);
+        }
+    }
+
+    @Test
     void itemPipelineCarriesBlendPlusCutoutInsteadOfTerrainTranslucency() throws Exception {
         net.minecraft.SharedConstants.tryDetectVersion();
         net.minecraft.server.Bootstrap.bootStrap();

@@ -22,6 +22,11 @@ public interface SpecialModelRenderer<T> {
 
 	void getExtents(Set<Vector3f> set);
 
+	/** Whether the model's selected materials require a fresh GUI raster each frame. */
+	default boolean isAnimated(@Nullable T argument) {
+		return false;
+	}
+
 	@Nullable
 	T extractArgument(ItemStack itemStack);
 

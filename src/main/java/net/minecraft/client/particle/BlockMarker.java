@@ -58,6 +58,28 @@ public class BlockMarker extends SingleQuadParticle {
 	}
 
 	boolean enqueueRustGal(Camera camera, float f) {
+		if (net.vulkanic.world.WorldRenderRoutePolicy.currentMaterialRoute().usesRustWholeFrameVulkan()) {
+			// Same immutable inputs as SingleQuadParticle.extractRotatedQuad.
+			// Rust owns billboard expansion, particle shading and atlas sampling.
+			// The normal Vulkan route stops at immutable particle semantics.
+			org.joml.Quaternionf rotation = new org.joml.Quaternionf();
+			this.getFacingCameraMode().setRotation(rotation, camera, f);
+			if (this.roll != 0.0F) {
+				rotation.rotateZ(net.minecraft.util.Mth.lerp(f, this.oRoll, this.roll));
+			}
+			boolean queued = RustGalWorldPrimitiveRenderer.enqueueTerrainParticle(
+				this.blockState, this.sprite.contents().name(), this.sprite.semanticAnimationResource(),
+				camera, this.xo, this.x, this.yo, this.y, this.zo, this.z, rotation, f,
+				this.getQuadSize(f), this.getU0(), this.getU1(), this.getV0(), this.getV1(),
+				net.minecraft.util.ARGB.colorFromFloat(this.alpha, this.rCol, this.gCol, this.bCol),
+				this.getLightColor(f), this.isOpaque
+					? net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_OPAQUE
+					: net.vulkanic.bridge.VulkanicGalBridge.ParticleSurface.TERRAIN_TRANSLUCENT);
+			if (!queued) {
+				throw new IllegalStateException("Native block-marker semantics rejected; expanded Java geometry is not a fallback");
+			}
+			return true;
+		}
 		return RustGalWorldPrimitiveRenderer.enqueueBlockMarker(
 			this.blockState,
 			camera,

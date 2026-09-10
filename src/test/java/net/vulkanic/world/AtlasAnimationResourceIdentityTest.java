@@ -9,6 +9,36 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class AtlasAnimationResourceIdentityTest {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {17, 0xfdf71712, 0x80000000, 0xffffffff})
+    void unsignedSemanticIdentitySurvivesPublicationAndTickDelivery(int textureId) {
+        try (var resource = new AtlasAnimationResource(GUI, textureId, source())) {
+            var texture = new VulkanicGalBridge.WorldMeshTextureAssetRecord(textureId, new byte[]{1}, List.of());
+            var publication = new AtlasAnimationPublication(texture, resource);
+            assertTrue(publication.recordSpriteUse(GUI, SPRITE));
+            publication.enqueueTick(1, true);
+            publication.textureAccepted(33, texture);
+            publication.flush((id, generation, initialTick, snapshot) -> {
+                assertEquals(textureId, id);
+                assertEquals(33, generation);
+                assertSame(resource.source(), snapshot);
+                return null;
+            });
+            assertTrue(publication.drainTicks((id, generation, tick, visible, onlyVisible) -> {
+                assertEquals(textureId, id);
+                assertEquals(33, generation);
+                assertEquals(1, tick);
+                assertArrayEquals(new int[]{1}, visible);
+                return true;
+            }));
+        }
+    }
+
+    @Test void zeroIsNotASemanticTextureIdentity() {
+        assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationResource(GUI, 0, source()));
+        assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationTickDelivery(0, 1, 0));
+    }
+
     private static final ResourceLocation BLOCKS = ResourceLocation.withDefaultNamespace("textures/atlas/blocks.png");
     private static final ResourceLocation GUI = ResourceLocation.withDefaultNamespace("textures/atlas/gui.png");
     private static final ResourceLocation SPRITE = ResourceLocation.withDefaultNamespace("audit/shared-name");
@@ -102,8 +132,7 @@ class AtlasAnimationResourceIdentityTest {
     }
 
     @Test void invalidIdentitiesRejectBeforeEventsCanBeCollected() {
-        for (int invalid : new int[]{0, -1, Integer.MIN_VALUE})
-            assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationResource(GUI, invalid, source()));
+        assertThrows(IllegalArgumentException.class, () -> new AtlasAnimationResource(GUI, 0, source()));
         assertThrows(NullPointerException.class, () -> new AtlasAnimationResource(null, 202, source()));
     }
 }

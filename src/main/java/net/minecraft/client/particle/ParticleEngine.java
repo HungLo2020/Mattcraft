@@ -75,7 +75,10 @@ public class ParticleEngine {
 
 	/** Installs one capture fixture while simulation ticks are frozen; never called by gameplay. */
 	void installGraphicsAuditParticle(Particle particle) {
-		if ((!GraphicsAuditTerrainParticleFixture.requested() && !GraphicsAuditAtlasParticleFixture.requested())
+		if ((!GraphicsAuditTerrainParticleFixture.requested() && !GraphicsAuditAtlasParticleFixture.requested()
+			&& !GraphicsAuditBlockMarkerFixture.requested()
+			&& !GraphicsAuditShriekParticleFixture.requested()
+			&& !GraphicsAuditVibrationParticleFixture.requested())
 			|| particle.getParticleLimit().isPresent()) {
 			throw new IllegalStateException("Unrequested or limited graphics audit particle");
 		}

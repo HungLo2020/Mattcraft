@@ -22,11 +22,12 @@ class RustGalGuiItemRasterContractTest {
     @Test void atlasVisibilityIsReportedOnlyAfterBoundedItemAdmission() throws Exception {
         String source = java.nio.file.Files.readString(java.nio.file.Path.of(
             "src/main/java/net/vulkanic/gui/RustGalGuiItemRenderer.java"));
-        int admission = source.indexOf("private-item-raster-mixed-source-layers");
+        int route = source.indexOf("private static List<RustGalGuiElementRenderState> tryEnqueueNativeFlatItem(");
+        int admission = source.indexOf("enqueueGuiMeshItemRequest(snapshot.batches()",route);
         int use = source.indexOf("RustGalWorldPrimitiveRenderer.recordAtlasSpriteUse(",admission);
-        int enqueue = source.indexOf("List<RustGalGuiElementRenderState> elements",admission);
-        assertTrue(admission >= 0 && use > admission && enqueue > use);
-        String extraction = source.substring(use,enqueue);
+        int accepted = source.indexOf("flat-mesh-accepted-layers=",use);
+        assertTrue(route >= 0 && admission > route && use > admission && accepted > use);
+        String extraction = source.substring(use,accepted);
         assertTrue(extraction.contains("sprite.semanticAnimationResource()"));
         assertFalse(extraction.contains("getTexture"));
         assertFalse(extraction.contains("tickAndUpload"));
@@ -71,26 +72,5 @@ class RustGalGuiItemRasterContractTest {
             inspected++;
         }
         assertTrue(inspected > 20, "exercise the real authored pipeline catalog");
-    }
-    @Test void affineFacesRequireTheActualFourthCorner() {
-        assertTrue(RustGalGuiItemRenderer.affineFourthCorner(0.5F,0,1,0.5F,0.5F,1,0,0.5F));
-        assertTrue(RustGalGuiItemRenderer.affineFourthCorner(0.5F,0,1,0.5F,Math.nextUp(0.5F),1,0,0.5F));
-        assertFalse(RustGalGuiItemRenderer.affineFourthCorner(0.5F,0,1,0.5F,0.6F,1,0,0.5F));
-        assertFalse(RustGalGuiItemRenderer.affineFourthCorner(0,0,1,0,Float.NaN,1,0,1));
-        assertFalse(RustGalGuiItemRenderer.affineFourthCorner(0,0,1,0,1,1,Float.POSITIVE_INFINITY,1));
-        assertArrayEquals(new float[]{8,0,16,8,0,8},
-            RustGalGuiItemRenderer.boundedItemRasterGeometry(0.5F,1,1,0.5F,0,0.5F).corners());
-    }
-
-    @Test void authoredGeometrySurvivesTheCanonicalSixteenUnitRasterBoundary() {
-        assertEquals(net.vulkanic.bridge.VulkanicGalBridge.GuiItemRasterGeometryRecord.FULL,
-            RustGalGuiItemRenderer.boundedItemRasterGeometry(0,1,1,1,0,0));
-        assertArrayEquals(new float[] {4,2,12,2,4,14},
-            RustGalGuiItemRenderer.boundedItemRasterGeometry(0.25F,0.875F,0.75F,0.875F,0.25F,0.125F).corners());
-        assertNull(RustGalGuiItemRenderer.boundedItemRasterGeometry(0,1,2,1,0,0));
-        assertArrayEquals(new float[] {16,0,0,0,16,16},
-            RustGalGuiItemRenderer.boundedItemRasterGeometry(1,1,0,1,1,0).corners());
-        assertNull(RustGalGuiItemRenderer.boundedItemRasterGeometry(0,1,0,1,0,0));
-        assertNull(RustGalGuiItemRenderer.boundedItemRasterGeometry(Float.NaN,1,1,1,0,0));
     }
 }

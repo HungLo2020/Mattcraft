@@ -10,6 +10,37 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class GuiFlatItemMeshCollectorTest {
+    @Test void nonFoilMeshPreservesAllFourAuthoredCornersAndRequestsNativeItemLighting() {
+        var item=new GuiItemRenderState("non-affine",new Matrix3x2f(),new TrackingItemStackRenderState(),0,0,null);
+        float[] transform={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+        var vertices=new ArrayList<GuiMeshVertexRecord>();
+        for (float[] point:List.of(new float[]{0,0,0.5F},new float[]{1,0,0.5F},
+                new float[]{0.6F,1,0.5F},new float[]{0,1,0.5F})) {
+            vertices.add(new GuiMeshVertexRecord(point,new float[]{0.4F,0.6F},
+                new float[]{0.2F,0.8F},0x8040ff20,0x007f0000));
+        }
+        var batch=GuiFlatItemMeshCollector.batch(item,320,180,3,420,0,2,99,transform,vertices,null);
+        assertEquals(vertices,batch.vertices(),"never reconstruct the fourth corner as an affine rectangle");
+        assertEquals(List.of(0,1,2,2,3,0),batch.indices());
+        assertNull(batch.itemFoil());
+        assertEquals(1,batch.lightingMode());
+        assertEquals(3,batch.itemRasterScale(),"native item raster requires the explicit frame lightmap");
+        assertEquals(0,batch.renderWidth(),"Rust chooses the raster extent");
+        assertEquals(0x8040ff20,batch.vertices().getFirst().colorArgb(),"Java must not compensate RGB");
+    }
+
+    @Test void projectedFoilStillRejectsMissingGeometryBeforeResourceAccess() throws Exception {
+        var state=new TrackingItemStackRenderState();
+        var context=net.minecraft.client.renderer.item.ItemStackRenderState.class.getDeclaredField("displayContext");
+        context.setAccessible(true);
+        context.set(state,net.minecraft.world.item.ItemDisplayContext.GUI);
+        state.newLayer().setFoilType(net.minecraft.client.renderer.item.ItemStackRenderState.FoilType.SPECIAL);
+        var item=new GuiItemRenderState("projected",new Matrix3x2f(),state,0,0,null);
+        var error=assertThrows(IllegalArgumentException.class,()->GuiFlatItemMeshCollector.collect(
+            item,320,180,2,420,new StandardItemFoilRecord(0,0,0.5F)));
+        assertEquals("unsupported flat mesh layer",error.getMessage());
+    }
+
     @Test void batchCopiesRawGeometryScalePoseAndFoilWithoutJavaRasterSetup() {
         var item=new GuiItemRenderState("test",new Matrix3x2f().translation(3,5),new TrackingItemStackRenderState(),12,34,null);
         float[] transform={1,0,0,0, 0,1,0,0, 0,0,1,0, -0.5F,-0.5F,-0.5F,1};
@@ -33,5 +64,25 @@ class GuiFlatItemMeshCollectorTest {
     @Test void incompleteOrNonGuiItemsRejectWithoutAccessingRendererState() {
         var item=new GuiItemRenderState("empty",new Matrix3x2f(),new TrackingItemStackRenderState(),0,0,null);
         assertThrows(IllegalArgumentException.class,()->GuiFlatItemMeshCollector.collect(item,320,180,2,420,new StandardItemFoilRecord(0,0,0.5F)));
+    }
+
+    @Test void manyFacesUseOneIndexedMeshWithoutDroppingOrReorderingQuads() {
+        var item=new GuiItemRenderState("many-faces",new Matrix3x2f(),new TrackingItemStackRenderState(),0,0,null);
+        float[] transform={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+        var vertices=new ArrayList<GuiMeshVertexRecord>();
+        for(int i=0;i<320;i++) vertices.add(new GuiMeshVertexRecord(new float[]{i,0,0},
+            new float[]{0,0},new float[]{0,0},-1,0));
+        var batch=GuiFlatItemMeshCollector.batch(item,320,180,2,420,0,2,99,transform,vertices,null);
+        assertEquals(320,batch.vertices().size());
+        assertEquals(480,batch.indices().size());
+        for(int face=0;face<80;face++) {
+            int i=face*4;
+            assertEquals(List.of(i,i+1,i+2,i+2,i+3,i),batch.indices().subList(face*6,face*6+6));
+            assertEquals(i,batch.vertices().get(i).position()[0]);
+        }
+        assertThrows(IllegalArgumentException.class,()->GuiFlatItemMeshCollector.batch(item,320,180,2,420,0,2,99,
+            transform,vertices.subList(0,319),null));
+        assertThrows(IllegalArgumentException.class,()->GuiFlatItemMeshCollector.batch(item,320,180,2,420,0,2,99,
+            transform,java.util.Collections.nCopies(65_540,vertices.getFirst()),null));
     }
 }

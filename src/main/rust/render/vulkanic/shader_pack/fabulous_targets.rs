@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use super::super::commands::{
     AttachmentLoadOp, AttachmentStoreOp, ClearColor, CommandOp, PassAttachment, ResourceBarrier,
-    TextureImageCopyRegion, TextureOrigin3d, TextureUsageState,
+    TextureImageCopyRegion, TextureOrigin3d, TextureUsageState, TextureRowOrder,
 };
 use super::super::error::{GalError, GalResult};
 use super::super::gal::VulkanicGal;
@@ -173,6 +173,8 @@ impl FabulousTransparencyPipelines {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -195,6 +197,8 @@ impl FabulousTransparencyPipelines {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -212,6 +216,8 @@ impl FabulousTransparencyPipelines {
                 topology: PrimitiveTopology::Triangles,
                 cull_mode: CullMode::None,
                 front_face: FrontFace::CounterClockwise,
+                provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
                 blend: BlendMode::Disabled,
                 depth_compare: None,
                 depth_write: false,
@@ -441,6 +447,9 @@ impl FabulousTransparencyBindings {
             self.resource_layout,
         ];
         handles.extend(self.combined_samplers.iter().copied());
+        // Combined descriptors reference, but do not own, these samplers.
+        // Retire descriptors first, then all twelve separately created samplers.
+        handles.extend(self.samplers.iter().copied());
         handles
     }
 }
@@ -1137,6 +1146,15 @@ impl FabulousAttachmentSet {
         source_before: TextureUsageState,
         destination_before: TextureUsageState,
     ) -> GalResult<()> {
+        self.append_translucent_capture_copy_oriented(ops, source_texture, extent,
+            source_before, destination_before, TextureRowOrder::Preserve)
+    }
+
+    fn append_translucent_capture_copy_oriented(
+        &self, ops: &mut Vec<CommandOp>, source_texture: Handle, extent: Extent3d,
+        source_before: TextureUsageState, destination_before: TextureUsageState,
+        row_order: TextureRowOrder,
+    ) -> GalResult<()> {
         if extent.width == 0 || extent.height == 0 || extent.depth != 1 {
             return Err(GalError::invalid_argument(
                 "Fabulous translucent capture copy requires a non-zero 2D extent",
@@ -1159,7 +1177,7 @@ impl FabulousAttachmentSet {
             dst_queue: super::super::resources::QueueClass::Transfer,
         }));
         ops.push(CommandOp::CopyTexture(TextureImageCopyRegion {
-            row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
+            row_order,
             src_texture: source_texture,
             src_mip: 0,
             src_layer: 0,
@@ -1242,6 +1260,15 @@ impl FabulousAttachmentSet {
         source_before: TextureUsageState,
         destination_before: TextureUsageState,
     ) -> GalResult<()> {
+        self.append_depth_capture_copy_oriented(ops, source_texture, destination, extent,
+            source_before, destination_before, TextureRowOrder::Preserve)
+    }
+
+    fn append_depth_capture_copy_oriented(
+        &self, ops: &mut Vec<CommandOp>, source_texture: Handle, destination: FabulousTargetRole,
+        extent: Extent3d, source_before: TextureUsageState, destination_before: TextureUsageState,
+        row_order: TextureRowOrder,
+    ) -> GalResult<()> {
         if extent.width == 0 || extent.height == 0 || extent.depth != 1 {
             return Err(GalError::invalid_argument(
                 "Fabulous depth capture copy requires a non-zero 2D extent",
@@ -1272,7 +1299,7 @@ impl FabulousAttachmentSet {
             dst_queue: super::super::resources::QueueClass::Transfer,
         }));
         ops.push(CommandOp::CopyTexture(TextureImageCopyRegion {
-            row_order: crate::render::vulkanic::commands::TextureRowOrder::Preserve,
+            row_order,
             src_texture: source_texture,
             src_mip: 0,
             src_layer: 0,
@@ -1424,6 +1451,23 @@ impl FabulousAttachmentSet {
         attachments_initialized: bool,
         deferred_translucent_initialized: bool,
     ) -> GalResult<Handle> {
+        self.append_terrain_handoff_to_frame_target_oriented(gal, ops, frame_target, extent,
+            deferred_frame_color_source, deferred_translucent_source, deferred_depth_source,
+            deferred_translucent_depth_source, external_operations, external_roles_written,
+            attachments_initialized, deferred_translucent_initialized, TextureRowOrder::Preserve)
+    }
+
+    /// Acquired-frame color and external roles are canonical. Deferred color
+    /// and both deferred depth inputs carry the declared copy row order; they
+    /// are normalized together before the transparency graph samples them.
+    pub(crate) fn append_terrain_handoff_to_frame_target_oriented(
+        &self, gal: &mut VulkanicGal, ops: &mut Vec<CommandOp>, frame_target: Handle,
+        extent: Extent3d, deferred_frame_color_source: Handle,
+        deferred_translucent_source: Handle, deferred_depth_source: Handle,
+        deferred_translucent_depth_source: Handle, external_operations: &[CommandOp],
+        external_roles_written: [bool; 4], attachments_initialized: bool,
+        deferred_translucent_initialized: bool, deferred_row_order: TextureRowOrder,
+    ) -> GalResult<Handle> {
         // A newly allocated attachment has no prior Vulkan layout.  Once a
         // submitted handoff has completed this explicit state becomes
         // shader-readable and is retained by the attachment set.  Carry this
@@ -1441,12 +1485,13 @@ impl FabulousAttachmentSet {
             persistent_before,
         )?;
         if deferred_translucent_initialized {
-            self.append_translucent_capture_copy(
+            self.append_translucent_capture_copy_oriented(
                 ops,
                 deferred_translucent_source,
                 extent,
                 TextureUsageState::ShaderRead,
                 persistent_before,
+                deferred_row_order,
             )?;
         } else {
             // The graph always samples the declared translucent role. When
@@ -1483,7 +1528,7 @@ impl FabulousAttachmentSet {
                 dst_queue: super::super::resources::QueueClass::Graphics,
             }));
         }
-        self.append_depth_capture_copy(
+        self.append_depth_capture_copy_oriented(
             ops,
             deferred_depth_source,
             FabulousTargetRole::Main,
@@ -1493,14 +1538,16 @@ impl FabulousAttachmentSet {
             // preceding graph leaves them shader-readable. Treating them as
             // Undefined causes an invalid old-layout transition on reuse.
             persistent_before,
+            deferred_row_order,
         )?;
-        self.append_depth_capture_copy(
+        self.append_depth_capture_copy_oriented(
             ops,
             deferred_translucent_depth_source,
             FabulousTargetRole::Translucent,
             extent,
             TextureUsageState::ShaderRead,
             persistent_before,
+            deferred_row_order,
         )?;
         for (role_index, role) in [
             FabulousTargetRole::ItemEntity,
@@ -1511,7 +1558,12 @@ impl FabulousAttachmentSet {
         .into_iter()
         .enumerate()
         {
-            if external_roles_written[role_index] {
+            // Item/entity work was already populated by the world graph.
+            // The remaining families draw below using Load, so initialize
+            // them even when a producer is present. Skipping their clear
+            // samples undefined images on allocation and preserves old-frame
+            // pixels thereafter. Undefined explicitly discards that history.
+            if role_index == 0 && external_roles_written[role_index] {
                 continue;
             }
             self.append_empty_attachment_clear(
@@ -2332,6 +2384,66 @@ mod tests {
                 if *target == set.translucent.render_target
         )));
         gal.destroy(no_translucent_presentation_pass).unwrap();
+        for row_order in [TextureRowOrder::Preserve, TextureRowOrder::Reverse] {
+            for has_translucent in [false, true] {
+                let mut oriented = Vec::new();
+                let pass = set.append_terrain_handoff_to_frame_target_oriented(
+                    &mut gal, &mut oriented, frame_target,
+                    Extent3d { width: 32, height: 32, depth: 1 }, frame_target,
+                    capture_source, capture_depth, translucent_depth, &[], [false; 4],
+                    false, has_translucent, row_order,
+                ).unwrap();
+                let copies: Vec<_> = oriented.iter().filter_map(|op| match op {
+                    CommandOp::CopyTexture(copy) => Some(copy), _ => None,
+                }).collect();
+                assert_eq!(copies.len(), if has_translucent { 3 } else { 2 });
+                assert!(copies.iter().all(|copy| copy.row_order == row_order),
+                    "deferred translucent color and both depths must share one normalization contract");
+                assert!(oriented.iter().any(|op| matches!(op,
+                    CommandOp::CopyFrameTargetToTexture { src, dst, .. }
+                        if *src == frame_target && *dst == set.main.color_texture)),
+                    "already-canonical acquired color must not be reversed again");
+                gal.create_command_list(super::super::super::commands::CommandListDesc {
+                    label: "oriented-terrain-handoff".into(), operations: oriented,
+                }).unwrap();
+                gal.destroy(pass).unwrap();
+            }
+        }
+        // External producers load their role images, unlike item/entity
+        // work which the earlier world graph has already populated.
+        for (role_index, attachment) in [(1, &set.particles), (2, &set.clouds), (3, &set.weather)] {
+            let mut external = Vec::new();
+            set.append_empty_attachment_clear(&mut external,
+                [FabulousTargetRole::Particles, FabulousTargetRole::Clouds, FabulousTargetRole::Weather][role_index - 1],
+                TextureUsageState::ShaderRead, TextureUsageState::ShaderRead);
+            // Model the real producer's Load pass, leaving attachments in
+            // their writable layouts for the handoff's final transitions.
+            external.truncate(4);
+            if let CommandOp::BeginPass { colors, depth_stencil, .. } = &mut external[2] {
+                colors[0].load_op = AttachmentLoadOp::Load;
+                colors[0].clear_color = None;
+                depth_stencil.as_mut().unwrap().load_op = AttachmentLoadOp::Load;
+            } else { panic!("expected external attachment pass"); }
+            let mut written = [false; 4];
+            written[role_index] = true;
+            let mut ops = Vec::new();
+            let pass = set.append_terrain_handoff_to_frame_target_with_external_ops(
+                &mut gal, &mut ops, frame_target, Extent3d { width: 32, height: 32, depth: 1 },
+                frame_target, capture_source, capture_depth, translucent_depth, &external, written, false, false,
+            ).unwrap();
+            let loads: Vec<_> = ops.iter().filter_map(|op| match op {
+                CommandOp::BeginPass { target, colors, depth_stencil, .. } if *target == attachment.render_target =>
+                    Some((colors[0].load_op, depth_stencil.as_ref().unwrap().load_op)),
+                _ => None,
+            }).collect();
+            assert_eq!(loads, vec![(AttachmentLoadOp::Clear, AttachmentLoadOp::Clear),
+                (AttachmentLoadOp::Load, AttachmentLoadOp::Load)],
+                "each produced external role must initialize color/depth before loading them");
+            gal.create_command_list(super::super::super::commands::CommandListDesc {
+                label: "initialized-external-handoff".into(), operations: ops,
+            }).unwrap();
+            gal.destroy(pass).unwrap();
+        }
         gal.destroy(capture_source).unwrap();
         gal.destroy(capture_depth).unwrap();
         gal.destroy(translucent_depth).unwrap();

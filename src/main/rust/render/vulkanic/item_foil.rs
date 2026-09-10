@@ -5,8 +5,16 @@
 
 use super::error::{GalError, GalResult};
 
+/// Semantic UV convention, not an arbitrary caller-provided texture matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardFoilKind {
+    Item,
+    Entity,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StandardItemFoil {
+    pub kind: StandardFoilKind,
     pub clock_millis: u64,
     pub speed: f64,
     pub strength: f32,
@@ -16,8 +24,9 @@ impl StandardItemFoil {
     pub fn decode(mode: u32, clock_millis: u64, speed: f64, strength: f32) -> GalResult<Option<Self>> {
         match mode {
             0 if clock_millis == 0 && speed.to_bits() == 0 && strength.to_bits() == 0 => Ok(None),
-            1 => {
-                let value = Self { clock_millis, speed, strength };
+            1 | 2 => {
+                let kind = if mode == 1 { StandardFoilKind::Item } else { StandardFoilKind::Entity };
+                let value = Self { kind, clock_millis, speed, strength };
                 value.validate()?;
                 Ok(Some(value))
             }
@@ -52,8 +61,12 @@ impl StandardItemFoil {
         let sin = (angle as f64).sin() as f32;
         // JOML's default cosFromSin at this positive first-quadrant angle.
         let cos = ((1.0 - sin * sin) as f64).sqrt() as f32;
-        let sin = sin * 8.0;
-        let cos = cos * 8.0;
+        let scale = match self.kind {
+            StandardFoilKind::Item => 8.0,
+            StandardFoilKind::Entity => 0.5,
+        };
+        let sin = sin * scale;
+        let cos = cos * scale;
         Ok([[cos, sin], [-sin, cos], [-g, h]])
     }
 
@@ -103,7 +116,28 @@ mod tests {
     use super::*;
 
     fn foil(clock_millis: u64) -> StandardItemFoil {
-        StandardItemFoil { clock_millis, speed: 0.5, strength: 0.5 }
+        StandardItemFoil { kind: StandardFoilKind::Item, clock_millis, speed: 0.5, strength: 0.5 }
+    }
+
+    #[test]
+    fn entity_foil_uses_frozen_half_scale_without_scaling_clock_translation() {
+        let entity = StandardItemFoil { kind: StandardFoilKind::Entity, ..foil(12_345) };
+        let matrix = entity.texture_transform().unwrap();
+        // Frozen ENTITY_GLINT_TEXTURING: translate(-g,h), rotateZ(PI/18),
+        // scale(0.5). This differs from ITEM only in its source-space basis.
+        let expected = [[0.492403895, 0.086824089], [-0.086824089, 0.492403895],
+                        [-0.448909104, 0.646000028]];
+        for column in 0..3 { for row in 0..2 {
+            assert!((matrix[column][row] - expected[column][row]).abs() < 0.000002);
+        }}
+        assert_eq!(entity.texture_uv([0.0, 0.0]).unwrap(), foil(12_345).texture_uv([0.0, 0.0]).unwrap());
+        let uv = entity.texture_uv([0.25, 0.75]).unwrap();
+        assert!((uv[0] - -0.390926212).abs() < 0.000002);
+        assert!((uv[1] - 1.037008881).abs() < 0.000002);
+        assert_ne!(entity.packed_instance().unwrap(), foil(12_345).packed_instance().unwrap());
+        assert_eq!(StandardItemFoil::decode(2, 12_345, 0.5, 0.5).unwrap(), Some(entity));
+        assert!(StandardItemFoil::decode(3, 0, 0.0, 0.0).is_err());
+        assert!(StandardItemFoil::decode(2, u64::MAX, 0.0, 0.0).is_err());
     }
 
     #[test]

@@ -380,7 +380,10 @@ public class ItemStackRenderState implements net.irisshaders.iris.mixinterface.I
 			boolean selectedVulkan = net.vulkanic.VulkanicAPI.isVulkanBackendSelected();
 			boolean rustWholeFrameHandoff = net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled();
 			boolean indexedItemScope = RustGalWorldPrimitiveRenderer.isIndexedItemSubmissionActive();
-			if (selectedVulkan || rustWholeFrameHandoff || indexedItemScope) {
+			// Text/coverage traversals replay the same producer callbacks, but their
+			// collectors must receive semantics without a second native submission.
+			if (!submitNodeCollector.isSemanticCoverageOnly()
+				&& (selectedVulkan || rustWholeFrameHandoff || indexedItemScope)) {
 				WorldRenderRoutePolicy.Route ownership = ItemEntityRenderOwnershipPolicy.currentOwnershipRoute();
 				if (rustWholeFrameHandoff && !selectedVulkan && !indexedItemScope) {
 					throw new IllegalStateException(
@@ -525,7 +528,8 @@ public class ItemStackRenderState implements net.irisshaders.iris.mixinterface.I
 			// Iris: Save block entity state before rendering (from ItemStackStateLayerMixin).
 			// Rust semantic/item submission owns its material identity explicitly and
 			// must not publish or read the Java/Iris captured-rendering singleton.
-			boolean captureIrisRenderState = !net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled()
+			boolean captureIrisRenderState = !submitNodeCollector.isSemanticCoverageOnly()
+				&& !net.vulkanic.bridge.RustGalVulkanWholeFrameMode.enabled()
 				&& !net.vulkanic.VulkanicAPI.isVulkanBackendSelected();
 			int lastBState = captureIrisRenderState
 				? net.irisshaders.iris.uniforms.CapturedRenderingState.INSTANCE.getCurrentRenderedBlockEntity()

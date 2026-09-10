@@ -8,6 +8,45 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class GuiRawImageDecodeParityTest {
+    @Test void selectedResourceSamplingIsCopiedWithPixelsAndReloadMetadata() throws Exception {
+        var bytes = png(new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB));
+        var pack = (net.minecraft.server.packs.PackResources) java.lang.reflect.Proxy.newProxyInstance(
+            getClass().getClassLoader(), new Class<?>[]{net.minecraft.server.packs.PackResources.class},
+            (proxy, method, args) -> { if (method.getName().equals("packId")) return "fixture";
+                throw new UnsupportedOperationException(method.getName()); });
+        var id = ResourceLocation.withDefaultNamespace("test/sampler");
+        for (boolean blur : new boolean[]{false,true}) for (boolean clamp : new boolean[]{false,true}) {
+            var resource = new net.minecraft.server.packs.resources.Resource(pack,
+                () -> new java.io.ByteArrayInputStream(bytes),
+                () -> net.minecraft.server.packs.resources.ResourceMetadata.fromJsonStream(new java.io.ByteArrayInputStream(
+                    ("{\"texture\":{\"blur\":"+blur+",\"clamp\":"+clamp+"}}").getBytes(java.nio.charset.StandardCharsets.UTF_8))));
+            var asset = RustGalGuiRawImageAssets.decode(id, resource, 1);
+            assertNotNull(asset);
+            assertEquals(blur ? 2 : 1, asset.samplingFilter());
+            assertEquals(clamp ? 2 : 1, asset.samplingAddress());
+            assertArrayEquals(new byte[4], asset.pixels());
+        }
+        var defaults = RustGalGuiRawImageAssets.decode(id,
+            new net.minecraft.server.packs.resources.Resource(pack, () -> new java.io.ByteArrayInputStream(bytes)), 1);
+        assertEquals(1, defaults.samplingFilter());
+        assertEquals(1, defaults.samplingAddress());
+        var broken = new net.minecraft.server.packs.resources.Resource(pack, () -> new java.io.ByteArrayInputStream(bytes),
+            () -> { throw new java.io.IOException("bad selected metadata"); });
+        assertNull(RustGalGuiRawImageAssets.decode(id, broken, 1));
+    }
+
+    @Test void transportRejectsPartialOrUnknownSamplerAndCoordinatorRetainsMetadataOnlyChanges() throws Exception {
+        for (int filter=0; filter<=3; filter++) for (int address=0; address<=3; address++) {
+            final int f=filter, a=address;
+            boolean valid = (f==0 && a==0) || (f>=1 && f<=2 && a>=1 && a<=2);
+            if (valid) assertDoesNotThrow(() -> new net.vulkanic.bridge.VulkanicGalBridge.GuiRawImageAssetRecord(1,2,1,1,new byte[4],f,a));
+            else assertThrows(IllegalArgumentException.class, () -> new net.vulkanic.bridge.VulkanicGalBridge.GuiRawImageAssetRecord(1,2,1,1,new byte[4],f,a));
+        }
+        var source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/net/vulkanic/gui/RustGalFrameCoordinator.java"));
+        assertTrue(source.contains("previous.samplingFilter() == asset.samplingFilter()"));
+        assertTrue(source.contains("previous.samplingAddress() == asset.samplingAddress()"));
+    }
+
     private static byte[] png(BufferedImage image) throws Exception {
         var out = new ByteArrayOutputStream();
         assertTrue(ImageIO.write(image, "PNG", out));

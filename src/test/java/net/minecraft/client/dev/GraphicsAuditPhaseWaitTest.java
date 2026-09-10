@@ -2,7 +2,7 @@ package net.minecraft.client.dev;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 class GraphicsAuditPhaseWaitTest {
-    @Test void normalItemReadbackClaimsOnlyAnEligibleObservedAnimationFrame() throws Exception {
+    @Test void normalReadbackClaimsOnlyAnEligibleObservedFrameForEveryFixture() throws Exception {
         String source=java.nio.file.Files.readString(java.nio.file.Path.of(
             "src/main/java/net/minecraft/client/dev/DeterministicCameraCapture.java"));
         int claim=source.indexOf("public static long claimWholeFrameAttachmentCaptureRenderedFrameIndex()");
@@ -10,6 +10,8 @@ class GraphicsAuditPhaseWaitTest {
         String beforeClaim=source.substring(claim,issued);
         assertTrue(beforeClaim.contains("GraphicsAuditBlockDisplayFixture.readyForCapture(minecraft)"));
         assertTrue(beforeClaim.contains("blockAnimationAtCapture = GraphicsAuditBlockDisplayFixture.animationObservation(minecraft)"));
+        assertFalse(beforeClaim.contains("guiItemAnimationRequested()"),
+            "magma and other animated fixtures must not bypass phase selection or capture-time receipts");
         assertTrue(beforeClaim.contains("return -1L"));
     }
     @Test void animationWaitCountsRealProgressRatherThanDuplicateRenderFrames() {

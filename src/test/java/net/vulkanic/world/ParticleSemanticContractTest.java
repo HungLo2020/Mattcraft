@@ -8,6 +8,61 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class ParticleSemanticContractTest {
+	@Test
+	void legacyMarkerEntryPointRejectsVulkanBeforeJavaGeometryOrResourceAccess() {
+		String key = net.vulkanic.bridge.RustGalVulkanWholeFrameMode.propertyName();
+		String previous = System.getProperty(key);
+		try {
+			System.setProperty(key, "true");
+			var error = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+				() -> RustGalWorldPrimitiveRenderer.enqueueBlockMarker(null, null,
+					0, 0, 0, 0, 0, 0, 1, .5F, -1, null, 0, 1, 0, 1));
+			assertTrue(error.getMessage().contains("typed particle semantics"));
+		} finally {
+			if (previous == null) System.clearProperty(key); else System.setProperty(key, previous);
+		}
+	}
+	@Test
+	void nativeMarkersAreNotCollectedTwiceByWholeFrameRendering() throws Exception {
+		String source = Files.readString(Path.of("src/main/java/net/minecraft/client/renderer/GameRenderer.java"));
+		assertTrue(!source.contains("enqueueRustGalBlockMarkers("),
+			"whole-frame extraction must not duplicate the ordinary visible particle collector");
+	}
+	@Test
+	void normalBlockMarkerRoutePreservesFrozenParticleInputsAndRejectsFallback() throws Exception {
+		String source = Files.readString(Path.of("src/main/java/net/minecraft/client/particle/BlockMarker.java"));
+		int start = source.indexOf("boolean enqueueRustGal(");
+		int legacy = source.indexOf("return RustGalWorldPrimitiveRenderer.enqueueBlockMarker(", start);
+		String semantic = source.substring(start, legacy);
+		assertTrue(!semantic.contains("mattmc.dev.nativeBlockMarkerGeometry")
+			&& semantic.contains("usesRustWholeFrameVulkan()"));
+		for (String input : new String[] {"this.sprite.contents().name()", "this.sprite.semanticAnimationResource()",
+			"this.getFacingCameraMode().setRotation", "this.oRoll", "this.getQuadSize(f)",
+			"this.getU0()", "this.getU1()", "this.getV0()", "this.getV1()", "this.getLightColor(f)",
+			"this.alpha, this.rCol, this.gCol, this.bCol", "ParticleSurface.TERRAIN_OPAQUE",
+			"ParticleSurface.TERRAIN_TRANSLUCENT"}) {
+			assertTrue(semantic.contains(input), "missing Frozen particle input: " + input);
+		}
+		assertTrue(!semantic.contains("FULL_BRIGHT") && !semantic.contains("billboardVertices")
+			&& !semantic.contains("WorldMaterialQuadRecord"));
+		assertTrue(semantic.contains("if (!queued)") && semantic.contains("throw new IllegalStateException")
+			&& semantic.contains("return true;"), "rejection cannot fall through to Java geometry");
+	}
+	@Test
+	void normalTerrainVulkanStopsAtSemanticInputsWithoutPrivateGeometrySwitch() throws Exception {
+		String source = Files.readString(Path.of("src/main/java/net/vulkanic/world/RustGalWorldPrimitiveRenderer.java"));
+		int start = source.indexOf("public static boolean enqueueTerrainParticle(");
+		int end = source.indexOf("private static void enqueueNativeParticleLocked", start);
+		String terrain = source.substring(start,end);
+		assertTrue(!terrain.contains("nativeTerrainParticleGeometry"));
+		int semantic = terrain.indexOf("PENDING_PARTICLE_QUADS.add(");
+		int normalReturn = terrain.indexOf("if (!Boolean.getBoolean(\"mattmc.dev.graphicsAuditSliceMetrics\")) return true;");
+		int geometry = terrain.indexOf("billboardVertices(");
+		assertTrue(semantic >= 0 && normalReturn > semantic && geometry > normalReturn,
+			"normal Vulkan must return after semantic publication, before diagnostic Java geometry");
+		assertTrue(terrain.contains("if (!nativeTerrain) PENDING_MATERIAL_QUADS.add("),
+			"Java-expanded material geometry must be excluded even during Vulkan diagnostics");
+	}
 	@org.junit.jupiter.api.BeforeAll
 	static void bootstrap() {
 		net.minecraft.SharedConstants.tryDetectVersion();

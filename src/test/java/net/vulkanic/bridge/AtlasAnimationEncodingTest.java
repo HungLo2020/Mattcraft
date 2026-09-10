@@ -12,8 +12,9 @@ import static net.vulkanic.bridge.VulkanicGalBridge.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class AtlasAnimationEncodingTest {
-    @Test
-    void semanticSnapshotStagesAgainstAcceptedTextureGenerationNotResourceCounter() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {0x54a17a1a, 0xfdf71712, 0x80000000, 0xffffffff})
+    void semanticSnapshotStagesAgainstAcceptedTextureGenerationNotResourceCounter(int atlas) throws Exception {
         var name = net.minecraft.resources.ResourceLocation.withDefaultNamespace("audit/animated");
         var pixels = new net.blaze3d.platform.NativeImage(2, 1, false);
         pixels.setPixel(0, 0, 0xff123456);
@@ -47,7 +48,6 @@ class AtlasAnimationEncodingTest {
             var image = new java.awt.image.BufferedImage(2, 1, java.awt.image.BufferedImage.TYPE_INT_ARGB);
             var png = new java.io.ByteArrayOutputStream();
             assertTrue(javax.imageio.ImageIO.write(image, "PNG", png));
-            int atlas = 0x54a17a1a;
             Status before = bridge.updateWorldMeshAssets(1, List.of(),
                 List.of(new WorldMeshTextureAssetRecord(atlas, png.toByteArray(), List.of())), List.of());
             assertThrows(IllegalStateException.class, () -> bridge.stageAtlasAnimationAssets(atlas, 77, 40, snapshot));
@@ -109,7 +109,7 @@ class AtlasAnimationEncodingTest {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment request = VulkanicGalBridge.encodeAtlasAnimationUpdate(arena, 17, 23, 41, List.of(source));
             assertEquals(48, request.byteSize());
-            assertEquals(42, request.get(ValueLayout.JAVA_INT, 0));
+            assertEquals(54, request.get(ValueLayout.JAVA_INT, 0));
             assertEquals(48, request.get(ValueLayout.JAVA_INT, 4));
             assertEquals(17, request.get(ValueLayout.JAVA_INT, 8));
             assertEquals(0, request.get(ValueLayout.JAVA_INT, 12));

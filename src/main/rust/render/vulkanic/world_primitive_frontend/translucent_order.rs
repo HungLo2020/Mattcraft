@@ -83,6 +83,7 @@ pub(super) fn append_batches(
     asset: &MeshAssetStore,
     instance_index: usize,
     color_format: ColorFormat,
+    raster_y_direction: RasterYDirection,
     g_buffer: bool,
     batches: &mut Vec<MeshBatch>,
 ) -> GalResult<()> {
@@ -100,7 +101,7 @@ pub(super) fn append_batches(
         let (section_index, index_offset) = cache.quads[ordinal];
         let section = &asset.sections[section_index as usize];
         let key = mesh_key_for_section(instance, section, section_index, section.cull_policy,
-            asset_generation_for_key(instance.mesh_key, asset)?, color_format, g_buffer);
+            asset_generation_for_key(instance.mesh_key, asset)?, color_format, raster_y_direction, g_buffer);
         // Only contiguous indices with identical resources and the same
         // instance can form one draw. Never move a pane across another material.
         if let Some(last) = batches.last_mut().filter(|last|

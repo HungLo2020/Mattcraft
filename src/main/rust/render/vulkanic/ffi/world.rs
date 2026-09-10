@@ -634,6 +634,39 @@ fn valid_world_lod_uv_corner_order(order: u32) -> bool {
     seen == 0x0f
 }
 
+pub(crate) fn merge_particle_semantics(
+    materials: Vec<WorldMaterialQuadRequest>,
+    particles: &[FfiWorldParticleQuadRequest],
+    viewport: [u32; 2],
+) -> GalResult<Vec<WorldMaterialQuadRequest>> {
+    let count = materials.len().checked_add(particles.len())
+        .filter(|&n| n <= FFI_MAX_BATCH_ITEMS)
+        .ok_or_else(|| GalError::invalid_argument("combined particle/material frame bound exceeded"))?;
+    let material_count = materials.len();
+    let mut source = materials.into_iter();
+    let mut output = Vec::with_capacity(count);
+    let mut cursor = 0;
+    for p in particles {
+        validate_item_size::<FfiWorldParticleQuadRequest>(p.byte_size, "particle semantics")?;
+        let index = p.material_index as usize;
+        if index < cursor || index > material_count {
+            return Err(GalError::invalid_argument("invalid particle surface or material ordering"));
+        }
+        let surface = crate::render::vulkanic::world_primitive_frontend::particle::ParticleSurface::from_wire(p.surface_kind)?;
+        let quad = crate::render::vulkanic::world_primitive_frontend::particle::ParticleQuad {
+            center: p.center, rotation: p.rotation, size: p.size, uv_bounds: p.uv_bounds,
+            texture_id: p.texture_id, translucent: surface.translucent(),
+            color_argb: p.color_argb, packed_light: p.packed_light,
+        };
+        let quad = quad.lower_surface(surface, viewport)?;
+        output.extend(source.by_ref().take(index-cursor));
+        cursor = index;
+        output.push(quad);
+    }
+    output.extend(source);
+    Ok(output)
+}
+
 pub(crate) unsafe fn decode_whole_frame_submit(
     request: *const FfiWholeFrameSubmitRequest,
     capabilities: BackendCapabilities,
@@ -708,6 +741,47 @@ pub(crate) unsafe fn decode_world_primitive_submit(
     Ok((generation, frame_target, frame))
 }
 
+unsafe fn read_whole_frame_request(request: *const FfiWholeFrameSubmitRequest)
+    -> GalResult<FfiWholeFrameSubmitRequest> {
+    if request.is_null() {
+        return Err(GalError::invalid_argument("whole-frame submit request is null"));
+    }
+    let header = read_struct(request.cast::<FfiHeader>(), "whole-frame header")?;
+    validate_header::<FfiWholeFrameSubmitRequest>(header)?;
+    read_struct(request, "whole-frame submit request")
+}
+
+pub(crate) fn merge_experience_orb_instances(
+    meshes: Vec<WorldMeshInstanceRequest>,
+    orbs: &[FfiWorldExperienceOrbInstanceRecord],
+    viewport: [u32; 2],
+) -> GalResult<Vec<WorldMeshInstanceRequest>> {
+    let count = meshes.len().checked_add(orbs.len())
+        .filter(|&count| count <= FFI_MAX_BATCH_ITEMS)
+        .ok_or_else(|| GalError::invalid_argument("combined mesh/orb frame bound exceeded"))?;
+    let mesh_count = meshes.len();
+    let mut source = meshes.into_iter();
+    let mut output = Vec::with_capacity(count);
+    let mut cursor = 0;
+    for orb in orbs {
+        validate_item_size::<FfiWorldExperienceOrbInstanceRecord>(orb.byte_size, "orb placement")?;
+        let index = orb.mesh_index as usize;
+        if orb.reserved0 != 0 || index < cursor || index > mesh_count {
+            return Err(GalError::invalid_argument("invalid orb placement ordering or reserved bits"));
+        }
+        let instance = crate::render::vulkanic::world_primitive_frontend::experience_orb::ExperienceOrbPlacement {
+            entity_transform: orb.entity_transform,
+            camera_orientation: orb.camera_orientation,
+            entity_id: orb.entity_id,
+        }.instance(orb.mesh_key, orb.mesh_generation, viewport)?;
+        output.extend(source.by_ref().take(index-cursor));
+        cursor = index;
+        output.push(instance);
+    }
+    output.extend(source);
+    Ok(output)
+}
+
 pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
     request: *const FfiWholeFrameSubmitRequest,
     capabilities: BackendCapabilities,
@@ -730,7 +804,8 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
             "whole-frame submit request is null",
         ));
     }
-    let input_bytes = input_bytes_for_whole_frame(&*request);
+    let request = read_whole_frame_request(request)?;
+    let input_bytes = input_bytes_for_whole_frame(&request);
     if input_bytes > FFI_MAX_WHOLE_FRAME_INPUT_BYTES {
         return Err(GalError::ffi(
             StatusCode::InvalidArgument,
@@ -740,8 +815,6 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
             ),
         ));
     }
-    let request = read_struct(request, "whole-frame submit request")?;
-    validate_header::<FfiWholeFrameSubmitRequest>(request.header)?;
     reject_unknown_feature_bits(request.negotiated_feature_bits)?;
     let supported = capability_feature_bits(capabilities);
     if request.negotiated_feature_bits & !supported != 0 {
@@ -1000,6 +1073,10 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
             viewport_height,
         });
     }
+    if request.world_particle_quads.count > FFI_MAX_BATCH_ITEMS as u64 {
+        return Err(GalError::invalid_argument("particle semantic count exceeds frame bound"));
+    }
+    let raw_particles = read_slice(request.world_particle_quads, true, "world particle semantics")?;
     let raw_materials = read_slice(
         request.world_material_quads,
         true,
@@ -1048,6 +1125,7 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
     let material_quad_count = raw_materials
         .len()
         .checked_add(raw_compact_materials.len())
+        .and_then(|count| count.checked_add(raw_particles.len()))
         .ok_or_else(|| {
             GalError::ffi(
                 StatusCode::LengthOverflow,
@@ -1487,6 +1565,11 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
             });
         }
     }
+    if !raw_particles.is_empty() {
+        material_quads = merge_particle_semantics(material_quads, raw_particles,
+            [decode_world_viewport_axis(request.viewport_width, "particle viewport width")?,
+             decode_world_viewport_axis(request.viewport_height, "particle viewport height")?])?;
+    }
     let raw_mesh_instances = read_slice(
         request.world_mesh_instances,
         true,
@@ -1502,6 +1585,10 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
             ),
         ));
     }
+    if request.world_experience_orbs.count > (FFI_MAX_BATCH_ITEMS - raw_mesh_instances.len()) as u64 {
+        return Err(GalError::invalid_argument("combined mesh/orb frame bound exceeded"));
+    }
+    let raw_orbs = read_slice(request.world_experience_orbs, true, "orb placements")?;
     let mut mesh_instances = Vec::with_capacity(raw_mesh_instances.len());
     for instance in raw_mesh_instances {
         validate_item_size::<FfiWorldMeshInstanceRecord>(
@@ -1562,6 +1649,12 @@ pub(crate) unsafe fn decode_whole_frame_submit_with_backend_policy(
             viewport_width,
             viewport_height,
         });
+    }
+    if !raw_orbs.is_empty() {
+        mesh_instances = merge_experience_orb_instances(mesh_instances, raw_orbs, [
+            decode_world_viewport_axis(request.viewport_width, "orb viewport width")?,
+            decode_world_viewport_axis(request.viewport_height, "orb viewport height")?,
+        ])?;
     }
     let raw_text_quads = read_slice(request.world_text_quads, true, "world text quads")?;
     if raw_text_quads.len() > FFI_MAX_BATCH_ITEMS {
@@ -2716,11 +2809,8 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_whole_frame_submit(
             );
             return error.code as i32;
         };
-        let input_bytes = if request.is_null() {
-            0
-        } else {
-            input_bytes_for_whole_frame(&*request)
-        };
+        let input_bytes = read_whole_frame_request(request).as_ref()
+            .map(input_bytes_for_whole_frame).unwrap_or(0);
         context.ffi_calls += 1;
         context.ffi_input_bytes = context.ffi_input_bytes.saturating_add(input_bytes);
         context.ffi_output_bytes = context
@@ -2742,6 +2832,16 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_whole_frame_submit(
                     gui_tiled_quads,
                 )| {
                     let world_frame_id = world_frame.frame_id;
+                    if std::env::var_os("MATTMC_TRACE_WHOLE_FRAME").is_some() {
+                        // Observe decoded native item meshes, not Java producer
+                        // counts. A group is the real scheduler item identity.
+                        let (groups, layers, nonidentity, distinct) =
+                            super::super::gui_mesh_frontend::flat_item_mesh_decode_counts(&gui_mesh_batches);
+                        if layers != 0 {
+                            whole_frame_trace(&format!("whole-frame.gui-item-mesh-layers groups={} layers={}", groups, layers));
+                            whole_frame_trace(&format!("whole-frame.gui-item-mesh-transforms layers={} nonidentity={} distinct={}", layers, nonidentity, distinct));
+                        }
+                    }
                     let item_layer_count = gui_affine_quads.iter().map(|quad|quad.item_raster_layers.len()).sum::<usize>();
                     context.ffi_input_bytes = context.ffi_input_bytes.saturating_add(
                         item_layer_count as u64 * size_of::<FfiGuiItemRasterLayer>() as u64);
@@ -2888,11 +2988,8 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_world_primitives_submit(
             );
             return error.code as i32;
         };
-        let input_bytes = if request.is_null() {
-            0
-        } else {
-            input_bytes_for_whole_frame(&*request)
-        };
+        let input_bytes = read_whole_frame_request(request).as_ref()
+            .map(input_bytes_for_whole_frame).unwrap_or(0);
         context.ffi_calls += 1;
         context.ffi_input_bytes = context.ffi_input_bytes.saturating_add(input_bytes);
         context.ffi_output_bytes = context

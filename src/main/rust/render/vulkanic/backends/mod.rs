@@ -7,6 +7,11 @@ pub(super) mod vulkan;
 #[cfg(test)]
 mod conformance_matrix;
 
+#[cfg(test)]
+mod graphics_storage_conformance;
+#[cfg(test)]
+mod terrain_interpolation_observation;
+
 use std::sync::{Mutex, OnceLock};
 
 use super::commands::ValidatedSubmissionBatch;
@@ -322,6 +327,7 @@ pub(super) mod mock {
         pub(in crate::render::vulkanic) encoded_batches: usize,
         pub(in crate::render::vulkanic) completed: SubmissionId,
         pub(in crate::render::vulkanic) fail_next_create: bool,
+        pub(in crate::render::vulkanic) fail_create_after: Option<usize>,
         pub(in crate::render::vulkanic) fail_next_submit: bool,
         pub(in crate::render::vulkanic) fail_retire_at: Option<SubmissionId>,
         pub(in crate::render::vulkanic) retire_requests: Vec<SubmissionId>,
@@ -370,8 +376,9 @@ pub(super) mod mock {
             handle: Handle,
             desc: BackendCreateDesc<'_>,
         ) -> GalResult<BackendToken> {
-            if self.fail_next_create {
+            if self.fail_next_create || self.fail_create_after == Some(self.creates.len()) {
                 self.fail_next_create = false;
+                self.fail_create_after = None;
                 return Err(GalError::backend("mock create failure"));
             }
             let kind = match desc {

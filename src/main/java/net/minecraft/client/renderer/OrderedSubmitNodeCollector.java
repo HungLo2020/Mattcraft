@@ -112,6 +112,14 @@ public interface OrderedSubmitNodeCollector {
 			null, outlineColor, crumblingOverlay);
 	}
 
+	/** Explicit visibility intent: this mesh contributes only an entity outline. */
+	default <S> void submitModelOutlineSemanticTexture(
+		Model<? super S> model, S state, PoseStack poseStack, RenderType material,
+		int light, ResourceLocation textureIdentity, int outlineColor
+	) {
+		throw new UnsupportedOperationException("outline-only semantic model collector unavailable");
+	}
+
 	/** Explicit direct-texture semantic model submit used by emissive feature layers. */
 	default <S> void submitModelSemanticTexture(
 		Model<? super S> model,

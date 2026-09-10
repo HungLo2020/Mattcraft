@@ -70,7 +70,10 @@ pub(crate) fn destroy_all_frame_targets(context: &mut BridgeContext) -> GalResul
 #[derive(Default)]
 pub(crate) struct BridgeRegistry {
     pub(crate) next_context_id: u64,
-    pub(crate) contexts: BTreeMap<u64, BridgeContext>,
+    // Keep large frontend/backend owners stable on the heap. BTree insertion
+    // otherwise copies whole contexts through several stack frames, exhausting
+    // ordinary JVM native stacks when inserting into an existing node.
+    pub(crate) contexts: BTreeMap<u64, Box<BridgeContext>>,
     pub(crate) last_error: String,
     pub(crate) windowed_presenter_active: bool,
 }
@@ -219,7 +222,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_create(
             reserve_context_slot()?;
             registry.contexts.insert(
                 context_id,
-                BridgeContext {
+                Box::new(BridgeContext {
                     gal,
                     windowed_presenter: false,
                     gui_frontend: GuiFrontend::default(),
@@ -230,7 +233,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_create(
                     last_error: String::new(),
                     frame_targets: BTreeMap::new(),
                     stale_frame_targets: Vec::new(),
-                },
+                }),
             );
             Ok(context_id)
         })?;
@@ -309,7 +312,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_create_borrowed_opengl(
             reserve_context_slot()?;
             registry.contexts.insert(
                 context_id,
-                BridgeContext {
+                Box::new(BridgeContext {
                     gal,
                     windowed_presenter: false,
                     gui_frontend: GuiFrontend::default(),
@@ -320,7 +323,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_create_borrowed_opengl(
                     last_error: String::new(),
                     frame_targets: BTreeMap::new(),
                     stale_frame_targets: Vec::new(),
-                },
+                }),
             );
             Ok(context_id)
         })?;
@@ -424,7 +427,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_create_windowed_vulkan(
             }
             registry.contexts.insert(
                 context_id,
-                BridgeContext {
+                Box::new(BridgeContext {
                     gal,
                     windowed_presenter: true,
                     gui_frontend: GuiFrontend::default(),
@@ -435,7 +438,7 @@ pub unsafe extern "C" fn mattmc_vulkanic_gal_context_create_windowed_vulkan(
                     last_error: String::new(),
                     frame_targets: BTreeMap::new(),
                     stale_frame_targets: Vec::new(),
-                },
+                }),
             );
             Ok(context_id)
         })?;

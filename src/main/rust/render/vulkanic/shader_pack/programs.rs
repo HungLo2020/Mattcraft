@@ -4353,7 +4353,46 @@ pub fn minimal_direct_terrain_material_program(
 }
 
 fn minimal_direct_terrain_fragment_source(kind: TerrainMaterialProgramKind) -> String {
-    terrain_fragment_source_with_pass_define(MINIMAL_TERRAIN_MATERIAL_FRAGMENT_DIRECT, kind)
+    let source = terrain_fragment_source_with_pass_define(MINIMAL_TERRAIN_MATERIAL_FRAGMENT_DIRECT, kind);
+    terrain_fragment_coordinate_probe(source, std::env::var("MATTMC_RUST_TERRAIN_COORDINATE_PROBE").ok().as_deref())
+}
+
+/// Opt-in diagnostic output, never a normal material or parity result. The
+/// existing explicit pass and Rust presenter carry the low 24 float bits in
+/// RGB8; the positive normalized atlas coordinate's exponent is known from
+/// the copied CPU source. No backend objects or GPU state enter the callsite.
+pub(crate) fn terrain_fragment_coordinate_probe(source: String, probe: Option<&str>) -> String {
+    if probe == Some("clip-bits") {
+        let source = source.replacen("#version 450\n", "#version 450\nlayout(location = 14) flat in vec4 diagnostic_clip;\n", 1);
+        let anchor = "vec2 sample_uv = v_animation_region.xy + v_uv * v_animation_region.zw;";
+        return source.replacen(anchor, &format!("{anchor}\n\
+            // DIAGNOSTIC ONLY: complete clip float bits across eight adjacent pixels.\n\
+            // Retain the previously measured UV sample as an instrumentation control.\n\
+            if (all(equal(ivec2(gl_FragCoord.xy), ivec2(764, 320)))) {{\n\
+                uint uv_bits = floatBitsToUint(sample_uv.y);\n\
+                out_color = vec4(vec3(uv_bits & 255u, (uv_bits >> 8u) & 255u, (uv_bits >> 16u) & 255u) / 255.0, 1.0);\n\
+                return;\n\
+            }}\n\
+            uint probe_x = uint(gl_FragCoord.x);\n\
+            uint coordinate_bits = floatBitsToUint(diagnostic_clip[(probe_x >> 1u) & 3u]);\n\
+            uvec3 probe_bytes = (probe_x & 1u) == 0u\n\
+                ? uvec3(coordinate_bits & 255u, (coordinate_bits >> 8u) & 255u, (coordinate_bits >> 16u) & 255u)\n\
+                : uvec3((coordinate_bits >> 24u) & 255u, 165u, 90u);\n\
+            out_color = vec4(vec3(probe_bytes) / 255.0, 1.0);\n\
+            return;"), 1);
+    }
+    let coordinate = match probe {
+        Some("u-bits") => "sample_uv.x",
+        Some("v-bits") => "sample_uv.y",
+        // Compare rasterized depth with the Frozen observer independently of
+        // atlas UV interpolation. This remains diagnostic color output, not
+        // a depth attachment override or a material admitted for normal play.
+        Some("depth-bits") => "gl_FragCoord.z",
+        _ => return source,
+    };
+    let anchor = "vec2 sample_uv = v_animation_region.xy + v_uv * v_animation_region.zw;";
+    let output = format!("{anchor}\n    // DIAGNOSTIC ONLY: terrain coordinate {coordinate} float bits, not color parity.\n    uint coordinate_bits = floatBitsToUint({coordinate});\n    out_color = vec4(vec3(coordinate_bits & 255u, (coordinate_bits >> 8u) & 255u, (coordinate_bits >> 16u) & 255u) / 255.0, 1.0);\n    return;");
+    source.replacen(anchor, &output, 1)
 }
 
 fn minimal_deferred_terrain_fragment_source(kind: TerrainMaterialProgramKind) -> String {
@@ -4384,7 +4423,18 @@ fn terrain_fragment_discard_define(kind: TerrainMaterialProgramKind) -> &'static
 /// texel-centre coordinate.
 /// Both direct and deferred builtin terrain use this exact vertex contract.
 fn minimal_direct_terrain_vertex_source() -> String {
-    MINIMAL_TERRAIN_MATERIAL_VERTEX.to_string()
+    terrain_vertex_coordinate_probe(MINIMAL_TERRAIN_MATERIAL_VERTEX.to_string(),
+        std::env::var("MATTMC_RUST_TERRAIN_COORDINATE_PROBE").ok().as_deref())
+}
+
+/// Observe the actual vertex expression before backend clip-depth conversion.
+/// Flat transport carries the pipeline's explicitly selected vertex unchanged;
+/// it does not replace position arithmetic or inspect backend resources.
+pub(crate) fn terrain_vertex_coordinate_probe(source: String, probe: Option<&str>) -> String {
+    if probe != Some("clip-bits") { return source; }
+    source.replacen("#version 450\n", "#version 450\nlayout(location = 14) flat out vec4 diagnostic_clip;\n", 1)
+        .replacen("vec4 clip = projection * view * world;",
+            "vec4 clip = projection * view * world;\n    diagnostic_clip = clip;", 1)
 }
 
 pub fn minimal_g_buffer_composite_program() -> CompositeProgram {
@@ -4676,9 +4726,8 @@ void main() {
 }
 "#;
 
-/// Solid-color vertex contract for the Rust-owned entity-outline mask. It
-/// reuses only the copied mesh vertex/instance ABI; terrain texture/material
-/// semantics are intentionally absent from this pass.
+/// Entity outline mask using the copied mesh/instance ABI. Texture alpha
+/// defines the silhouette; the semantic outline color replaces surface RGB.
 pub const MINIMAL_ENTITY_OUTLINE_VERTEX: &str = r#"#version 450
 struct MeshVertex {
     vec4 position_uv;
@@ -4703,9 +4752,12 @@ layout(set = 0, binding = 1, std430) readonly buffer WorldMeshInstances {
     mat4 projection;
     mat4 light_view_projection;
     vec4 shadow_params;
+    vec4 fog_color_and_environmental_start;
+    vec4 fog_ranges;
     MeshInstance instances[];
 };
 layout(location = 0) out vec4 v_outline_color;
+layout(location = 1) out vec2 v_outline_uv;
 void main() {
     MeshVertex vertex = vertices[gl_VertexIndex];
     MeshInstance instance = instances[gl_InstanceIndex];
@@ -4716,15 +4768,21 @@ void main() {
 #endif
     gl_Position = clip;
     v_outline_color = instance.color;
+    v_outline_uv = (uint(instance.material.w) & 1u) != 0u
+        ? vertex.shader_data.xy : vec2(vertex.position_uv.w, vertex.color_uv.w);
 }
 "#;
 
-/// Solid-color fragment contract for the entity-outline mask. Alpha is kept
-/// from the semantic outline color so the bundled Sobel pass can detect edges.
+/// Vanilla discards only exactly transparent texture samples. Nonzero alpha
+/// contributes the semantic outline color, with no material lighting or fog.
 pub const MINIMAL_ENTITY_OUTLINE_FRAGMENT: &str = r#"#version 450
+layout(set = 0, binding = 2) uniform texture2D OutlineTexture;
+layout(set = 0, binding = 3) uniform sampler OutlineSampler;
 layout(location = 0) in vec4 v_outline_color;
+layout(location = 1) in vec2 v_outline_uv;
 layout(location = 0) out vec4 out_outline_color;
 void main() {
+    if (texture(sampler2D(OutlineTexture, OutlineSampler), v_outline_uv).a == 0.0) discard;
     out_outline_color = v_outline_color;
 }
 "#;
@@ -4788,7 +4846,9 @@ void main() {
         blurred += texture(sampler2D(InTexture, InSampler), v_uv + step_value * a);
     }
     blurred += texture(sampler2D(InTexture, InSampler), v_uv + step_value * radius) * 0.5;
-    out_color = blurred / (radius + 0.5);
+    // Vanilla entity_outline_box_blur averages color, not coverage. Alpha is
+    // accumulated and clamped by the UNORM attachment on each filter pass.
+    out_color = vec4((blurred / (radius + 0.5)).rgb, blurred.a);
 }
 "#;
 
@@ -5690,11 +5750,13 @@ mod tests {
     };
 
     #[test]
-    fn entity_outline_shader_contract_is_solid_color_and_preserves_alpha() {
+    fn entity_outline_shader_contract_preserves_outline_color_and_texture_silhouette() {
         assert!(MINIMAL_ENTITY_OUTLINE_VERTEX.contains("WorldMeshVertices"));
         assert!(MINIMAL_ENTITY_OUTLINE_VERTEX.contains("v_outline_color = instance.color"));
         assert!(MINIMAL_ENTITY_OUTLINE_FRAGMENT.contains("out_outline_color = v_outline_color"));
-        assert!(!MINIMAL_ENTITY_OUTLINE_FRAGMENT.contains("sampler2D"));
+        assert!(MINIMAL_ENTITY_OUTLINE_FRAGMENT.contains("v_outline_uv).a == 0.0) discard"));
+        assert!(MINIMAL_ENTITY_OUTLINE_VERTEX.contains("vec4 fog_color_and_environmental_start;"));
+        assert!(MINIMAL_ENTITY_OUTLINE_VERTEX.contains("vec4 fog_ranges;"));
     }
 
     #[test]
@@ -5993,6 +6055,41 @@ mod tests {
             // performs no fragment-side `gl_FrontFacing` discard.
             assert!(!fragment.contains("gl_FrontFacing"));
         }
+    }
+
+    #[test]
+    fn terrain_coordinate_probe_is_explicit_and_preserves_normal_source() {
+        let normal = terrain_fragment_source_with_pass_define(
+            MINIMAL_TERRAIN_MATERIAL_FRAGMENT_DIRECT, TerrainMaterialProgramKind::Opaque);
+        assert_eq!(terrain_fragment_coordinate_probe(normal.clone(), None), normal);
+        assert_eq!(terrain_fragment_coordinate_probe(normal.clone(), Some("unknown")), normal);
+        for (mode, coordinate) in [("u-bits", "sample_uv.x"), ("v-bits", "sample_uv.y"), ("depth-bits", "gl_FragCoord.z")] {
+            let probe = terrain_fragment_coordinate_probe(normal.clone(), Some(mode));
+            assert_eq!(probe.matches("DIAGNOSTIC ONLY").count(), 1);
+            assert!(probe.contains(&format!("floatBitsToUint({coordinate})")));
+            assert!(!probe.contains("gl_FragDepth ="));
+            assert!(probe.contains("(coordinate_bits >> 16u) & 255u"));
+            assert!(probe.find("uint coordinate_bits").unwrap() < probe.find("bool use_mipmaps").unwrap());
+        }
+    }
+
+    #[test]
+    fn terrain_clip_probe_observes_without_replacing_position_or_depth_math() {
+        for mode in [None, Some("unknown"), Some("u-bits"), Some("v-bits"), Some("depth-bits")] {
+            assert_eq!(terrain_vertex_coordinate_probe(MINIMAL_TERRAIN_MATERIAL_VERTEX.into(), mode),
+                MINIMAL_TERRAIN_MATERIAL_VERTEX);
+        }
+        let vertex = terrain_vertex_coordinate_probe(MINIMAL_TERRAIN_MATERIAL_VERTEX.into(), Some("clip-bits"));
+        assert_eq!(vertex.matches("vec4 clip = projection * view * world;").count(), 1);
+        assert!(vertex.contains("layout(location = 14) flat out vec4 diagnostic_clip;"));
+        assert!(vertex.find("diagnostic_clip = clip;").unwrap() < vertex.find("clip.z = clip.z * 0.5").unwrap());
+        assert_eq!(vertex.matches("gl_Position = clip;").count(), 1);
+        let fragment = terrain_fragment_coordinate_probe(MINIMAL_TERRAIN_MATERIAL_FRAGMENT_DIRECT.into(), Some("clip-bits"));
+        assert!(fragment.contains("layout(location = 14) flat in vec4 diagnostic_clip;"));
+        assert!(fragment.contains("(coordinate_bits >> 24u) & 255u, 165u, 90u"));
+        assert!(fragment.contains("ivec2(764, 320)"));
+        assert!(fragment.contains("uint uv_bits = floatBitsToUint(sample_uv.y);"));
+        assert!(!fragment.contains("gl_FragDepth ="));
     }
 
     #[test]

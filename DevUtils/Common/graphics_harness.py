@@ -1589,6 +1589,20 @@ def canonical_fixture_requested(args: argparse.Namespace, modes: Sequence[ModeSp
 
 def canonical_camera_options(args: argparse.Namespace) -> dict[str, float | str]:
     camera = dict(DEFAULT_PARITY_CAMERA)
+    if getattr(args, "model_camera", "world") == "sky":
+        if (getattr(args, "world_mesh_model_scenario", "") != "cow"
+                or getattr(args, "world_static_terrain_scenario", "")
+                or getattr(args, "world_static_terrain_resource_pack_scenario", "")
+                or getattr(args, "gui_resource_pack_scenario", "")
+                or getattr(args, "world_cloud_scenario", "")
+                or getattr(args, "capture_celestial", "")):
+            raise ValueError("sky model camera requires only the cow model fixture, without terrain/cloud/celestial scenarios")
+        # The existing no-gravity server cow follows the camera. Above the
+        # dimension's build height no fixture support block can be placed;
+        # both renderers see a genuinely terrain-free scene, not hidden draws.
+        camera["y"] = 512.0
+        camera["pitch"] = 0.0
+        camera["pose_sequence"] = "cow-sky-static-v1"
     if getattr(args, "gui_resource_pack_scenario", "") == "water-bottom-isolation":
         camera["y"] = 96.0
         camera["pitch"] = -20.0
@@ -1605,6 +1619,10 @@ def canonical_camera_options(args: argparse.Namespace) -> dict[str, float | str]
         camera["y"] = 192.0
         camera["pitch"] = 0.0
         camera["pose_sequence"] = "cloud-layer-static-v1"
+        if getattr(args, "cloud_camera", "layer") == "overhead":
+            camera["y"] = 160.0
+            camera["pitch"] = -90.0
+            camera["pose_sequence"] = "cloud-overhead-static-v1"
     return camera
 
 
@@ -1637,7 +1655,7 @@ def canonical_fixture_uses_static_capture_schedule(args: argparse.Namespace) -> 
     if not getattr(args, "_canonical_fixture_run_source", None):
         return False
     pose_sequence = canonical_camera_options(args)["pose_sequence"]
-    if pose_sequence == "cloud-layer-static-v1":
+    if pose_sequence in {"cloud-layer-static-v1", "cloud-overhead-static-v1"}:
         return True
     if pose_sequence != "single-static-v1":
         return False
@@ -1696,7 +1714,13 @@ def add_parity_fixture_environment(args: argparse.Namespace, env: MutableMapping
 
 def read_json(path: Path) -> dict[str, object] | None:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        if path.exists():
+            value = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            # Historical evidence can be losslessly compacted without changing
+            # the authoritative paths declared by its original manifests.
+            with gzip.open(path.with_name(path.name + ".gz"), "rt", encoding="utf-8") as source:
+                value = json.load(source)
     except Exception:
         return None
     return value if isinstance(value, dict) else None
@@ -8984,12 +9008,11 @@ def deterministic_initial_frame_path(artifact_path: Path) -> Path | None:
     # manifest first so visual pairing follows the actual captured pose rather
     # than requiring a particular filename. Shell-scene diagnostic crops are
     # deliberately excluded because they are not the presented game frame.
-    manifests = sorted(capture_dir.glob("deterministic_camera_capture_*.json"))
-    for manifest in manifests:
-        document = read_json(manifest)
+    document = deterministic_capture_document(artifact_path)
+    if document is not None:
         captures = document.get("captures") if isinstance(document, dict) else None
         if not isinstance(captures, list):
-            continue
+            return None
         for capture in captures:
             if not isinstance(capture, dict):
                 continue
@@ -8999,8 +9022,7 @@ def deterministic_initial_frame_path(artifact_path: Path) -> Path | None:
             candidate = Path(screenshot)
             if candidate.is_file() and not candidate.name.startswith("rust_vulkan_shell_scene_crop_"):
                 return candidate
-    matches = sorted(capture_dir.glob("deterministic_camera_capture_*/*01_initial.png"))
-    return matches[0] if matches else None
+    return None
 
 
 def deterministic_inventory_frame_path(artifact_path: Path) -> Path | None:
@@ -9033,12 +9055,22 @@ def deterministic_capture_document(artifact_path: Path) -> dict[str, object] | N
     an image pair without its semantic capture receipt.
     """
     capture_dir = artifact_path.parent / "capture"
-    manifests = sorted(capture_dir.glob("deterministic_camera_capture_*.json"))
-    for manifest in reversed(manifests):
-        document = read_json(manifest)
-        if isinstance(document, dict):
-            return document
-    return None
+    artifact = read_json(artifact_path)
+    files = artifact.get("capture", {}).get("files", {}) if isinstance(artifact, dict) else {}
+    if "deterministic" in files:
+        declared = files["deterministic"]
+        manifest = Path(declared) if isinstance(declared, str) and declared else None
+        if manifest is not None and manifest.resolve().parent != capture_dir.resolve():
+            return None
+    elif any(capture_dir.glob("meta_*.txt")):
+        manifest = load_capture_files(capture_dir)["deterministic"]
+    else:
+        # Legacy standalone fixtures have no artifact receipt. They are usable
+        # only when unambiguous; never choose an arbitrary retry by filename.
+        manifests = list(capture_dir.glob("deterministic_camera_capture_*.json"))
+        manifest = manifests[0] if len(manifests) == 1 else None
+    document = read_json(manifest) if manifest is not None else None
+    return document if isinstance(document, dict) else None
 
 
 def _deterministic_initial_capture(document: Mapping[str, object] | None) -> dict[str, object] | None:
@@ -9092,6 +9124,48 @@ def deterministic_lightmap_inputs(document: Mapping[str, object] | None) -> list
     return values if values and all(len(value.split(",")) == 13 for value in values) else None
 
 
+def dropped_item_foil_fixture_valid(receipt):
+    if not isinstance(receipt, Mapping):
+        return False
+    count = receipt.get("stackCount")
+    items = receipt.get("items")
+    if (receipt.get("fixture") != "dropped-item-foil-v2" or receipt.get("complete") is not True
+            or receipt.get("frozenSimulation") is not True
+            or type(count) is not int or count not in (1, 64)
+            or not isinstance(items, list) or len(items) != 2):
+        return False
+    for item, name in zip(items, ("minecraft:diamond", "minecraft:stone")):
+        if not isinstance(item, Mapping):
+            return False
+        extracted = item.get("extracted")
+        if (not isinstance(extracted, Mapping)
+                or type(extracted.get("age")) not in (int, float) or extracted["age"] != 1.0
+                or type(extracted.get("bobOffset")) not in (int, float) or extracted["bobOffset"] != 3.1415927
+                or type(extracted.get("copies")) is not int or extracted["copies"] != (1 if count == 1 else 5)
+                or type(extracted.get("seed")) is not int
+                or type(extracted.get("light")) is not int):
+            return False
+        position = item.get("position")
+        if (item.get("item") != name or type(item.get("count")) is not int or item["count"] != count
+                or item.get("foil") is not True or type(item.get("tickCount")) is not int or item["tickCount"] != 0
+                or type(item.get("bobOffset")) not in (int, float) or item["bobOffset"] != 3.1415927
+                or not isinstance(position, list) or len(position) != 3
+                or not all(type(v) in (int, float) and math.isfinite(v) for v in position)):
+            return False
+    return items[0]["position"] != items[1]["position"]
+
+
+def mixed_item_foil_fixture_valid(receipt):
+    if not isinstance(receipt, Mapping):
+        return False
+    position = receipt.get("position")
+    return (receipt.get("fixture") == "mixed-item-foil-v2"
+            and receipt.get("item") == "minecraft:diamond" and receipt.get("context") == "ground"
+            and receipt.get("foil") is True and receipt.get("complete") is True
+            and isinstance(position, list) and len(position) == 3
+            and all(type(value) in (int,float) and math.isfinite(value) for value in position))
+
+
 def deterministic_visual_fixture_equivalence(
     baseline: Mapping[str, object] | None,
     current: Mapping[str, object] | None,
@@ -9115,6 +9189,38 @@ def deterministic_visual_fixture_equivalence(
     # installs a runtime fixture. Require observed world-state receipts, not
     # merely the requested scenario name, before comparing these pixels.
     documents = tuple(doc if isinstance(doc, Mapping) else {} for doc in (baseline, current))
+    if any(doc.get("hotbarItemFixture") in ("shield-patterns", "shield-patterns-foil") for doc in documents):
+        pattern_fixture=documents[0].get("hotbarItemFixture")
+        expected = {"fixture": "held-shield-patterns-v1", "selectedSlot": 1,
+                    "mainHand": "minecraft:shield", "count": 1, "foil": False, "usingItem": False,
+                    "baseColor": "yellow", "patterns": "minecraft:cross:red,minecraft:border:blue", "complete": True}
+        if pattern_fixture == "shield-patterns-foil":
+            expected.update(fixture="held-shield-patterns-foil-v1",foil=True,speed=0.0,strength=0.5)
+        if pattern_fixture not in ("shield-patterns", "shield-patterns-foil") or any(doc.get("hotbarItemFixture") != pattern_fixture or doc.get("shieldPatternFixture") != expected for doc in documents):
+            mismatches.append("shield-pattern-fixture-state")
+    if any(doc.get("hotbarItemFixture") in ("shield", "shield-foil") for doc in documents):
+        fixture = documents[0].get("hotbarItemFixture")
+        expected = {"fixture": "held-shield-v1", "selectedSlot": 1,
+                    "mainHand": "minecraft:shield", "count": 1, "foil": fixture == "shield-foil",
+                    "usingItem": False, "speed": 0.0, "strength": 0.5, "complete": True}
+        if fixture not in ("shield", "shield-foil") or any(
+                doc.get("hotbarItemFixture") != fixture or doc.get("shieldFoilFixture") != expected
+                for doc in documents):
+            mismatches.append("shield-foil-fixture-state")
+    if any(doc.get("hotbarItemFixture") == "model-foil" for doc in documents):
+        expected = {"fixture": "held-trident-foil-v1", "selectedSlot": 1,
+                    "mainHand": "minecraft:trident", "count": 1, "foil": True,
+                    "usingItem": False, "speed": 0.0, "strength": 0.5, "complete": True}
+        if any(doc.get("hotbarItemFixture") != "model-foil" or doc.get("modelFoilFixture") != expected for doc in documents):
+            mismatches.append("model-foil-fixture-state")
+    if any(doc.get("droppedItemFoilFixture") is not None for doc in documents):
+        receipts = [doc.get("droppedItemFoilFixture") for doc in documents]
+        if not all(dropped_item_foil_fixture_valid(value) for value in receipts) or receipts[0] != receipts[1]:
+            mismatches.append("dropped-item-foil-fixture-state")
+    if any(doc.get("mixedItemFoilFixture") is not None for doc in documents):
+        receipts = [doc.get("mixedItemFoilFixture") for doc in documents]
+        if not all(mixed_item_foil_fixture_valid(value) for value in receipts) or receipts[0] != receipts[1]:
+            mismatches.append("mixed-item-foil-fixture-state")
     if any(doc.get("flowingWaterFixture") is not None for doc in documents):
         if not all(flowing_water_fixture_matches(doc) for doc in documents):
             mismatches.append("flowing-water-fixture-state")
@@ -9150,7 +9256,11 @@ def deterministic_visual_fixture_equivalence(
 
     if any(doc.get("terrainParticleFixture") is not None for doc in documents):
         receipts = [doc.get("terrainParticleFixture") for doc in documents]
-        if any(not isinstance(receipt, Mapping)
+        from cutout_terrain_reference import NAME as cutout_name, GLASS_NAME, source_evidence as cutout_source
+        if any(isinstance(r, Mapping) and r.get("fixture") in (cutout_name, GLASS_NAME) for r in receipts):
+            if not cutout_source(documents)["passed"]:
+                mismatches.append("terrain-particle-fixture-state")
+        elif any(not isinstance(receipt, Mapping)
                or receipt.get("fixture") != "magma-terrain-particle-v1"
                or receipt.get("block") != "minecraft:magma_block"
                or receipt.get("sprite") != "minecraft:block/magma"
@@ -9169,7 +9279,11 @@ def deterministic_visual_fixture_equivalence(
                or receipt.get("fixture") not in ("ordinary-flame-atlas-v1", "ordinary-static-flame-atlas-v1")
                or receipt.get("atlas") != "minecraft:textures/atlas/particles.png"
                or receipt.get("sprite") != "minecraft:flame"
-               or receipt.get("complete") is not True or receipt.get("size") != 0.35
+               or receipt.get("complete") is not True
+               or type(receipt.get("sizeSign", 1)) is not int
+               or receipt.get("sizeSign", 1) not in (-1, 1)
+               or receipt.get("size") != 0.35 * receipt.get("sizeSign", 1)
+               or receipt.get("layer", "OPAQUE") != "OPAQUE"
                or receipt.get("color") != -1 or type(receipt.get("light")) is not int
                or not isinstance(receipt.get("position"), list) or len(receipt["position"]) != 3
                for receipt in receipts) or receipts[0] != receipts[1]:
@@ -9511,7 +9625,7 @@ def block_display_animation_upload_equivalence(baseline_doc, current_artifact: P
         if not isinstance(frozen, Mapping):
             raise ValueError("missing Frozen uploaded-pixel observation")
         if required_sprite is not None and (not isinstance(required_sprite, str)
-                or not (required_sprite.startswith("minecraft:block/") or required_sprite in ("minecraft:flame", "minecraft:item/feather"))
+                or not (required_sprite.startswith("minecraft:block/") or required_sprite in ("minecraft:flame", "minecraft:vibration", "minecraft:item/feather", "minecraft:entity/shield_base_nopattern"))
                 or frozen.get("spriteName") != required_sprite
                 or current_doc["blockDisplayAnimationAtCapture"].get("spriteName") != required_sprite):
             raise ValueError("upload evidence must identify the required sprite")
@@ -10020,7 +10134,7 @@ def flat_item_layer_expected(index, x, y, alpha_bands=False, removed_layer=False
 def flat_item_pack_image_pair(baseline_path, current_path, variant, tolerance=6.0, gui_scale=3, viewport=(1280,720), animation_frame=None, animation_subframe=None, foil_sources=None, foil_timings=None):
     """Require all nine replacement icons, not merely a low whole-frame mean."""
     from PIL import Image, ImageChops, ImageStat
-    if variant not in ("a", "b", "alpha", "tint-alpha", "geometry", "uv", "orientation", "animation", "animation-interpolated", "layers", "layer-alpha", "layer-replacement", "rotated", "transformed", "transformed-asymmetric", "child-transforms", "foil-blend", "foil-pattern", "foil-moving", "foil-cutout") or not math.isfinite(tolerance) or tolerance < 0:
+    if variant not in ("a", "b", "alpha", "tint-alpha", "geometry", "uv", "orientation", "animation", "animation-interpolated", "layers", "layer-alpha", "layer-replacement", "rotated", "transformed", "transformed-asymmetric", "child-transforms", "foil-blend", "foil-pattern", "foil-nearest", "foil-clamp", "foil-nearest-clamp", "foil-moving", "foil-cutout") or not math.isfinite(tolerance) or tolerance < 0:
         raise ValueError("invalid flat-item witness inputs")
     if variant.startswith("animation") and (type(animation_frame) is not int or animation_frame not in (0,1)):
         raise ValueError("animated item witness requires the captured frame")
@@ -10105,7 +10219,7 @@ def flat_item_pack_image_pair(baseline_path, current_path, variant, tolerance=6.
                 correct=all(all(abs(v-t)<=2 for v,t in zip(pixel,expected)) for pixel in observed)
                 orientation_samples.append({"expected":expected,"observed":observed,"passed":correct})
             visible=all(sample["passed"] for sample in orientation_samples)
-        if variant in ("foil-pattern", "foil-moving"):
+        if variant in ("foil-pattern", "foil-nearest", "foil-clamp", "foil-nearest-clamp", "foil-moving"):
             from capture_runner import FLAT_ITEM_UV_COLORS
             from gui_foil_reference import expected_pixel
             if not isinstance(foil_sources,dict):
@@ -10116,7 +10230,8 @@ def flat_item_pack_image_pair(baseline_path, current_path, variant, tolerance=6.
             if index and source is None:
                 raise ValueError("patterned foil source missing for "+name)
             for (x,y),color in zip(((4,4),(12,4),(4,12),(12,12)),FLAT_ITEM_UV_COLORS):
-                expected=expected_pixel(color,source,x,y,gui_scale) if index else [round(v*252/255) for v in color]
+                expected=expected_pixel(color,source,x,y,gui_scale,
+                    blur="nearest" not in variant, clamp="clamp" in variant) if index else [round(v*252/255) for v in color]
                 observed=[image.getpixel((x*gui_scale-1,y*gui_scale)) for image in (reference,actual)]
                 targets=[expected,expected]
                 if variant == "foil-moving" and index:
@@ -10222,23 +10337,136 @@ def flat_item_animation_changed(previous, current):
 
 
 def gui_item_layer_decode_evidence(log, removed_layer=False):
-    counts=[int(value) for value in re.findall(r"^whole-frame\.gui-item-layers groups=9 layers=(\d+)$",log,re.MULTILINE)]
+    family = "mesh-" if "whole-frame.gui-item-mesh-" in log else ""
+    counts=[int(value) for value in re.findall(r"^whole-frame\.gui-item-"+family+r"layers groups=9 layers=(\d+)$",log,re.MULTILINE)]
     if 17 not in counts: return False
     return not removed_layer or 16 in counts[counts.index(17)+1:]
 
 
 def gui_item_transform_replacement_evidence(log):
+    family = "mesh-" if "whole-frame.gui-item-mesh-" in log else ""
     counts=[int(value) for value in re.findall(
-        r"^whole-frame\.gui-item-transforms layers=17 nonidentity=16 distinct=(\d+)$",log,re.MULTILINE)]
+        r"^whole-frame\.gui-item-"+family+r"transforms layers=17 nonidentity=16 distinct=(\d+)$",log,re.MULTILINE)]
     if not counts or counts[0]!=2 or 3 not in counts: return False
     transition=counts.index(3)
     return all(value==2 for value in counts[:transition]) and all(value==3 for value in counts[transition:])
 
 
-def gui_block_lighting_parity_report(visual_report, fixture):
-    if fixture != "standard-3d-logs":
+def shield_animation_phase_diagnostic(visual_report, fixture, scenario):
+    """Diagnose a verified phase; never substitute one phase for full admission."""
+    from shield_animation_reference import compare_phase_paths
+    rows = []
+    interpolated = scenario == "shield-animation-interpolated"
+    expected = {"fixture": "held-shield-v1", "selectedSlot": 1,
+                "mainHand": "minecraft:shield", "count": 1, "foil": False,
+                "usingItem": False, "speed": 0.0, "strength": 0.5, "complete": True}
+    for pair in visual_report.get("pairs", []):
+        try:
+            if fixture != "shield" or scenario not in ("shield-animation", "shield-animation-interpolated"):
+                raise ValueError("phase diagnostic requires the plain animated shield fixture")
+            docs = []
+            for key in ("baseline_artifact", "current_artifact"):
+                artifact = Path(pair[key])
+                doc = deterministic_capture_document(artifact) or {}
+                meta = latest_capture_meta_path(artifact.parent / "capture")
+                settings = read_key_values(meta) if meta is not None else {}
+                if (doc.get("hotbarItemFixture") != fixture or doc.get("shieldFoilFixture") != expected
+                        or settings.get("forced_option_guiScale") != "3"
+                        or settings.get("gui_resource_pack_scenario") != scenario):
+                    raise ValueError("missing equivalent shield semantics, pack, or GUI scale")
+                docs.append(doc)
+            frozen = docs[0].get("blockDisplayAnimationAtCapture") or {}
+            if type(frozen.get("frame")) is not int or type(frozen.get("subFrame")) is not int:
+                raise ValueError("Frozen animation phase must contain integer observations")
+            phase = {(0, 0): 0, (1, 1): 4, (2, 1): 9}.get((frozen.get("frame"), frozen.get("subFrame")))
+            if phase is None or (phase in (0, 9) and not interpolated):
+                raise ValueError("no Frozen pixel oracle for this animation phase")
+            # Discrete frames retain their upload across subframes. Their exact
+            # uploaded pixels must match; interpolated frames additionally need
+            # the exact retained subframe. Existing strict interpolation checks
+            # are unchanged.
+            upload = block_display_animation_upload_equivalence(
+                docs[0], Path(pair["current_artifact"]),
+                required_sprite="minecraft:entity/shield_base_nopattern",
+                required_mip_levels=1,
+                required_texture=4260828946 if interpolated else None)
+            native = (upload or {}).get("native") or {}
+            if (not upload or not upload.get("passed") or native.get("texture") != 4260828946
+                    or native.get("retained_frame") != frozen.get("frame")
+                    or interpolated and native.get("retained_subframe") != frozen.get("subFrame")):
+                raise ValueError("missing same-phase, presentation-correlated shield upload evidence")
+            if phase == 0 and (type(native.get("retained_tick")) is not int
+                    or native["retained_tick"] < 17 or native["retained_tick"] % 17 != 0):
+                raise ValueError("cycle boundary requires a retained upload after a complete animation cycle")
+            row = compare_phase_paths(pair["baseline_image"], pair["current_image"],
+                                      interpolated=interpolated, phase=phase)
+            row["upload"] = upload
+            rows.append(row)
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            rows.append({"passed": False, "reason": str(error)})
+    return {"passed": bool(rows) and all(row["passed"] for row in rows),
+            "capability_admitted": False, "pairs": rows}
+
+
+def model_item_foil_parity_report(visual_report, fixture, resource_pack_scenario=""):
+    if resource_pack_scenario in ("shield-animation", "shield-animation-interpolated"):
+        return {"requested": True, "passed": False, "pairs": [],
+                "phase_diagnostic": shield_animation_phase_diagnostic(
+                    visual_report, fixture, resource_pack_scenario),
+                "reason": "Timed shield animation uploads and phase-matched Frozen pixel evidence are required; admission pending"}
+    if fixture not in ("model-foil", "shield", "shield-foil", "shield-patterns", "shield-patterns-foil"):
         return {"requested": False, "passed": True, "pairs": []}
-    from gui_block_lighting_reference import compare
+    patterned = fixture in ("shield-patterns", "shield-patterns-foil")
+    if patterned:
+        from shield_item_reference import compare_pattern_paths as compare_paths
+    elif fixture in ("shield", "shield-foil"):
+        from shield_item_reference import compare_paths
+    else:
+        from model_item_foil_reference import compare_paths
+    rows = []
+    shield = fixture in ("shield", "shield-foil")
+    receipt_key = "shieldFoilFixture" if shield else "modelFoilFixture"
+    expected = {"fixture": "held-shield-v1" if shield else "held-trident-foil-v1", "selectedSlot": 1,
+                "mainHand": "minecraft:shield" if shield else "minecraft:trident", "count": 1, "foil": fixture != "shield",
+                "usingItem": False, "speed": 0.0, "strength": 0.5, "complete": True}
+    if patterned:
+        receipt_key = "shieldPatternFixture"
+        expected = {"fixture": "held-shield-patterns-v1", "selectedSlot": 1,
+                    "mainHand": "minecraft:shield", "count": 1, "foil": False, "usingItem": False,
+                    "baseColor": "yellow", "patterns": "minecraft:cross:red,minecraft:border:blue", "complete": True}
+        if fixture == "shield-patterns-foil":
+            expected.update(fixture="held-shield-patterns-foil-v1",foil=True,speed=0.0,strength=0.5)
+    for pair in visual_report.get("pairs", []):
+        try:
+            for key in ("baseline_artifact", "current_artifact"):
+                doc = deterministic_capture_document(Path(pair[key])) or {}
+                if doc.get("hotbarItemFixture") != fixture or doc.get(receipt_key) != expected:
+                    raise ValueError("model foil requires complete observed item semantics")
+                meta = latest_capture_meta_path(Path(pair[key]).parent / "capture")
+                if meta is None or read_key_values(meta).get("forced_option_guiScale") != "3":
+                    raise ValueError("model foil reference requires observed GUI scale3")
+                if resource_pack_scenario in ("shield-alpha", "shield-alpha-zero", "shield-alpha-occlusion"):
+                    if not shield or read_key_values(meta).get("gui_resource_pack_scenario") != resource_pack_scenario:
+                        raise ValueError("shield alpha requires matching observed resource-pack fixture")
+            if resource_pack_scenario == "shield-alpha-occlusion":
+                if fixture != "shield":
+                    raise ValueError("shield alpha occlusion reference requires unenchanted control")
+                from shield_alpha_reference import compare_paths as compare_alpha_paths
+                rows.append(compare_alpha_paths(pair["baseline_image"], pair["current_image"]))
+                continue
+            if resource_pack_scenario in ("shield-alpha", "shield-alpha-zero"):
+                raise ValueError("shield alpha local Frozen reference pending; capability not verified")
+            options = {"foil": fixture == "shield-patterns-foil"} if patterned else {"foil": fixture != "shield"} if shield else {}
+            rows.append(compare_paths(pair["baseline_image"],pair["current_image"], **options))
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            rows.append({"passed": False, "reason": str(error)})
+    return {"requested": True, "passed": bool(rows) and all(row["passed"] for row in rows), "pairs": rows}
+
+
+def gui_block_lighting_parity_report(visual_report, fixture):
+    if fixture not in ("standard-3d-logs", "animated-block"):
+        return {"requested": False, "passed": True, "pairs": []}
+    from gui_block_lighting_reference import compare, compare_animated_block
     from PIL import Image
     rows = []
     for pair in visual_report.get("pairs", []):
@@ -10251,29 +10479,58 @@ def gui_block_lighting_parity_report(visual_report, fixture):
                 scales.append(int(read_key_values(meta).get("forced_option_guiScale", "0")))
             if scales[0] != scales[1] or scales[0] not in (2, 3):
                 raise ValueError("block item lighting requires equivalent GUI scale 2 or 3")
+            animation = None
+            if fixture == "animated-block":
+                expected = {"fixture":"held-magma-v1","selectedSlot":1,
+                            "mainHand":"minecraft:magma_block","count":1,"complete":True}
+                documents = [deterministic_capture_document(Path(pair[key])) or {}
+                             for key in ("baseline_artifact","current_artifact")]
+                if any(doc.get("hotbarItemFixture") != fixture or doc.get("animatedItemFixture") != expected
+                       for doc in documents):
+                    raise ValueError("animated block faces require the observed held magma fixture")
+                animation = block_display_animation_upload_equivalence(documents[0],Path(pair["current_artifact"]),
+                    required_sprite="minecraft:block/magma")
+                if not animation or not animation.get("passed"):
+                    raise ValueError("animated block faces require matching presented animation uploads")
             with Image.open(pair["baseline_image"]) as frozen, Image.open(pair["current_image"]) as current:
-                rows.append(compare(frozen, current, scales[0], include_logs=True))
+                row = (compare_animated_block(frozen,current,scales[0]) if fixture == "animated-block"
+                       else compare(frozen, current, scales[0], include_logs=True))
+                if animation is not None: row["animation"] = animation
+                rows.append(row)
         except (KeyError, OSError, TypeError, ValueError) as error:
             rows.append({"passed": False, "reason": str(error)})
     return {"requested": True, "passed": bool(rows) and all(row["passed"] for row in rows), "pairs": rows}
 
 
-def flat_item_pack_parity_report(visual_report, scenario, tolerance, gui_scale=3, gui_scale_cycle=False, window_resize_cycle=False, resize_capture_stage=3, animation_reference=None, foil_phase=10000, foil_reference=None):
-    if scenario not in ("flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+def flat_item_pack_parity_report(visual_report, scenario, tolerance, gui_scale=3, gui_scale_cycle=False, window_resize_cycle=False, resize_capture_stage=3, animation_reference=None, foil_phase=10000, foil_reference=None, selected_hotbar_slot=1, mixed_item_foil=False, dropped_item_foil_count=0):
+    if scenario not in ("flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
         return {"requested": False, "passed": True, "pairs": []}
     variant = "alpha" if scenario in ("flat-item-alpha", "flat-item-alpha-backed") else "a" if scenario == "flat-item-a" else "b"
     if scenario == "flat-item-tint-alpha": variant = "tint-alpha"
     if scenario == "flat-item-geometry": variant = "geometry"
     if scenario == "flat-item-uv": variant = "uv"
     if scenario == "flat-item-orientation": variant = "orientation"
-    if scenario in ("flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"): variant = scenario.removeprefix("flat-item-")
+    if scenario in ("flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"): variant = scenario.removeprefix("flat-item-")
     if scenario in ("flat-item-animation", "flat-item-animation-interpolated"): variant = scenario.removeprefix("flat-item-")
     if scenario == "flat-item-transform-replacement": variant = "child-transforms"
     if scenario == "flat-item-foil-generated": variant = "foil-blend"
+    if scenario == "flat-item-foil-wide": variant = "foil-pattern"
+    if scenario == "flat-item-foil-nearest-wide": variant = "foil-nearest"
     rows = []
     for pair in visual_report.get("pairs", []):
         try:
             scale_receipts = []
+            if dropped_item_foil_count:
+                receipts = [(deterministic_capture_document(Path(pair[key])) or {}).get("droppedItemFoilFixture")
+                            for key in ("baseline_artifact", "current_artifact")]
+                if (not all(dropped_item_foil_fixture_valid(value) for value in receipts)
+                        or receipts[0] != receipts[1] or receipts[0]["stackCount"] != dropped_item_foil_count):
+                    raise ValueError("dropped foil lacks equivalent observed extraction inputs")
+            if mixed_item_foil:
+                receipts = [(deterministic_capture_document(Path(pair[key])) or {}).get("mixedItemFoilFixture")
+                            for key in ("baseline_artifact", "current_artifact")]
+                if not all(mixed_item_foil_fixture_valid(value) for value in receipts) or receipts[0] != receipts[1]:
+                    raise ValueError("mixed item foil fixture lacks equivalent observed entity state")
             resize_receipts = []
             for key in ("baseline_artifact", "current_artifact"):
                 meta_path = latest_capture_meta_path(Path(pair[key]).parent / "capture")
@@ -10317,13 +10574,14 @@ def flat_item_pack_parity_report(visual_report, scenario, tolerance, gui_scale=3
                 animation_subframe = animation["frozen"]["subFrame"]
             foil_sources = None
             foil_timings = None
-            if variant in ("foil-blend", "foil-pattern", "foil-moving", "foil-cutout"):
+            hand_foil_timings = None
+            if variant in ("foil-blend", "foil-pattern", "foil-nearest", "foil-clamp", "foil-nearest-clamp", "foil-moving", "foil-cutout"):
                 for key in ("baseline_artifact","current_artifact"):
                     receipt=deterministic_capture_document(Path(pair[key])) or {}
                     if (receipt.get("guiItemFoilCount")!=8 or receipt.get("guiItemGlintSpeed")!=(0.5 if variant=="foil-moving" else 0)
-                            or receipt.get("guiItemGlintStrength")!=0.5 or receipt.get("selectedHotbarSlot")!=1):
+                            or receipt.get("guiItemGlintStrength")!=0.5 or receipt.get("selectedHotbarSlot")!=selected_hotbar_slot):
                         raise ValueError("foil blend fixture lacks actual item/strength/clock evidence")
-                if variant in ("foil-pattern", "foil-moving"):
+                if variant in ("foil-pattern", "foil-nearest", "foil-clamp", "foil-nearest-clamp", "foil-moving"):
                     from gui_foil_reference import source_evidence
                     source_pairs=[source_evidence((deterministic_capture_document(Path(pair[key])) or {}).get("guiItemFoilSources"))
                                   for key in ("baseline_artifact","current_artifact")]
@@ -10341,8 +10599,25 @@ def flat_item_pack_parity_report(visual_report, scenario, tolerance, gui_scale=3
                         raise ValueError("moving foil captured phases differ")
                     if any(not 0 <= (tick-foil_phase)%330000 <= 512 for times in foil_timings for tick in times):
                         raise ValueError("moving foil missed requested phase")
+                    if selected_hotbar_slot == 2:
+                        from gui_foil_reference import hand_timing_evidence
+                        hand_foil_timings = [hand_timing_evidence(read_json(Path(str(pair[key])+".foil-timing.json")),foil_phase)
+                                            for key in ("baseline_image","current_image")]
             row = flat_item_pack_image_pair(pair["baseline_image"], pair["current_image"], variant, tolerance, gui_scale, viewport,animation_frame,animation_subframe,foil_sources,foil_timings)
+            if mixed_item_foil:
+                from held_item_foil_reference import compare_mixed_ground_paths
+                row["mixed_ground_foil"] = compare_mixed_ground_paths(pair["baseline_image"], pair["current_image"])
+                row["passed"] &= row["mixed_ground_foil"]["passed"]
+            if dropped_item_foil_count:
+                from dropped_item_foil_reference import compare_paths
+                row["dropped_item_foil"] = compare_paths(pair["baseline_image"], pair["current_image"], dropped_item_foil_count)
+                row["passed"] &= row["dropped_item_foil"]["passed"]
             if foil_timings is not None: row["foil_timing_ticks"]=foil_timings
+            if hand_foil_timings is not None: row["hand_foil_timing_ticks"]=hand_foil_timings
+            if hand_foil_timings is not None:
+                from held_item_foil_reference import compare_moving_paths
+                row["held_item_foil_moving"] = compare_moving_paths(pair["baseline_image"],pair["current_image"])
+                row["passed"] &= row["held_item_foil_moving"]["passed"]
             if animation is not None: row["animation"] = animation
             if gui_scale_cycle: row["world_gui_scale_receipts"] = scale_receipts
             if window_resize_cycle: row["world_window_resize_receipts"] = resize_receipts
@@ -10353,7 +10628,8 @@ def flat_item_pack_parity_report(visual_report, scenario, tolerance, gui_scale=3
                 if not isinstance(prior,Mapping) or prior.get("success") is not True:
                     raise ValueError("temporal foil comparison requires an accepted first phase")
                 previous_visual=prior["cross_repository_visual_parity"]
-                checked=flat_item_pack_parity_report(previous_visual,scenario,tolerance,gui_scale)
+                checked=flat_item_pack_parity_report(previous_visual,scenario,tolerance,gui_scale,
+                                                     selected_hotbar_slot=selected_hotbar_slot)
                 if not checked["passed"] or len(checked["pairs"])!=1 or len(previous_visual["pairs"])!=1:
                     raise ValueError("first foil phase no longer passes pixel/timing validation")
                 for key in ("baseline_artifact","current_artifact"):
@@ -10369,10 +10645,46 @@ def flat_item_pack_parity_report(visual_report, scenario, tolerance, gui_scale=3
                 from gui_foil_reference import temporal_change_evidence
                 row["foil_temporal_change"]=temporal_change_evidence(checked["pairs"][0],row)
                 row["passed"] &= row["foil_temporal_change"]["passed"]
+                if hand_foil_timings is not None:
+                    from held_item_foil_reference import moving_change_evidence
+                    row["hand_foil_temporal_change"] = moving_change_evidence(
+                        checked["pairs"][0]["held_item_foil_moving"],row["held_item_foil_moving"])
+                    row["passed"] &= row["hand_foil_temporal_change"]["passed"]
             if scenario == "flat-item-foil-cutout":
                 from held_item_cutout_reference import compare_paths
                 row["held_item_faces"] = compare_paths(pair["baseline_image"], pair["current_image"])
                 row["passed"] &= row["held_item_faces"]["passed"]
+            if scenario == "flat-item-foil-generated" and selected_hotbar_slot == 2:
+                from held_item_foil_reference import compare_paths
+                row["held_item_foil"] = compare_paths(pair["baseline_image"], pair["current_image"])
+                row["passed"] &= row["held_item_foil"]["passed"]
+            if scenario == "flat-item-foil-pattern" and selected_hotbar_slot == 2:
+                from held_item_foil_reference import compare_pattern_paths
+                row["held_item_foil_pattern"] = compare_pattern_paths(pair["baseline_image"], pair["current_image"])
+                row["passed"] &= row["held_item_foil_pattern"]["passed"]
+            if scenario in ("flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp") and selected_hotbar_slot == 2:
+                # Predetermined paired interior pixels plus authored-face presence.
+                # GUI probes above independently verify the selected sampler.
+                from held_item_foil_reference import compare_moving_paths
+                row["held_item_foil_sampler"] = compare_moving_paths(pair["baseline_image"], pair["current_image"])
+                row["passed"] &= row["held_item_foil_sampler"]["passed"]
+            if scenario == "flat-item-foil-nearest-wide":
+                from gui_foil_reference import sampler_filter_discrimination
+                from held_item_foil_reference import wide_source_evidence, compare_sampler_wide_paths
+                source = foil_sources["minecraft:item/apple"]
+                row["foil_repeat_source"] = wide_source_evidence(source)
+                row["foil_filter_discrimination"] = sampler_filter_discrimination(source, gui_scale)
+                row["passed"] &= row["foil_repeat_source"]["passed"] and row["foil_filter_discrimination"]["passed"]
+                if selected_hotbar_slot == 2:
+                    row["held_item_foil_sampler_wide"] = compare_sampler_wide_paths(pair["baseline_image"], pair["current_image"])
+                    row["passed"] &= row["held_item_foil_sampler_wide"]["passed"]
+            if scenario == "flat-item-foil-wide":
+                from held_item_foil_reference import wide_source_evidence, compare_wide_paths
+                row["foil_repeat_source"] = wide_source_evidence(foil_sources["minecraft:item/apple"])
+                row["passed"] &= row["foil_repeat_source"]["passed"]
+                if selected_hotbar_slot == 2:
+                    row["held_item_foil_wide"] = compare_wide_paths(pair["baseline_image"], pair["current_image"])
+                    row["passed"] &= row["held_item_foil_wide"]["passed"]
             if variant.startswith("animation") and animation_frame == 1:
                 reference=read_json(Path(animation_reference)/MANIFEST_NAME) if animation_reference else None
                 if not isinstance(reference,Mapping) or reference.get("success") is not True:
@@ -10548,7 +10860,10 @@ def particle_animation_transition_report(visual_report, reference_run, tolerance
             continue
         try:
             from PIL import Image
-            reference = read_json(Path(reference_run) / MANIFEST_NAME)
+            reference_path = Path(reference_run)
+            reference = read_json(reference_path if reference_path.is_file() else reference_path / MANIFEST_NAME)
+            if not isinstance(reference, Mapping):
+                raise ValueError("particle reference must be a readable manifest or run directory")
             previous_pairs = reference["cross_repository_visual_parity"]["pairs"]
             if reference.get("success") is not True or len(previous_pairs) != 1:
                 raise ValueError("reference must be one accepted paired run")
@@ -10657,6 +10972,28 @@ def static_particle_replacement_report(visual_report, reference_run, tolerance, 
             and all(v/count <= tolerance for v in error))
     except (ImportError, OSError, ValueError, TypeError, KeyError, ZeroDivisionError) as error:
         result["error"] = str(error)
+    return result
+
+
+def cloud_local_visual_evidence(baseline_cloud, current_cloud, left, right, tolerance):
+    """Keep empty sky from diluting errors in a deterministic cloud fixture."""
+    scenarios = [(cloud or {}).get("scenario") for cloud in (baseline_cloud, current_cloud)]
+    if not any(scenario in {"bounded", "fast"} for scenario in scenarios):
+        return None
+    result = {"schema": "cloud-local-grid-v1", "passed": False, "tiles": []}
+    if scenarios[0] != scenarios[1] or left.size != right.size or min(left.size) < 3:
+        result["reason"] = "incomparable-cloud-fixture"
+        return result
+    from PIL import ImageChops, ImageStat
+    width, height = left.size
+    for row in range(3):
+        for column in range(3):
+            box = (column * width // 3, row * height // 3,
+                   (column + 1) * width // 3, (row + 1) * height // 3)
+            mean = ImageStat.Stat(ImageChops.difference(left.crop(box), right.crop(box))).mean
+            result["tiles"].append({"box": box, "mean_rgb_abs": mean,
+                                    "passed": all(value <= tolerance for value in mean)})
+    result["passed"] = all(tile["passed"] for tile in result["tiles"])
     return result
 
 
@@ -10793,6 +11130,13 @@ def write_cross_repo_visual_pairs(
                 },
             }
         )
+        cloud_inputs = [((read_json(path) or {}).get("metrics") or {}).get("rust_gal_slice", {}).get("world_cloud_metrics")
+                        for path in (baseline_path, current_path)]
+        cloud = cloud_local_visual_evidence(*cloud_inputs, left, right, mean_rgb_abs_tolerance)
+        if cloud is not None:
+            entry["cloud_local_visual"] = cloud
+            if not cloud["passed"]:
+                entry["status"] = "cloud-local-visual-mismatch"
         bottom = mixed_fluid_bottom_surface_evidence(
             deterministic_capture_document(baseline_path) or {},
             deterministic_capture_document(current_path) or {}, left, right, mean_rgb_abs_tolerance)
@@ -10837,6 +11181,11 @@ def write_cross_repo_visual_pairs(
                 block_display_animation_upload_equivalence(lava_docs[0], current_path,
                     required_sprite="minecraft:flame", required_mip_levels=1, required_texture=0x50415254))
             entry["atlas_particle_local"] = local_atlas_particle
+            if static_particle:
+                from opaque_particle_reference import full_quad
+                entry["atlas_particle_full_quad"] = full_quad(left, right, mean_rgb_abs_tolerance)
+                if not entry["atlas_particle_full_quad"]["passed"]:
+                    entry["status"] = "atlas-particle-full-quad-mismatch"
             entry["atlas_particle_static_source" if static_particle else "atlas_particle_animation"] = animation
             if "crop_box" in local_atlas_particle:
                 box = tuple(local_atlas_particle["crop_box"])
@@ -10865,11 +11214,19 @@ def write_cross_repo_visual_pairs(
                 box = tuple(local_particle["crop_box"])
                 left.crop(box).save(pair_root / "frozen_particle_crop.png")
                 right.crop(box).save(pair_root / "current_particle_crop.png")
-            animation = block_display_animation_upload_equivalence(
-                deterministic_capture_document(baseline_path), current_path)
-            entry["terrain_particle_animation"] = animation
-            if animation is None or not animation["passed"]:
-                entry["status"] = "incomparable-animation-upload-state"
+            from cutout_terrain_reference import NAME as cutout_name, GLASS_NAME, source_evidence as cutout_source
+            particle_doc = deterministic_capture_document(current_path)
+            if particle_doc.get("terrainParticleFixture", {}).get("fixture") in (cutout_name, GLASS_NAME):
+                source = cutout_source([deterministic_capture_document(baseline_path), particle_doc])
+                entry["terrain_particle_static_source"] = source
+                if not source["passed"]:
+                    entry["status"] = "incomparable-static-cutout-inputs"
+            else:
+                animation = block_display_animation_upload_equivalence(
+                    deterministic_capture_document(baseline_path), current_path)
+                entry["terrain_particle_animation"] = animation
+                if animation is None or not animation["passed"]:
+                    entry["status"] = "incomparable-animation-upload-state"
         (pair_root / "visual_pair_metrics.json").write_text(
             json.dumps(entry, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -10930,6 +11287,11 @@ def terrain_particle_local_visual_evidence(doc, baseline_image, current_image, t
     """A static single-particle fixture cannot hide inside a full-frame average."""
     if not isinstance(doc, Mapping) or doc.get("terrainParticleFixture") is None:
         return None
+    from cutout_terrain_reference import NAME as cutout_name, GLASS_NAME, local as cutout_local, producer as cutout_producer
+    if doc["terrainParticleFixture"].get("fixture") in (cutout_name, GLASS_NAME):
+        if not cutout_producer(doc):
+            return {"passed": False, "status": "missing-bounded-cutout-producer"}
+        return cutout_local(baseline_image, current_image, tolerance)
     from PIL import ImageChops, ImageStat
     captures = doc.get("captures", [])
     frame = captures[0].get("renderedFrameIndex") if len(captures) == 1 else None
@@ -10957,6 +11319,34 @@ def terrain_particle_local_visual_evidence(doc, baseline_image, current_image, t
     passed = all(value <= tolerance for value in means)
     return {"passed": passed, "status": "complete" if passed else "particle-local-mismatch",
             "crop_box": list(box), "mean_rgb_abs": means, "producer_records": len(records)}
+
+
+def cow_outline_fixture_equivalence(baseline_doc, current_doc):
+    """Reject unmatched opt-in cow poses before interpreting image differences."""
+    receipts = [doc.get("cowOutlineFixture", {}) if isinstance(doc, Mapping) else {}
+                for doc in (baseline_doc, current_doc)]
+    if not any(receipt.get("requested") for receipt in receipts):
+        return {"passed": True, "status": "not-requested"}
+    failures = []
+    for side, receipt in zip(("baseline", "current"), receipts):
+        if any(receipt.get(key) is not True for key in ("requested", "ready", "entityPresent", "glowing")):
+            failures.append(side + "-fixture-not-ready")
+        if type(receipt.get("invisible")) is not bool or receipt.get("invisible") != receipt.get("invisibleRequested"):
+            failures.append(side + "-invisibility-not-observed")
+        observation = receipt.get("modelObservation", {})
+        if (not isinstance(observation, Mapping) or not isinstance(observation.get("pose"), list)
+                or len(observation["pose"]) != 16 or not isinstance(observation.get("parts"), Mapping)
+                or not observation["parts"]):
+            failures.append(side + "-model-observation-missing")
+        elif any(observation.get(key) != 0.0 for key in ("bodyRot", "yRot", "xRot", "walkAnimationSpeed")):
+            failures.append(side + "-model-not-in-fixed-pose")
+    if receipts[0].get("invisibleRequested") != receipts[1].get("invisibleRequested"):
+        failures.append("invisibility-fixture-mismatch")
+    for key in ("x", "y", "z", "modelObservation"):
+        if receipts[0].get(key) != receipts[1].get(key):
+            failures.append(key + "-mismatch")
+    return {"passed": not failures, "status": "passed" if not failures else "incomparable-cow-fixture",
+            "failures": failures}
 
 
 def write_cross_repo_model_crop_pairs(
@@ -10994,6 +11384,9 @@ def write_cross_repo_model_crop_pairs(
             deterministic_capture_document(current_artifact),
         )
         entry["fixture_equivalence"] = fixture
+        cow_fixture = cow_outline_fixture_equivalence(
+            deterministic_capture_document(baseline_artifact), deterministic_capture_document(current_artifact))
+        entry["cow_outline_fixture_equivalence"] = cow_fixture
         current = read_json(current_artifact)
         metrics = current.get("metrics") if isinstance(current, Mapping) else None
         slice_metrics = metrics.get("rust_gal_slice") if isinstance(metrics, Mapping) else None
@@ -11011,7 +11404,7 @@ def write_cross_repo_model_crop_pairs(
                 malformed_crops = True
             else:
                 indexed_crops[capture_index] = candidate
-        if fixture.get("status") != "passed":
+        if fixture.get("status") != "passed" or not cow_fixture["passed"]:
             entry["status"] = "incomparable-fixture-state"
         elif malformed_crops or not expected_indices or set(indexed_crops) != expected_indices:
             entry["status"] = "missing-rust-model-crop"
@@ -11965,9 +12358,9 @@ def latest_capture_meta_path(capture_dir: Path) -> Path | None:
     return metas[-1] if metas else None
 
 
-def live_capture_phase(capture_dir: Path, tool_kind: str) -> tuple[str, str]:
+def live_capture_phase(capture_dir: Path, tool_kind: str, *, prior_metadata=()) -> tuple[str, str]:
     meta_path = latest_capture_meta_path(capture_dir)
-    if meta_path is None:
+    if meta_path is None or meta_path in prior_metadata:
         return "startup", "waiting for capture metadata"
     meta = read_key_values(meta_path)
     if "exit_code" in meta:
@@ -18016,9 +18409,22 @@ def replay_renderdoc_summary(capture_dir: Path, capture_path: Path) -> Path:
 
 
 def validate_fixture_combinations(args: argparse.Namespace) -> None:
+    if getattr(args, "dropped_item_foil_count", 0) and (
+            getattr(args, "mixed_item_foil", False)
+            or getattr(args, "gui_resource_pack_scenario", "") != "flat-item-foil-clamp"
+            or getattr(args, "hotbar_item_fixture", "") != "flat-items"
+            or getattr(args, "selected_hotbar_slot", None) != 2
+            or getattr(args, "flat_item_gui_scale", 3) != 2):
+        raise ValueError("dropped foil requires separate clamped flat-item fixture, slot2, GUI scale2")
+    if getattr(args, "mixed_item_foil", False) and (
+            getattr(args, "gui_resource_pack_scenario", "") != "flat-item-foil-clamp"
+            or getattr(args, "hotbar_item_fixture", "") != "flat-items"
+            or getattr(args, "selected_hotbar_slot", None) != 2
+            or getattr(args, "flat_item_gui_scale", 3) != 2):
+        raise ValueError("mixed item foil requires clamped flat-item fixture, selected slot 2, GUI scale 2")
     foil_phase=getattr(args,"flat_item_foil_phase",10000)
     foil_reference=getattr(args,"flat_item_foil_reference",None)
-    if getattr(args,"gui_resource_pack_scenario","")!="flat-item-foil-moving" and (foil_phase!=10000 or foil_reference is not None):
+    if getattr(args,"gui_resource_pack_scenario","") not in ("flat-item-foil-moving", "special-item-foil-moving") and (foil_phase!=10000 or foil_reference is not None):
         raise ValueError("foil phase/reference requires the moving foil fixture")
     if foil_phase!=10000 and foil_reference is None:
         raise ValueError("second moving foil phase requires an accepted first-phase reference")
@@ -18138,6 +18544,10 @@ def build_capture_command(
     # Title captures do not enable world fixtures or certify gameplay parity,
     # but requested backend validation still applies to their submissions and
     # swapchain lifecycle. Do not silently disable Vulkan API validation here.
+    native_orb_fixture = any(arg.startswith("-Dmattmc.dev.graphicsAuditNativeOrb=")
+                             for arg in (getattr(args, "jvm_arg", []) or []))
+    if native_orb_fixture and getattr(args, "world_experience_orb_scenario", ""):
+        raise ValueError("shared native orb fixture cannot be combined with the old orb scenario")
     requested_static_terrain_scenario = str(getattr(args, "world_static_terrain_scenario", "") or "").strip()
     static_terrain_scenario = requested_static_terrain_scenario
     # A resource-pack terrain row is still a real static-terrain fixture.  Use
@@ -18302,7 +18712,8 @@ def build_capture_command(
             getattr(args, "rust_selected_source_execution", False)
         )
         moving_mesh_capture_requested = bool(
-            getattr(args, "world_mesh_falling_block_scenario", "")
+            native_orb_fixture
+            or getattr(args, "world_mesh_falling_block_scenario", "")
             or getattr(args, "world_mesh_piston_scenario", "")
             or getattr(args, "world_mesh_primed_tnt_scenario", "")
             or getattr(args, "world_mesh_arrow_scenario", "")
@@ -18321,7 +18732,9 @@ def build_capture_command(
             command.append("--deterministic-camera-capture")
         if not title_screen_capture and tool_kind == "capture" and (
             (workload_profile == "settled-static" and not moving_mesh_capture_requested)
-            or static_terrain_capture_requested
+            # Terrain may be the background of a multi-frame entity fixture.
+            # The static launcher flag overrides its poseCount in capture_runner.
+            or (static_terrain_capture_requested and not moving_mesh_capture_requested)
             or (selected_source_capture_requested and not moving_mesh_capture_requested)
         ):
             command.append("--deterministic-static-camera-capture")
@@ -18535,6 +18948,49 @@ def build_capture_command(
     env.setdefault("SCREENSHOT_START_DELAY_SECS", "10")
     java_options = shlex.split(env.get("JAVA_TOOL_OPTIONS", ""))
     java_options.extend(getattr(args, "jvm_arg", []) or [])
+    if getattr(args, "translucent_terrain_particle", None):
+        if getattr(args, "cutout_terrain_particle", None):
+            raise ValueError("choose one terrain particle surface fixture")
+        java_options.extend(["-Dmattmc.dev.graphicsAuditTranslucentTerrainParticle=true",
+            "-Dmattmc.dev.graphicsAuditTranslucentTerrainHidden=" + str(args.translucent_terrain_particle == "hidden").lower(),
+            "-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+            "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
+    if getattr(args, "cutout_terrain_particle", None):
+        java_options.extend(["-Dmattmc.dev.graphicsAuditCutoutTerrainParticle=true",
+            "-Dmattmc.dev.graphicsAuditCutoutTerrainHidden=" + str(args.cutout_terrain_particle == "hidden").lower(),
+            "-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+            "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
+    atlas_size_sign = getattr(args, "atlas_particle_size_sign", 1)
+    if getattr(args, "gui_resource_pack_scenario", "") == "particle-atlas-static-a":
+        java_options.extend(["-Dmattmc.dev.graphicsAuditAtlasParticle=true",
+            "-Dmattmc.dev.graphicsAuditAtlasParticleStatic=true",
+            "-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+            "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
+    if atlas_size_sign != 1:
+        if getattr(args, "gui_resource_pack_scenario", "") != "particle-atlas-static-a":
+            raise ValueError("signed opaque particle witness requires static particle pack A")
+        java_options.append("-Dmattmc.dev.graphicsAuditAtlasParticleSizeSign=" + str(atlas_size_sign))
+    if getattr(args, "shriek_particle", None):
+        java_options.extend(["-Dmattmc.dev.graphicsAuditShriekParticle=true",
+            "-Dmattmc.dev.graphicsAuditShriekDelayed=" + str(args.shriek_particle == "delayed").lower(),
+            "-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+            "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
+    if getattr(args, "vibration_particle", None):
+        # Fixed vanilla fixture: particle atlas animated sprite 1. These are
+        # bounded observations only; the receipt still verifies actual sprite
+        # identity, incarnation, accepted upload and presentation association.
+        env["MATTMC_GRAPHICS_AUDIT"] = "true"
+        env["MATTMC_ATLAS_TRACE_TEXTURE"] = str(0x50415254)
+        env["MATTMC_ATLAS_TRACE_SPRITE"] = "1"
+        if args.vibration_elevation and args.vibration_steps:
+            raise ValueError("elevated vibration fixture requires initial simulation pose")
+        java_options.extend(["-Dmattmc.dev.graphicsAuditVibrationParticle=true",
+            "-Dmattmc.dev.graphicsAuditVibrationHidden=" + str(args.vibration_particle == "hidden").lower(),
+            "-Dmattmc.dev.graphicsAuditVibrationCapturePhase=" + str(args.vibration_phase),
+            "-Dmattmc.dev.graphicsAuditVibrationSteps=" + str(args.vibration_steps),
+            "-Dmattmc.dev.graphicsAuditVibrationElevation=" + str(args.vibration_elevation),
+            "-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+            "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
     if getattr(args, "require_lava_detail", False) or getattr(args, "require_flowing_lava", False):
         java_options.extend(["-Dmattmc.dev.graphicsAuditLavaCycleCapture=true",
                              "-Dmattmc.dev.deterministicCameraCapture.poseCount=1"])
@@ -19318,6 +19774,10 @@ def build_capture_command(
             java_options.append("-Dmattmc.dev.rustGalWorldArrow.disabled=true")
         elif arrow_control == "legacy":
             java_options.append("-Dmattmc.dev.rustGalWorldArrow.legacyControl=true")
+    if getattr(args, "mixed_item_foil", False):
+        java_options.append("-Dmattmc.dev.graphicsAuditMixedItemFoil=true")
+    if getattr(args, "dropped_item_foil_count", 0):
+        java_options.append(f"-Dmattmc.dev.graphicsAuditDroppedItemFoil={args.dropped_item_foil_count}")
     if getattr(args, "world_item_entity_scenario", ""):
         java_options.append(
             f"-Dmattmc.dev.rustGalWorldItemEntity.scenario={args.world_item_entity_scenario}"
@@ -19709,6 +20169,14 @@ def build_capture_command(
             # minimum valid simulation distance.
             env.setdefault("MATTMC_CAPTURE_SIMULATION_DISTANCE", "5")
     positive_control_delay_ms = getattr(args, "positive_control_delay_ms", 0) or 0
+    if getattr(args, "model_camera", "world") == "sky":
+        # Terrain visibility cannot be a readiness requirement in this scene.
+        # The ordinary replicated cow/model/pose readiness gates still apply.
+        java_options.extend([
+            "-Dmattmc.dev.deterministicCameraCapture.settledReadyFamilies=none",
+            "-Dmattmc.dev.staticTerrainParityDiagnostics.waitForStable=false",
+            "-Dmattmc.dev.deterministicCameraCapture.framesPerPose=8",
+        ])
     if positive_control_delay_ms > 0:
         java_options.append(
             f"-Dmattmc.dev.graphicsFrameBenchmark.positiveControlDelayNanos={int(positive_control_delay_ms) * 1_000_000}"
@@ -20108,25 +20576,37 @@ def build_capture_command(
                 "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0",
             ]
         )
-    if tool_kind == "capture" and getattr(args,"gui_resource_pack_scenario","") in ("flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+    if tool_kind == "capture" and getattr(args,"gui_resource_pack_scenario","") in ("flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
         java_options.append("-Dmattmc.dev.graphicsAuditGuiItemFoilBlend=true")
-        if getattr(args,"gui_resource_pack_scenario","") in ("flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+        if getattr(args,"gui_resource_pack_scenario","") in ("flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
             java_options.append("-Dmattmc.dev.guiItemRasterTrace=true")
         if getattr(args,"gui_resource_pack_scenario","") == "flat-item-foil-moving":
             java_options.append(f"-Dmattmc.dev.graphicsAuditGuiItemFoilPhase={getattr(args,'flat_item_foil_phase',10000)}")
+            if getattr(args,"selected_hotbar_slot",None) == 2:
+                java_options.append("-Dmattmc.dev.handItemFoilTiming=true")
+    if tool_kind == "capture" and getattr(args, "gui_resource_pack_scenario", "") in ("special-item-foil-pattern", "special-item-foil-moving"):
+        if getattr(args, "hotbar_item_fixture", "") != "special-foil":
+            raise ValueError("special foil pack requires the special-foil item fixture")
+        java_options.extend(["-Dmattmc.dev.graphicsAuditGuiItemFoilBlend=true",
+                             "-Dmattmc.dev.guiItemRasterTrace=true",
+                             "-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+                             "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
+        if args.gui_resource_pack_scenario == "special-item-foil-moving":
+            java_options.append(f"-Dmattmc.dev.graphicsAuditGuiItemFoilPhase={args.flat_item_foil_phase}")
     if tool_kind == "capture" and getattr(args,"gui_resource_pack_scenario","") in ("flat-item-animation", "flat-item-animation-interpolated"):
         java_options.append("-Dmattmc.dev.graphicsAuditGuiItemAnimation=true")
         java_options.append("-Dmattmc.dev.deterministicCameraCapture.selectedHotbarSlot=1")
-    if tool_kind == "capture" and getattr(args,"gui_resource_pack_scenario","") in ("flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+    if tool_kind == "capture" and getattr(args,"gui_resource_pack_scenario","") in ("flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
         java_options.append(f"-Dmattmc.dev.deterministicCameraCapture.selectedHotbarSlot={getattr(args, 'selected_hotbar_slot', None) or 1}")
         env["MATTMC_TRACE_WHOLE_FRAME"] = "1"
-    if tool_kind == "capture" and getattr(args, "gui_resource_pack_scenario", "") in ("water-face-isolation", "water-bottom-isolation", "particle-atlas-animation", "particle-atlas-static-a", "particle-atlas-static-b", "particle-atlas-static-replacement", "flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
+    if tool_kind == "capture" and getattr(args, "gui_resource_pack_scenario", "") in ("block-marker-a", "block-marker-b", "block-marker-replacement", "block-item-expanded", "block-item-oversized", "block-item-foil", "block-item-foil-moving", "water-face-isolation", "water-bottom-isolation", "water-overlay-isolation", "water-overlay-hidden", "particle-atlas-animation", "particle-atlas-static-a", "particle-atlas-static-b", "particle-atlas-static-replacement", "flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"):
         # This diagnostic isolates one fixed face, not a GUI-pack yaw sweep.
         java_options.extend([
             "-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
             "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0",
         ])
     if (getattr(args, "gui_resource_pack_scenario", "") and tool_kind == "capture"
+            and getattr(args, "gui_resource_pack_scenario", "") not in ("special-item-foil-pattern", "special-item-foil-moving")
             and not getattr(args, "capture_celestial", "")
             and not getattr(args, "capture_post_effect", "")
             and not getattr(args, "require_water_detail", False)
@@ -20134,7 +20614,7 @@ def build_capture_command(
             and not getattr(args, "require_lava_detail", False)
             and not getattr(args, "require_flowing_lava", False)
             and not static_terrain_requires_translucent_camera_sort(static_terrain_scenario)
-            and getattr(args, "gui_resource_pack_scenario", "") not in ("water-face-isolation", "water-bottom-isolation", "particle-atlas-animation", "particle-atlas-static-a", "particle-atlas-static-b", "particle-atlas-static-replacement", "flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout")):
+            and getattr(args, "gui_resource_pack_scenario", "") not in ("block-marker-a", "block-marker-b", "block-marker-replacement", "block-item-expanded", "block-item-oversized", "block-item-foil", "block-item-foil-moving", "water-face-isolation", "water-bottom-isolation", "water-overlay-isolation", "water-overlay-hidden", "particle-atlas-animation", "particle-atlas-static-a", "particle-atlas-static-b", "particle-atlas-static-replacement", "flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout")):
         # Celestial/post-effect/water pack captures retain their explicit
         # single pose; a GUI sweep must not override that shared contract.
         # A GUI-pack row is a pack-selection fixture, not the unscoped static
@@ -20148,6 +20628,20 @@ def build_capture_command(
                 "-Dmattmc.dev.deterministicCameraCapture.yawDelta=35.0",
             ]
         )
+    if tool_kind == "capture" and getattr(args, "gui_resource_pack_scenario", "") in (
+            "shield-alpha", "shield-alpha-zero", "shield-alpha-occlusion", "shield-animation", "shield-animation-interpolated"):
+        # These local shield material witnesses use one fixed camera, including
+        # after a resource reload. Override the generic GUI-pack yaw sweep for
+        # BOTH launchers, not just Current's item-fixture capture shortcut.
+        java_options.extend(["-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+                             "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
+    if (tool_kind == "capture" and getattr(args,"gui_resource_pack_scenario","") == "vanilla"
+            and getattr(args,"hotbar_item_fixture","") in ("standard-3d","standard-3d-logs")):
+        # The unenchanted block reference must use the same static camera as
+        # its foil/oversized variants, not the generic GUI pack-selection sweep.
+        # Keep this after that sweep's defaults for BOTH launchers.
+        java_options.extend(["-Dmattmc.dev.deterministicCameraCapture.poseCount=1",
+                             "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0"])
     if tool_kind == "capture" and getattr(args, "world_weather_scenario", ""):
         # Weather is a live, client-interpolated producer even with a fixed
         # world clock.  The Rust whole-frame attachment handshake installs a
@@ -20172,8 +20666,43 @@ def build_capture_command(
         java_options.append("-Dmattmc.dev.deterministicCameraCapture.windowResizeCycle=true")
         java_options.append("-Dmattmc.dev.deterministicCameraCapture.windowResizeCaptureStage="
                             + str(getattr(args, "world_window_resize_capture_stage", 3)))
+    if tool_kind == "capture" and native_orb_fixture:
+        # Same five held-camera samples in both repositories. Keep this after
+        # canonical terrain defaults, which otherwise reduce the pose count.
+        prefixes = ("-Dmattmc.dev.deterministicCameraCapture.poseCount=",
+                    "-Dmattmc.dev.deterministicCameraCapture.yawDelta=",
+                    "-Dmattmc.dev.deterministicCameraCapture.framesPerPose=",
+                    "-Dmattmc.dev.staticTerrainParityDiagnostics.maxCaptureCoverageEvents=")
+        java_options = [part for part in java_options if not part.startswith(prefixes)]
+        java_options.extend(["-Dmattmc.dev.deterministicCameraCapture.poseCount=5",
+                             "-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0",
+                             "-Dmattmc.dev.deterministicCameraCapture.framesPerPose=8",
+                             # Five poses * two layers * source/execution *
+                             # request/final-output boundaries. The default four
+                             # receipts only covered the first pose of r483.
+                             "-Dmattmc.dev.staticTerrainParityDiagnostics.maxCaptureCoverageEvents=40",
+                             "-Dmattmc.dev.deterministicCameraCapture.rustFinalOutputEveryPose=true"])
+    if tool_kind == "capture" and getattr(args, "world_mesh_model_scenario", "") == "cow":
+        # Five cow captures require two layers, each with source/execution
+        # receipts. Keep headroom for the final-output observation boundary;
+        # the default budget of four silently truncated all later Rust poses.
+        prefix = "-Dmattmc.dev.staticTerrainParityDiagnostics.maxCaptureCoverageEvents="
+        java_options = [part for part in java_options if not part.startswith(prefix)]
+        java_options.append(prefix + "40")
     env["JAVA_TOOL_OPTIONS"] = " ".join(shlex.quote(part) for part in java_options if part).strip()
-    if getattr(args, "gui_resource_pack_scenario", "").startswith("flat-item-"):
+    if tool_kind == "capture" and getattr(args,"gui_resource_pack_scenario","") in ("block-item-foil", "block-item-foil-moving"):
+        if getattr(args,"hotbar_item_fixture","") != "standard-3d-logs" or getattr(args,"gui_item_placement",False):
+            raise ValueError("ordinary block foil requires the standard-3d-logs fixture")
+        env["JAVA_TOOL_OPTIONS"] += " -Dmattmc.dev.graphicsAuditGuiItemFoilBlend=true -Dmattmc.dev.guiItemRasterTrace=true"
+        if args.gui_resource_pack_scenario == "block-item-foil-moving":
+            env["JAVA_TOOL_OPTIONS"] += " -Dmattmc.dev.graphicsAuditGuiItemFoilPhase=10000"
+    if tool_kind == "capture" and getattr(args,"gui_item_placement",False):
+        if getattr(args,"gui_resource_pack_scenario","") != "block-item-oversized" or getattr(args,"hotbar_item_fixture","") != "standard-3d-logs":
+            raise ValueError("GUI item placement requires oversized block item fixture")
+        env["JAVA_TOOL_OPTIONS"] += " -Dmattmc.dev.graphicsAuditGuiItemPlacement=true"
+    if (getattr(args, "gui_resource_pack_scenario", "").startswith(("flat-item-", "block-item-"))
+            or getattr(args,"hotbar_item_fixture","") in ("standard-3d","standard-3d-logs","animated-block")
+            or getattr(args, "gui_resource_pack_scenario", "") in ("special-item-foil-pattern", "special-item-foil-moving")):
         env["MATTMC_CAPTURE_GUI_SCALE"] = str(getattr(args, "flat_item_gui_scale", 3))
     # Both repositories use exactly the same lossless drawable decoder.
     env["MATTMC_CAPTURE_XWD_HELPER"] = str(Path(__file__).with_name("xwd_pixels.py").resolve())
@@ -21000,6 +21529,9 @@ def run_mode(
     started = time.monotonic()
     timeout_seconds = child_process_timeout_seconds(args)
     hard_timeout_seconds = per_mode_timeout_seconds(args)
+    # Retained retries are evidence, not the new process's lifecycle. An old
+    # exit receipt must not start the new launcher's finalization deadline.
+    prior_metadata = frozenset(capture_dir.glob("meta_*.txt"))
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
         try:
             process = subprocess.Popen(
@@ -21193,7 +21725,7 @@ def run_mode(
                                 or f"Subsystem artifact reached {subsystem_status}; parent bounded shutdown after {shutdown_budget}s"
                             )
                             break
-                live_phase, live_detail = live_capture_phase(capture_dir, tool_kind)
+                live_phase, live_detail = live_capture_phase(capture_dir, tool_kind, prior_metadata=prior_metadata)
                 if live_phase == "artifact-finalization":
                     if artifact_finalization_started is None:
                         artifact_finalization_started = now
@@ -21215,6 +21747,8 @@ def run_mode(
                             or f"Capture wrote exit_code={exit_code}; parent bounded artifact finalization after {cleanup_budget}s"
                         )
                         break
+                else:
+                    artifact_finalization_started = None
                 if matrix_progress_enabled(args) and now - last_progress >= MATRIX_PROGRESS_INTERVAL_SECONDS:
                     last_progress = now
                     if live_phase == "readiness" and "readiness-reached" not in emitted_live_events:
@@ -22033,8 +22567,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         subparser.add_argument("--mount-present", action="store_true", help="Force mount-health hearts visible for gameplay/capture controls.")
         subparser.add_argument("--mount-health", type=float, help="Force deterministic current mount health for mount-heart controls.")
         subparser.add_argument("--mount-max-health", type=float, help="Force deterministic max mount health for mount-heart controls.")
-        subparser.add_argument("--flat-item-gui-scale", type=int, choices=(1, 2, 3), default=3,
-                               help="GUI scale for equivalent flat-item pack captures in both repositories.")
+        subparser.add_argument("--flat-item-gui-scale", "--item-gui-scale", dest="flat_item_gui_scale", type=int, choices=(1, 2, 3), default=3,
+                               help="GUI scale for equivalent flat-item and block-item fixture captures in both repositories.")
         subparser.add_argument("--world-gui-scale-cycle", action="store_true",
                                help="Apply and observe a normal 2-3-2 GUI-scale cycle before paired world capture.")
         subparser.add_argument("--world-window-resize-cycle", action="store_true",
@@ -22056,7 +22590,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
         subparser.add_argument(
             "--hotbar-item-fixture",
-            choices=("standard-3d", "standard-3d-logs", "animated-block", "flat-items"),
+            choices=("standard-3d", "standard-3d-logs", "animated-block", "flat-items", "model-foil", "special-foil", "shield", "shield-foil", "shield-patterns", "shield-patterns-foil"),
             default="",
             help="Install the same deterministic hotbar fixture in every route before capture.",
         )
@@ -22385,6 +22919,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             help="Exercise real vanilla cloud-cell extraction through the bounded Rust whole-frame material route.",
         )
         subparser.add_argument(
+            "--cloud-camera", choices=("layer", "overhead"), default="layer",
+            help="Shared cloud fixture camera; overhead observes normal clouds without hiding terrain in either renderer.",
+        )
+        subparser.add_argument(
+            "--model-camera", choices=("world", "sky"), default="world",
+            help="Shared cow camera: sky places the normal no-gravity entity above build height; no renderer suppression.",
+        )
+        subparser.add_argument(
             "--world-weather-control",
             choices=("rust", "disabled", "legacy"),
             default=os.environ.get("MATTMC_WORLD_WEATHER_CONTROL", "rust"),
@@ -22605,7 +23147,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
         subparser.add_argument(
             "--gui-resource-pack-scenario",
-            choices=("vanilla", "pack-a", "pack-b", "priority-a-b", "priority-b-a", "missing", "malformed", "unsupported", "sky-sun-minification", "sky-moon-minification", "sky-moon-replacement", "sky-moon-filtered", "sky-moon-sampler-replacement", "post-invert-quarter", "post-creeper-eight", "post-spider-dim", "post-spider-namespaced", "post-spider-multiline-import", "post-spider-multiline-version", "water-mip-compatible", "water-face-isolation", "water-bottom-isolation", "lava-mip-minification", "particle-atlas-animation", "particle-atlas-static-a", "particle-atlas-static-b", "particle-atlas-static-replacement", "flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"),
+            choices=("shield-animation", "shield-animation-interpolated", "shield-alpha-occlusion", "shield-alpha-zero", "shield-alpha", "experience-orb-occlusion", "experience-orb-a", "experience-orb-b", "experience-orb-replacement", "block-marker-a", "block-marker-b", "block-marker-replacement", "block-item-expanded", "block-item-oversized", "block-item-foil", "block-item-foil-moving", "special-item-foil-moving", "special-item-foil-pattern", "vanilla", "pack-a", "pack-b", "priority-a-b", "priority-b-a", "missing", "malformed", "unsupported", "sky-sun-minification", "sky-moon-minification", "sky-moon-replacement", "sky-moon-filtered", "sky-moon-sampler-replacement", "post-invert-quarter", "post-creeper-eight", "post-spider-dim", "post-spider-namespaced", "post-spider-multiline-import", "post-spider-multiline-version", "water-mip-compatible", "water-face-isolation", "water-bottom-isolation", "water-overlay-isolation", "water-overlay-hidden", "lava-mip-minification", "particle-atlas-animation", "particle-atlas-static-a", "particle-atlas-static-b", "particle-atlas-static-replacement", "flat-item-a", "flat-item-b", "flat-item-alpha", "flat-item-alpha-backed", "flat-item-replacement", "flat-item-tint-alpha", "flat-item-geometry", "flat-item-uv", "flat-item-orientation", "flat-item-animation", "flat-item-animation-interpolated", "flat-item-layers", "flat-item-layer-alpha", "flat-item-layer-replacement", "flat-item-rotated", "flat-item-transformed", "flat-item-transformed-asymmetric", "flat-item-child-transforms", "flat-item-transform-replacement", "flat-item-foil-blend", "flat-item-foil-pattern", "flat-item-foil-nearest", "flat-item-foil-nearest-wide", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp", "flat-item-foil-wide", "flat-item-foil-moving", "flat-item-foil-generated", "flat-item-foil-cutout"),
             default=os.environ.get("MATTMC_GUI_RESOURCE_PACK_SCENARIO", ""),
             help="Generate/select diagnostic GUI resource-pack scenarios in the isolated game dir.",
         )
@@ -22705,10 +23247,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             help="Accepted phase-zero paired run required for changed animated item captures.")
         subparser.add_argument("--flat-item-foil-phase", type=int, choices=(10000,40000), default=10000,
             help="Natural moving-glint phase in scaled ticks; never overrides the renderer clock.")
+        subparser.add_argument("--mixed-item-foil", action="store_true",
+            help="Add an ordinary stationary ground-context item display to the held foil fixture.")
+        subparser.add_argument("--dropped-item-foil-count", type=int, choices=(0,1,64), default=0,
+            help="Add frozen-simulation vanilla dropped diamond/stone stacks; unreferenced counts reject acceptance.")
+        subparser.add_argument("--gui-block-layout-reference", type=Path,
+                              help="Accepted vanilla GUI block capture for enlarged-model comparison.")
+        subparser.add_argument("--gui-item-placement", action="store_true",
+                              help="Shared opt-in transformed/scissored oversized slab fixture.")
         subparser.add_argument("--flat-item-foil-reference", type=Path,
             help="Accepted first moving-glint phase; required for the second-phase temporal comparison.")
         subparser.add_argument("--particle-animation-reference", type=Path,
-                              help="Accepted phase-zero paired run required to validate an interpolated terrain particle.")
+                              help="Accepted phase-zero paired run directory or manifest required to validate an interpolated particle.")
+        subparser.add_argument("--shriek-particle", choices=("delayed", "visible"))
+        subparser.add_argument("--cutout-terrain-particle", choices=("hidden", "visible"))
+        subparser.add_argument("--translucent-terrain-particle", choices=("hidden", "visible"))
+        subparser.add_argument("--translucent-terrain-reference", type=Path,
+                              help="Accepted hidden blue-glass particle run directory or manifest.")
+        subparser.add_argument("--cutout-terrain-reference", type=Path,
+                              help="Accepted hidden oak-leaf particle run directory or manifest.")
+        subparser.add_argument("--atlas-particle-size-sign", type=int, choices=(-1,1), default=1)
+        subparser.add_argument("--vibration-particle", choices=("hidden", "visible"))
+        subparser.add_argument("--vibration-phase", type=int, choices=range(7), default=0)
+        subparser.add_argument("--vibration-steps", type=int, choices=(0,6), default=0)
+        subparser.add_argument("--vibration-elevation", type=int, choices=(0,1), default=0)
+        subparser.add_argument("--vibration-motion-reference", type=Path,
+                              help="Accepted visible zero-step vibration manifest.")
+        subparser.add_argument("--vibration-phase-reference", type=Path,
+                              help="Accepted visible phase-zero manifest, required for nonzero vibration phases.")
+        subparser.add_argument("--vibration-reference", type=Path,
+                              help="Accepted invisible-vibration control manifest.")
+        subparser.add_argument("--shriek-reference", type=Path,
+                              help="Accepted delayed-shriek manifest required for visible two-quad evidence.")
         subparser.add_argument("--particle-static-reference", type=Path,
                               help="Accepted static A pair required by the A-to-B pack reload fixture.")
         subparser.add_argument("--require-night-stars", action="store_true",
@@ -22717,6 +23287,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                               help="Perform a real world resource reload and require both completion receipts.")
         subparser.add_argument("--require-water-detail", action="store_true",
                               help="Require fixed Origin initial-camera water color and high-frequency detail parity.")
+        subparser.add_argument("--water-overlay-reference", type=Path,
+                              help="Accepted hidden-overlay paired manifest for the visible ice-overlay witness.")
         subparser.add_argument("--require-lava-detail", action="store_true",
                               help="Require the observed lava basin, nine local witnesses and exact presented lava_still upload parity.")
         subparser.add_argument("--require-flowing-lava", action="store_true",
@@ -23033,14 +23605,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     world_resource_reload = world_resource_reload_report(cross_repo_parity, args.world_resource_reload,
                                                        args.world_reload_remove_pack)
     gui_block_lighting_parity = gui_block_lighting_parity_report(cross_repo_visual_parity, args.hotbar_item_fixture)
+    from gui_block_layout_reference import report as gui_block_layout_report
+    gui_block_layout_parity = gui_block_layout_report(cross_repo_visual_parity,
+        args.gui_resource_pack_scenario,args.gui_block_layout_reference,args.gui_item_placement)
+    from gui_block_foil_reference import report as gui_block_foil_report
+    gui_block_foil_parity = gui_block_foil_report(cross_repo_visual_parity,args.gui_resource_pack_scenario,
+        args.gui_block_layout_reference)
+    from gui_special_foil_reference import report as gui_special_foil_report
+    gui_special_foil_parity = gui_special_foil_report(cross_repo_visual_parity, args.hotbar_item_fixture,
+        args.flat_item_foil_phase if args.gui_resource_pack_scenario == "special-item-foil-moving" else None,
+        args.flat_item_foil_reference if args.gui_resource_pack_scenario == "special-item-foil-moving" else None)
+    model_item_foil_parity = model_item_foil_parity_report(
+        cross_repo_visual_parity, args.hotbar_item_fixture, args.gui_resource_pack_scenario)
     flat_item_pack_parity = flat_item_pack_parity_report(cross_repo_visual_parity,
         args.gui_resource_pack_scenario, args.visual_mean_rgb_abs_tolerance, args.flat_item_gui_scale,
         args.world_gui_scale_cycle, args.world_window_resize_cycle, args.world_window_resize_capture_stage,
-        args.flat_item_animation_reference, args.flat_item_foil_phase, args.flat_item_foil_reference)
+        args.flat_item_animation_reference, args.flat_item_foil_phase, args.flat_item_foil_reference,
+        selected_hotbar_slot=args.selected_hotbar_slot or 1, mixed_item_foil=args.mixed_item_foil,
+        dropped_item_foil_count=args.dropped_item_foil_count)
     water_detail_parity = water_detail_parity_report(cross_repo_visual_parity, args.require_water_detail or args.require_flowing_water,
                                                    args.world, args.capture_post_effect,
                                                    5 if args.gui_resource_pack_scenario == "water-mip-compatible" else (1 if args.require_flowing_water else 0),
                                                    flowing_water=args.require_flowing_water)
+    from water_overlay_reference import report as water_overlay_report
+    from shriek_reference import report as shriek_report
+    shriek_parity = shriek_report(cross_repo_visual_parity, args.shriek_particle, args.shriek_reference)
+    from vibration_reference import report as vibration_report
+    from opaque_particle_reference import requested_sign
+    from cutout_terrain_reference import report as cutout_report, GLASS_NAME
+    translucent_terrain_parity = cutout_report(cross_repo_visual_parity,
+        args.translucent_terrain_particle, args.translucent_terrain_reference, GLASS_NAME)
+    cutout_terrain_parity = cutout_report(cross_repo_visual_parity,
+        args.cutout_terrain_particle, args.cutout_terrain_reference)
+    opaque_particle_inputs = requested_sign(cross_repo_visual_parity, args.gui_resource_pack_scenario,
+        args.atlas_particle_size_sign)
+    vibration_parity = vibration_report(cross_repo_visual_parity, args.vibration_particle, args.vibration_reference,
+        args.vibration_phase, args.vibration_phase_reference, args.vibration_steps, args.vibration_motion_reference,
+        args.vibration_elevation)
+    water_overlay_parity = water_overlay_report(cross_repo_visual_parity, args.gui_resource_pack_scenario,
+                                                args.water_overlay_reference)
     from lava_parity import required_lava_report
     lava_detail_parity = required_lava_report(cross_repo_visual_parity,
         args.require_lava_detail or args.require_flowing_lava, flowing=args.require_flowing_lava)
@@ -23104,8 +23707,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "world_resource_reload": world_resource_reload,
         "flat_item_pack_parity": flat_item_pack_parity,
         "gui_block_lighting_parity": gui_block_lighting_parity,
+        "gui_block_layout_parity": gui_block_layout_parity,
+        "gui_block_foil_parity": gui_block_foil_parity,
+        "gui_special_foil_parity": gui_special_foil_parity,
+        "model_item_foil_parity": model_item_foil_parity,
         "post_effect_parity": post_effect_parity,
         "water_detail_parity": water_detail_parity,
+        "water_overlay_parity": water_overlay_parity,
+        "shriek_parity": shriek_parity,
+        "vibration_parity": vibration_parity,
+        "opaque_particle_inputs": opaque_particle_inputs,
+        "cutout_terrain_parity": cutout_terrain_parity,
+        "translucent_terrain_parity": translucent_terrain_parity,
         "lava_detail_parity": lava_detail_parity,
         "cross_repository_model_crop_parity": cross_repo_model_crop_parity,
         "cross_repository_shadow_receiver_parity": cross_repo_shadow_receiver_parity,
@@ -23122,8 +23735,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         and world_resource_reload["passed"]
         and flat_item_pack_parity["passed"]
         and gui_block_lighting_parity["passed"]
+        and gui_block_layout_parity["passed"]
+        and gui_block_foil_parity["passed"]
+        and gui_special_foil_parity["passed"]
+        and model_item_foil_parity["passed"]
         and post_effect_parity["passed"]
         and water_detail_parity["passed"]
+        and water_overlay_parity["passed"]
+        and shriek_parity["passed"]
+        and vibration_parity["passed"]
+        and opaque_particle_inputs["passed"]
+        and cutout_terrain_parity["passed"]
+        and translucent_terrain_parity["passed"]
         and lava_detail_parity["passed"]
         and cross_repo_model_crop_parity["passed"]
         and cross_repo_shadow_receiver_parity["passed"]

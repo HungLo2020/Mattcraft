@@ -37,6 +37,20 @@ def scaled_offset(ticks):
     return (-f32(f32(ticks % 110000)/110000), f32(f32(ticks % 30000)/30000))
 
 
+def hand_timing_evidence(receipt, phase):
+    if not isinstance(receipt,dict) or type(phase) is not int or not 0 <= phase < 330000:
+        raise ValueError("invalid hand foil phase receipt")
+    hand = receipt.get("hand")
+    if (not isinstance(hand,dict) or hand.get("enabled") is not True or hand.get("complete") is not True
+            or type(hand.get("frameSequence")) is not int or hand["frameSequence"] <= 0):
+        raise ValueError("missing capture-local hand foil timing")
+    ticks = hand.get("scaledTicks")
+    if (not isinstance(ticks,list) or len(ticks)!=1 or type(ticks[0]) is not int
+            or not 0 <= ticks[0] <= 2**63-1 or (ticks[0]-phase)%330000 > 512):
+        raise ValueError("hand foil phase is absent, ambiguous, or outside requested window")
+    return ticks[0]
+
+
 def timing_evidence(receipt, scale, viewport):
     from graphics_harness import flat_item_witness_layout
     if (not isinstance(receipt,dict) or receipt.get("enabled") is not True
@@ -121,14 +135,22 @@ def standard_uv(uv, clock_millis=0, speed=0.0, scaled_ticks=None):
             f32(f32(f32(s*uv[0]) + f32(c*uv[1])) + dy))
 
 
-def sample_pattern(uv):
-    """Normalized linear filtering with explicit repeat, including negative UV."""
+def sample_pattern(uv, *, blur=True, clamp=False):
+    """Independent normalized sampler for the authored 16x16 foil texture."""
     if len(uv) != 2 or not all(math.isfinite(v) for v in uv):
         raise ValueError("invalid sampling UV")
-    x, y = ((v % 1)*16 - 0.5 for v in uv)
+    if type(blur) is not bool or type(clamp) is not bool:
+        raise ValueError("sampling metadata must contain booleans")
+    def address(index):
+        return min(15, max(0, index)) if clamp else index % 16
+    # Bound coordinates before conversion, including large finite inputs.
+    coords = [min(1.0, max(0.0, v)) if clamp else v % 1 for v in uv]
+    if not blur:
+        return pattern_pixel(*(address(math.floor(v*16)) for v in coords))[:3]
+    x, y = (v*16 - 0.5 for v in coords)
     ix, iy = math.floor(x), math.floor(y)
     fx, fy = x-ix, y-iy
-    pixels = [pattern_pixel(a % 16, b % 16) for a,b in
+    pixels = [pattern_pixel(address(a), address(b)) for a,b in
               ((ix,iy),(ix+1,iy),(ix,iy+1),(ix+1,iy+1))]
     return tuple((pixels[0][c]*(1-fx)+pixels[1][c]*fx)*(1-fy)
                  +(pixels[2][c]*(1-fx)+pixels[3][c]*fx)*fy for c in range(3))
@@ -159,14 +181,30 @@ def source_at_pixel(sample, x, y, scale, clock_millis=0, speed=0.0, scaled_ticks
     raise ValueError("foil probe outside observed source geometry")
 
 
-def expected_pixel(base_rgb, sample, x, y, scale, clock_millis=0, speed=0.0, strength=0.5, scaled_ticks=None):
+def expected_pixel(base_rgb, sample, x, y, scale, clock_millis=0, speed=0.0, strength=0.5, scaled_ticks=None, *, blur=True, clamp=False):
     if (isinstance(strength, bool) or not isinstance(strength, (int,float))
             or not math.isfinite(strength) or not 0 <= strength <= 1):
         raise ValueError("invalid foil strength")
     strength = f32(strength)
     lighted = [round(v*252/255) for v in base_rgb]
-    sampled = sample_pattern(source_at_pixel(sample,x,y,scale,clock_millis,speed,scaled_ticks))
+    sampled = sample_pattern(source_at_pixel(sample,x,y,scale,clock_millis,speed,scaled_ticks), blur=blur, clamp=clamp)
     return [min(255, round(base+(channel*strength)**2/255)) for base,channel in zip(lighted,sampled)]
+
+
+def sampler_filter_discrimination(source, scale):
+    """Require predetermined GUI probes to separate the two filter oracles.
+
+    A difference greater than twice the unchanged pixel tolerance (2) means
+    the same observed pixel cannot pass both filters' expected colors.
+    """
+    from capture_runner import FLAT_ITEM_UV_COLORS
+    rows=[]
+    for (x,y),color in zip(((4,4),(12,4),(4,12),(12,12)), FLAT_ITEM_UV_COLORS):
+        nearest=expected_pixel(color,source,x,y,scale,blur=False)
+        linear=expected_pixel(color,source,x,y,scale,blur=True)
+        difference=max(abs(a-b) for a,b in zip(nearest,linear))
+        rows.append(dict(position=[x,y],nearest=nearest,linear=linear,max_difference=difference))
+    return dict(passed=any(row["max_difference"]>4 for row in rows),probes=rows)
 
 
 def source_evidence(receipt):

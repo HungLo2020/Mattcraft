@@ -68,7 +68,9 @@ pub const FFI_ABI_V40_VERSION: u32 = 40;
 pub const FFI_ABI_V41_VERSION: u32 = 41;
 /// v42 appends standard world/held item foil semantics to mesh instances.
 pub const FFI_ABI_V42_VERSION: u32 = 42;
-pub const FFI_ABI_VERSION: u32 = 42;
+/// v53 adds immutable orb appearance assets, lowered to geometry only in Rust.
+/// v54 adds semantic orb placement to the ordered entity mesh stream.
+pub const FFI_ABI_VERSION: u32 = 54;
 pub const FFI_INITIAL_PRESENTATION_SUPPORTED: bool = false;
 pub const FFI_ABI_NAME: &str = "MattMC VulkanicGAL Java-Rust batch ABI";
 pub const FFI_MAX_LABEL_BYTES: usize = 1024;
@@ -585,6 +587,8 @@ pub struct FfiGuiMeshVertex {
     pub local_uv: [f32; 2],
     pub color_argb: u32,
     pub normal_packed: u32,
+    pub source_face: u32,
+    pub source_foil_type: u32,
 }
 
 /// One coarse material-homogeneous GUI item mesh layer. Geometry payloads are
@@ -625,6 +629,14 @@ pub struct FfiGuiMeshBatchRequest {
     pub item_foil_speed: f64,
     pub item_foil_strength: f32,
     pub item_raster_scale: u32,
+    pub decal_foil_mode: u32,
+    pub decal_model_pose: [f32; 16],
+    pub decal_normal_pose: [f32; 9],
+    pub block_item_scale: u32,
+    pub block_model_bounds: [f64; 6],
+    pub block_item_layout: u32,
+    pub item_cache_identity: u64,
+    pub item_cache_mode: u32,
 }
 
 #[repr(C)]
@@ -693,6 +705,8 @@ pub struct FfiGuiRawImageAssetPayload {
     pub width: i32,
     pub height: i32,
     pub pixels: FfiBytes,
+    pub sampling_filter: u32,
+    pub sampling_address: u32,
 }
 
 #[repr(C)]
@@ -1173,6 +1187,22 @@ pub struct FfiWorldMeshAssetUpdateRequest {
     pub sorted_indices: FfiSlice<FfiWorldMeshSortedIndexRecord>,
     pub negotiated_feature_bits: u64,
     pub retirements: FfiSlice<FfiWorldMeshAssetRetirementRecord>,
+    pub experience_orbs: FfiSlice<FfiWorldExperienceOrbAssetRecord>,
+}
+
+/// Immutable gameplay appearance and CPU resource identity, not GPU handles
+/// or caller-selected vertices, UVs, materials, or raster state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FfiWorldExperienceOrbAssetRecord {
+    pub byte_size: u32,
+    pub icon: u32,
+    pub mesh_key: u64,
+    pub mesh_generation: u64,
+    pub red: u32,
+    pub blue: u32,
+    pub packed_light: u32,
+    pub reserved0: u32,
 }
 
 /// Coarse, backend-neutral Distant Horizons LOD vertex semantics. This is a
@@ -1691,6 +1721,42 @@ pub struct FfiWholeFrameSubmitRequest {
     pub engine_partial_tick: f32,
     pub engine_glint_alpha: f32,
     pub engine_menu_blur_radius: i32,
+    /// ABI v50: ordinary particle semantics; no Java-expanded vertices.
+    pub world_particle_quads: FfiSlice<FfiWorldParticleQuadRequest>,
+    pub world_experience_orbs: FfiSlice<FfiWorldExperienceOrbInstanceRecord>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FfiWorldExperienceOrbInstanceRecord {
+    pub byte_size: u32,
+    /// Insert before this ordinal in the non-orb mesh instance stream.
+    pub mesh_index: u32,
+    pub mesh_key: u64,
+    pub mesh_generation: u64,
+    pub entity_transform: [f32; 16],
+    pub camera_orientation: [f32; 4],
+    pub entity_id: i32,
+    pub reserved0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FfiWorldParticleQuadRequest {
+    pub byte_size: u32,
+    pub texture_id: u32,
+    /// ABI 51: 0 ordinary opaque, 1 ordinary translucent, 2 terrain opaque,
+    /// 3 terrain cutout. Backend policy is chosen in Rust, not transported.
+    pub surface_kind: u32,
+    /// Insert before this index in the decoded non-particle material stream.
+    /// Nondecreasing values retain input order, including coincident particles.
+    pub material_index: u32,
+    pub center: [f32; 3],
+    pub rotation: [f32; 4],
+    pub size: f32,
+    pub uv_bounds: [f32; 4],
+    pub color_argb: u32,
+    pub packed_light: u32,
 }
 
 #[repr(C)]

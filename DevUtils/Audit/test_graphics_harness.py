@@ -1644,6 +1644,68 @@ class GraphicsAuditHarnessTests(unittest.TestCase):
 
         baseline = manifest()
         current = manifest()
+        receipt = {"fixture": "held-trident-foil-v1", "selectedSlot": 1,
+                   "mainHand": "minecraft:trident", "count": 1, "foil": True,
+                   "usingItem": False, "speed": 0.0, "strength": 0.5, "complete": True}
+        for doc in (baseline, current):
+            doc["hotbarItemFixture"] = "model-foil"
+            doc["modelFoilFixture"] = dict(receipt)
+        self.assertEqual("passed", harness.deterministic_visual_fixture_equivalence(baseline, current)["status"])
+        for invalid in (None, {}, {**receipt, "foil": False}, {**receipt, "speed": 0.5},
+                        {**receipt, "mainHand": "minecraft:stone"}, {**receipt, "usingItem": True},
+                        {**receipt, "strength": 1.0}, {**receipt, "complete": False}):
+            current["modelFoilFixture"] = invalid
+            self.assertIn("model-foil-fixture-state",
+                          harness.deterministic_visual_fixture_equivalence(baseline, current)["mismatches"])
+        current["modelFoilFixture"] = dict(receipt)
+        del baseline["hotbarItemFixture"]
+        self.assertEqual("failed", harness.deterministic_visual_fixture_equivalence(baseline, current)["status"])
+
+        for scenario, foil in (("shield", False), ("shield-foil", True)):
+            baseline, current = manifest(), manifest()
+            receipt = {"fixture": "held-shield-v1", "selectedSlot": 1,
+                       "mainHand": "minecraft:shield", "count": 1, "foil": foil,
+                       "usingItem": False, "speed": 0.0, "strength": 0.5, "complete": True}
+            for doc in (baseline, current):
+                doc["hotbarItemFixture"] = scenario
+                doc["shieldFoilFixture"] = dict(receipt)
+            self.assertEqual("passed", harness.deterministic_visual_fixture_equivalence(baseline, current)["status"])
+            for invalid in (None, {}, {**receipt, "foil": not foil},
+                            {**receipt, "mainHand": "minecraft:trident"}, {**receipt, "complete": False},
+                            {**receipt, "speed": 0.5}, {**receipt, "count": 0}):
+                current["shieldFoilFixture"] = invalid
+                self.assertIn("shield-foil-fixture-state",
+                              harness.deterministic_visual_fixture_equivalence(baseline, current)["mismatches"])
+            current["shieldFoilFixture"] = dict(receipt)
+            del baseline["hotbarItemFixture"]
+            self.assertEqual("failed", harness.deterministic_visual_fixture_equivalence(baseline, current)["status"])
+
+        baseline = manifest()
+        current = manifest()
+        pattern_receipt = {"fixture": "held-shield-patterns-v1", "selectedSlot": 1,
+            "mainHand": "minecraft:shield", "count": 1, "foil": False, "usingItem": False,
+            "baseColor": "yellow", "patterns": "minecraft:cross:red,minecraft:border:blue", "complete": True}
+        for doc in (baseline, current):
+            doc["hotbarItemFixture"] = "shield-patterns"
+            doc["shieldPatternFixture"] = dict(pattern_receipt)
+        self.assertEqual("passed",harness.deterministic_visual_fixture_equivalence(baseline,current)["status"])
+        for invalid in (None, {}, {**pattern_receipt,"baseColor":"red"},
+                        {**pattern_receipt,"patterns":"minecraft:border:blue,minecraft:cross:red"},
+                        {**pattern_receipt,"foil":True}, {**pattern_receipt,"complete":False}):
+            current["shieldPatternFixture"] = invalid
+            self.assertIn("shield-pattern-fixture-state",harness.deterministic_visual_fixture_equivalence(baseline,current)["mismatches"])
+        self.assertFalse(harness.model_item_foil_parity_report({},"shield-patterns")["passed"])
+        foil_receipt={**pattern_receipt,"fixture":"held-shield-patterns-foil-v1","foil":True,"speed":0.0,"strength":0.5}
+        for doc in (baseline,current):
+            doc["hotbarItemFixture"]="shield-patterns-foil"
+            doc["shieldPatternFixture"]=dict(foil_receipt)
+        self.assertEqual("passed",harness.deterministic_visual_fixture_equivalence(baseline,current)["status"])
+        for invalid in (pattern_receipt,{**foil_receipt,"speed":0.5},{**foil_receipt,"strength":1.0},
+                        {**foil_receipt,"foil":False},{**foil_receipt,"complete":False}):
+            current["shieldPatternFixture"]=invalid
+            self.assertIn("shield-pattern-fixture-state",harness.deterministic_visual_fixture_equivalence(baseline,current)["mismatches"])
+        self.assertFalse(harness.model_item_foil_parity_report({},"shield-patterns-foil")["passed"])
+        baseline, current = manifest(), manifest()
         receipt = {"fixture": "magma-display-v1", "block": "minecraft:magma_block",
                    "position": [1, 2, 3], "complete": True}
         for doc in (baseline, current):
@@ -1767,6 +1829,11 @@ class GraphicsAuditHarnessTests(unittest.TestCase):
             with mock.patch.object(harness, "deterministic_capture_document", return_value={}), \
                  mock.patch.object(harness, "deterministic_visual_fixture_equivalence", return_value={"status": "passed"}):
                 self.assertTrue(harness.particle_animation_transition_report(visual, root, 6)["passed"])
+                self.assertEqual(harness.particle_animation_transition_report(visual, root, 6),
+                    harness.particle_animation_transition_report(visual, root / harness.MANIFEST_NAME, 6))
+                missing = harness.particle_animation_transition_report(visual, root / "missing.json", 6)
+                self.assertFalse(missing["passed"])
+                self.assertIn("readable manifest", missing["pairs"][0]["error"])
                 self.assertFalse(harness.particle_animation_transition_report(visual, None, 6)["passed"])
                 Image.new("RGB", (2, 2), (100, 20, 30)).save(root / "after/current_atlas_particle_crop.png")
                 self.assertFalse(harness.particle_animation_transition_report(visual, root, 6)["passed"])
@@ -8604,6 +8671,67 @@ else:
                 self.assertEqual(camera["pitch"], 0.0)
                 self.assertEqual(camera["pose_sequence"], "cloud-layer-static-v1")
 
+    def test_overhead_cloud_camera_is_identical_in_both_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            current, frozen = fake_repo(root, "current"), fake_repo(root, "frozen")
+            args = harness.parse_args(["capture", "--repo-root", str(current.root),
+                "--world", "Origin", "--world-cloud-scenario", "bounded",
+                "--cloud-camera", "overhead", "--dry-run"])
+            args._canonical_fixture_run_source = str(root / "canonical" / "run")
+            cameras = []
+            for target, name in [(current, "current-rust-vulkan-shaders-off"),
+                                 (frozen, "frozen-opengl-shaders-off")]:
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                _, env = harness.build_capture_command(target, mode, root / name, "correctness", args, "capture")
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                cameras.append([option for option in options if any(key in option for key in
+                    (".fixedX=", ".fixedY=", ".fixedZ=", ".fixedYaw=", ".fixedPitch=", ".cameraPathId="))])
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.fixedY=160.0", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.fixedPitch=-90.0", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.cameraPathId=cloud-overhead-static-v1", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.poseCount=1", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0", options)
+            self.assertEqual(cameras[0], cameras[1])
+            self.assertEqual(len(cameras[0]), 6)
+
+    def test_sky_cow_camera_and_readiness_are_shared_without_terrain_suppression(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            current, frozen = fake_repo(root, "current"), fake_repo(root, "frozen")
+            args = harness.parse_args(["capture", "--repo-root", str(current.root),
+                "--world", "Origin", "--world-mesh-model-scenario", "cow",
+                "--model-camera", "sky", "--dry-run"])
+            args._canonical_fixture_run_source = str(root / "canonical" / "run")
+            cameras = []
+            for target, name in [(current, "current-rust-vulkan-shaders-off"),
+                                 (frozen, "frozen-opengl-shaders-off")]:
+                mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                _, env = harness.build_capture_command(target, mode, root / name, "correctness", args, "capture")
+                options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                cameras.append([option for option in options if any(key in option for key in
+                    (".fixedX=", ".fixedY=", ".fixedZ=", ".fixedYaw=", ".fixedPitch=", ".cameraPathId="))])
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.fixedY=512.0", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.fixedPitch=0.0", options)
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.cameraPathId=cow-sky-static-v1", options)
+                families = [opt for opt in options if ".settledReadyFamilies=" in opt]
+                self.assertTrue(families[-1].endswith("=none"))
+                terrain_wait = [opt for opt in options if "staticTerrainParityDiagnostics.waitForStable=" in opt]
+                self.assertTrue(terrain_wait[-1].endswith("=false"))
+                self.assertIn("-Dmattmc.dev.deterministicCameraCapture.framesPerPose=8", options)
+                self.assertFalse(any("rustGalStaticTerrain.scenario=" in opt for opt in options))
+            self.assertEqual(cameras[0], cameras[1])
+            self.assertEqual(len(cameras[0]), 6)
+
+    def test_sky_cow_camera_rejects_incompatible_fixture_requirements(self) -> None:
+        for extra in ({"world_mesh_model_scenario": "pig"},
+                      {"world_static_terrain_scenario": "real-world"},
+                      {"gui_resource_pack_scenario": "water-bottom-isolation"},
+                      {"world_cloud_scenario": "bounded"}):
+            values = {"model_camera": "sky", "world_mesh_model_scenario": "cow", **extra}
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                harness.canonical_camera_options(Namespace(**values))
+
     def test_ordinary_canonical_capture_explicitly_uses_its_static_camera_schedule(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -10040,6 +10168,78 @@ else:
                 shlex.split(options),
             )
 
+    def test_real_world_orb_capture_preserves_multi_frame_sequence(self) -> None:
+        # Real-world terrain is the background, not permission to collapse a
+        # moving entity's five-frame contract to a single screenshot.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                with self.subTest(mode=name):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                    target = fake_repo(root, "current" if name.startswith("current") else "frozen")
+                    args = harness.parse_args([
+                        "capture", "--profile", "extended", "--mode", name,
+                        "--world", "Origin", "--world-static-terrain-scenario", "real-world",
+                        "--world-experience-orb-scenario", "ordinary",
+                        "--rust-full-gameplay-attachments",
+                    ])
+                    command, env = harness.build_capture_command(
+                        target, mode, root / name, "correctness", args, "capture"
+                    )
+                    options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                    self.assertIn("--deterministic-camera-capture", command)
+                    self.assertNotIn("--deterministic-static-camera-capture", command)
+                    counts = [part for part in options if part.startswith(
+                        "-Dmattmc.dev.deterministicCameraCapture.poseCount=")]
+                    self.assertTrue(counts)
+                    self.assertEqual("-Dmattmc.dev.deterministicCameraCapture.poseCount=5", counts[-1])
+
+    def test_cow_fixture_preserves_exact_terrain_receipts_for_all_five_poses(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                with self.subTest(mode=name):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                    target = fake_repo(root, "current" if name.startswith("current") else "frozen")
+                    args = harness.parse_args([
+                        "capture", "--profile", "extended", "--mode", name,
+                        "--world", "Origin", "--world-static-terrain-scenario", "real-world",
+                        "--world-mesh-model-scenario", "cow",
+                    ])
+                    _, env = harness.build_capture_command(target, mode, root / name, "correctness", args, "capture")
+                    prefix = "-Dmattmc.dev.staticTerrainParityDiagnostics.maxCaptureCoverageEvents="
+                    limits = [part for part in shlex.split(env["JAVA_TOOL_OPTIONS"]) if part.startswith(prefix)]
+                    self.assertEqual([prefix + "40"], limits)
+
+    def test_shared_native_orb_fixture_uses_equivalent_five_pose_launches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                with self.subTest(mode=name):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                    target = fake_repo(root, "current" if name.startswith("current") else "frozen")
+                    args = harness.parse_args([
+                        "capture", "--profile", "extended", "--mode", name,
+                        "--world", "Origin", "--world-static-terrain-scenario", "real-world",
+                        "--rust-full-gameplay-attachments",
+                        "--jvm-arg=-Dmattmc.dev.graphicsAuditNativeOrb=1",
+                    ])
+                    command, env = harness.build_capture_command(
+                        target, mode, root / name, "correctness", args, "capture"
+                    )
+                    options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                    self.assertIn("--deterministic-camera-capture", command)
+                    self.assertNotIn("--deterministic-static-camera-capture", command)
+                    for key, expected in (("poseCount", "5"), ("yawDelta", "0.0"), ("framesPerPose", "8")):
+                        prefix = "-Dmattmc.dev.deterministicCameraCapture." + key + "="
+                        self.assertEqual([prefix + expected], [p for p in options if p.startswith(prefix)])
+                    self.assertIn("-Dmattmc.dev.deterministicCameraCapture.rustFinalOutputEveryPose=true", options)
+                    receipt_prefix = "-Dmattmc.dev.staticTerrainParityDiagnostics.maxCaptureCoverageEvents="
+                    self.assertEqual([receipt_prefix + "40"], [p for p in options if p.startswith(receipt_prefix)])
+                    args.world_experience_orb_scenario = "ordinary"
+                    with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                        harness.build_capture_command(target, mode, root / name, "correctness", args, "capture")
+
     def test_selected_source_stage_diagnostic_keeps_the_real_falling_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -10210,6 +10410,41 @@ else:
             self.assertIn("-Dmattmc.dev.deterministicCameraCapture.poseCount=1", java_options)
             self.assertIn("-Dmattmc.dev.deterministicCameraCapture.yawDelta=0.0", java_options)
             self.assertNotIn("MATTMC_RUST_WHOLE_FRAME_ATTACHMENT_DIR", env)
+
+    def test_marker_packs_preserve_one_pose_in_both_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for scenario in ("block-marker-a", "block-marker-b", "block-marker-replacement"):
+                args = harness.parse_args(["capture", "--profile", "extended",
+                    "--world-static-terrain-scenario", "real-world",
+                    "--gui-resource-pack-scenario", scenario])
+                for mode_name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == mode_name)
+                    target = fake_repo(root, mode.target)
+                    _command, env = harness.build_capture_command(
+                        target, mode, root / (scenario + mode_name), "correctness", args, "capture")
+                    options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                    poses = [v for v in options if v.startswith("-Dmattmc.dev.deterministicCameraCapture.poseCount=")]
+                    self.assertTrue(poses)
+                    self.assertEqual("-Dmattmc.dev.deterministicCameraCapture.poseCount=1", poses[-1])
+                    self.assertNotIn("-Dmattmc.dev.deterministicCameraCapture.poseCount=4", options)
+
+    def test_orb_packs_preserve_shared_five_pose_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for scenario in ("experience-orb-a", "experience-orb-b", "experience-orb-replacement", "experience-orb-occlusion"):
+                args = harness.parse_args(["capture", "--profile", "extended",
+                    "--world-static-terrain-scenario", "real-world",
+                    "--gui-resource-pack-scenario", scenario,
+                    "--jvm-arg=-Dmattmc.dev.graphicsAuditNativeOrb=10"])
+                for mode_name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == mode_name)
+                    _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                        root / (scenario + mode_name), "correctness", args, "capture")
+                    options = shlex.split(env["JAVA_TOOL_OPTIONS"])
+                    for key, expected in (("poseCount", "5"), ("yawDelta", "0.0"), ("framesPerPose", "8")):
+                        prefix = "-Dmattmc.dev.deterministicCameraCapture." + key + "="
+                        self.assertEqual([prefix + expected], [v for v in options if v.startswith(prefix)])
 
     def test_background_capture_uses_one_static_pose_for_both_current_and_frozen(self) -> None:
         """Static sky probes must not create an asymmetric camera schedule."""
@@ -15230,6 +15465,21 @@ class FlatItemFixtureTests(unittest.TestCase):
         for log in (trace(171,16),trace(16,17),trace(17),trace(16),"prefix "+trace(17,16)):
             self.assertFalse(harness.gui_item_layer_decode_evidence(log,True))
 
+    def test_native_mesh_layer_evidence_keeps_exact_counts_and_cannot_use_legacy_fallback(self):
+        good = "whole-frame.gui-item-mesh-layers groups=9 layers=17"
+        removed = "whole-frame.gui-item-mesh-layers groups=9 layers=16"
+        self.assertTrue(harness.gui_item_layer_decode_evidence(good))
+        self.assertTrue(harness.gui_item_layer_decode_evidence(good+"\n"+removed,True))
+        legacy = "whole-frame.gui-item-layers groups=9 layers=17\nwhole-frame.gui-item-layers groups=9 layers=16"
+        for bad in (good.replace("groups=9","groups=8"),good.replace("layers=17","layers=171"),
+                    removed,"prefix "+good,removed+"\n"+good):
+            self.assertFalse(harness.gui_item_layer_decode_evidence(bad+"\n"+legacy,True))
+        old = "whole-frame.gui-item-mesh-transforms layers=17 nonidentity=16 distinct=2"
+        new = old.replace("distinct=2","distinct=3")
+        self.assertTrue(harness.gui_item_transform_replacement_evidence(old+"\n"+new))
+        for bad in (new+"\n"+old,old,new,old+"\n"+new.replace("nonidentity=16","nonidentity=15")):
+            self.assertFalse(harness.gui_item_transform_replacement_evidence(bad))
+
     def test_layer_replacement_pixels_reject_stale_child_even_when_images_agree(self):
         from PIL import Image
         boxes,_=harness.flat_item_witness_layout(2)
@@ -15873,6 +16123,24 @@ class FlatItemFixtureTests(unittest.TestCase):
                 self.assertFalse(report["passed"])
                 self.assertFalse(report["items"][0]["alpha_steps"][1]["passed"])
 
+    def test_shield_alpha_pack_reload_has_identical_camera_schedule_in_both_launchers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for scenario in ("shield-alpha", "shield-alpha-zero", "shield-alpha-occlusion"):
+                for name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                    mode = next(mode for mode in harness.MATRIX_MODES if mode.name == name)
+                    args = harness.parse_args(["capture", "--profile", "extended", "--mode", name,
+                        "--world", "Origin", "--world-static-terrain-scenario", "real-world",
+                        "--gui-resource-pack-scenario", scenario, "--world-resource-reload",
+                        "--hotbar-item-fixture", "shield", "--selected-hotbar-slot", "1"])
+                    args._canonical_fixture_run_source = root / "fixture"
+                    _, env = harness.build_capture_command(fake_repo(root, mode.target), mode,
+                        root / "capture", "settled-static", args, "capture")
+                    self.assertEqual("1", harness.java_option_property(shlex.split(env["JAVA_TOOL_OPTIONS"]),
+                        "mattmc.dev.deterministicCameraCapture.poseCount"))
+                    self.assertEqual("0.0", harness.java_option_property(shlex.split(env["JAVA_TOOL_OPTIONS"]),
+                        "mattmc.dev.deterministicCameraCapture.yawDelta"))
+
     def test_flat_item_scale_is_identical_in_both_launchers(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -16008,6 +16276,201 @@ class FlatItemFixtureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 harness.validate_fixture_combinations(harness.parse_args(argv))
 
+    def test_foil_receipts_require_requested_slot_on_both_clients(self):
+        pair = {"baseline_artifact": "/baseline/result.json", "current_artifact": "/current/result.json",
+                "baseline_image": "baseline.png", "current_image": "current.png",
+                "fixture_equivalence": {"status": "passed"}}
+        for requested in (1, 2):
+            for slots in ((1,1), (1,2), (2,1), (2,2), (None,2)):
+                documents = [{"selectedHotbarSlot": slot, "guiItemFoilCount": 8,
+                              "guiItemGlintSpeed": 0, "guiItemGlintStrength": 0.5} for slot in slots]
+                with mock.patch.object(harness, "latest_capture_meta_path", return_value=Path("meta.txt")), \
+                     mock.patch.object(harness, "read_key_values", return_value={"forced_option_guiScale": "2"}), \
+                     mock.patch.object(harness, "deterministic_capture_document", side_effect=documents), \
+                     mock.patch.object(harness, "flat_item_pack_image_pair", return_value={"passed": True}) as compare:
+                    result = harness.flat_item_pack_parity_report({"pairs": [pair]}, "flat-item-foil-blend", 6, 2,
+                                                                 selected_hotbar_slot=requested)
+                    expected = slots == (requested, requested)
+                    self.assertEqual(expected, result["passed"])
+                    self.assertEqual(expected, compare.called)
+
+    def test_generated_held_foil_requires_strict_pixel_gate(self):
+        pair = {"baseline_artifact": "/baseline/result.json", "current_artifact": "/current/result.json",
+                "baseline_image": "baseline.png", "current_image": "current.png",
+                "fixture_equivalence": {"status": "passed"}}
+        doc = {"selectedHotbarSlot": 2, "guiItemFoilCount": 8,
+               "guiItemGlintSpeed": 0, "guiItemGlintStrength": 0.5}
+        for passed in (False, True):
+            with mock.patch.object(harness, "latest_capture_meta_path", return_value=Path("meta.txt")), \
+                 mock.patch.object(harness, "read_key_values", return_value={"forced_option_guiScale": "2"}), \
+                 mock.patch.object(harness, "deterministic_capture_document", return_value=doc), \
+                 mock.patch.object(harness, "flat_item_pack_image_pair", return_value={"passed": True}), \
+                 mock.patch("held_item_foil_reference.compare_paths", return_value={"passed": passed}) as compare:
+                result = harness.flat_item_pack_parity_report({"pairs": [pair]}, "flat-item-foil-generated", 6, 2,
+                                                             selected_hotbar_slot=2)
+                self.assertEqual(passed, result["passed"])
+                compare.assert_called_once_with("baseline.png", "current.png")
+
+    def test_foil_sampler_fixtures_change_only_metadata(self):
+        normal, = capture_runner.gui_resource_pack_specs("flat-item-foil-pattern")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture_runner.write_gui_resource_pack(root/"normal", normal)
+            for variant, blur, clamp in (("nearest",False,False),("clamp",True,True),("nearest-clamp",False,True)):
+                scenario = "flat-item-foil-"+variant
+                spec, = capture_runner.gui_resource_pack_specs(scenario)
+                capture_runner.write_gui_resource_pack(root/variant, spec)
+                metadata = "assets/minecraft/textures/misc/enchanted_glint_item.png.mcmeta"
+                self.assertEqual({"texture":{"blur":blur,"clamp":clamp}},
+                                 json.loads((root/variant/metadata).read_text()))
+                for path in (root/"normal").rglob("*"):
+                    if path.is_file():
+                        relative = path.relative_to(root/"normal")
+                        if str(relative) not in (metadata,"pack.mcmeta"):
+                            self.assertEqual(path.read_bytes(),(root/variant/relative).read_bytes(),str(relative))
+                args = harness.parse_args(["capture","--gui-resource-pack-scenario",scenario,
+                    "--hotbar-item-fixture","flat-items","--selected-hotbar-slot","2"])
+                harness.validate_fixture_combinations(args)
+                for mode_name in ("current-rust-vulkan-shaders-off","frozen-opengl-shaders-off"):
+                    target = fake_repo(root,mode_name+variant)
+                    mode = next(m for m in harness.MATRIX_MODES if m.name == mode_name)
+                    _,env = harness.build_capture_command(target,mode,root/(mode_name+variant)/"capture","correctness",args,"capture")
+                    self.assertIn("-Dmattmc.dev.graphicsAuditGuiItemFoilBlend=true",env["JAVA_TOOL_OPTIONS"])
+                    self.assertIn("-Dmattmc.dev.guiItemRasterTrace=true",env["JAVA_TOOL_OPTIONS"])
+
+    def test_mixed_item_foil_requires_matching_observed_fixture_and_explicit_options(self):
+        receipt={"fixture":"mixed-item-foil-v2","item":"minecraft:diamond","context":"ground",
+                 "position":[-1.3,1.6,4.0],"foil":True,"complete":True}
+        self.assertTrue(harness.mixed_item_foil_fixture_valid(receipt))
+        for key,value in (("foil",False),("complete",False),("item","minecraft:stone"),
+                          ("context","gui"),("position",[False,0,0]),("position",[float('nan'),0,0])):
+            self.assertFalse(harness.mixed_item_foil_fixture_valid(dict(receipt,**{key:value})))
+        result=harness.deterministic_visual_fixture_equivalence({"mixedItemFoilFixture":receipt},{})
+        self.assertIn("mixed-item-foil-fixture-state",str(result))
+        args=harness.parse_args(["capture","--mixed-item-foil","--gui-resource-pack-scenario","flat-item-foil-clamp",
+            "--hotbar-item-fixture","flat-items","--selected-hotbar-slot","2","--flat-item-gui-scale","2"])
+        harness.validate_fixture_combinations(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            for mode_name in ("current-rust-vulkan-shaders-off","frozen-opengl-shaders-off"):
+                target=fake_repo(root,mode_name)
+                mode=next(m for m in harness.MATRIX_MODES if m.name==mode_name)
+                _,env=harness.build_capture_command(target,mode,root/mode_name/"capture","correctness",args,"capture")
+                self.assertIn("-Dmattmc.dev.graphicsAuditMixedItemFoil=true",env["JAVA_TOOL_OPTIONS"])
+        args.selected_hotbar_slot=1
+        with self.assertRaises(ValueError): harness.validate_fixture_combinations(args)
+
+    def test_dropped_item_foil_requires_observed_matching_stack_and_phase(self):
+        import copy
+        receipt = {"fixture": "dropped-item-foil-v2", "stackCount": 64, "complete": True, "frozenSimulation": True,
+                   "items": [{"item": name, "count": 64, "foil": True, "bobOffset": 3.1415927,
+                              "tickCount": 0, "position": [x, 2.0, 3.0],
+                              "extracted": {"age": 1.0, "bobOffset": 3.1415927, "copies": 5, "seed": 187, "light": 15728640}}
+                             for name, x in (("minecraft:diamond", 1.0), ("minecraft:stone", 2.0))]}
+        self.assertTrue(harness.dropped_item_foil_fixture_valid(receipt))
+        for key, value in (("age", .5), ("bobOffset", 0.0), ("copies", 1), ("seed", True), ("light", None)):
+            invalid = copy.deepcopy(receipt)
+            invalid["items"][0]["extracted"][key] = value
+            self.assertFalse(harness.dropped_item_foil_fixture_valid(invalid))
+        for key, value in (("count", True), ("count", 1), ("foil", False),
+                           ("bobOffset", .1), ("bobOffset", False), ("tickCount", 1),
+                           ("tickCount", False), ("position", [float('nan'), 0, 0])):
+            invalid = copy.deepcopy(receipt)
+            invalid["items"][0][key] = value
+            self.assertFalse(harness.dropped_item_foil_fixture_valid(invalid))
+        invalid = copy.deepcopy(receipt)
+        invalid["items"][1]["position"] = invalid["items"][0]["position"]
+        self.assertFalse(harness.dropped_item_foil_fixture_valid(invalid))
+        result = harness.deterministic_visual_fixture_equivalence({"droppedItemFoilFixture": receipt}, {})
+        self.assertIn("dropped-item-foil-fixture-state", str(result))
+        other = copy.deepcopy(receipt)
+        other["items"][0]["position"][0] += .01
+        result = harness.deterministic_visual_fixture_equivalence(
+            {"droppedItemFoilFixture": receipt}, {"droppedItemFoilFixture": other})
+        self.assertIn("dropped-item-foil-fixture-state", str(result))
+
+    def test_dropped_item_foil_cli_pins_both_repositories_and_rejects_wrong_fixture(self):
+        args = harness.parse_args(["capture", "--dropped-item-foil-count", "1",
+            "--gui-resource-pack-scenario", "flat-item-foil-clamp", "--hotbar-item-fixture", "flat-items",
+            "--selected-hotbar-slot", "2", "--flat-item-gui-scale", "2"])
+        harness.validate_fixture_combinations(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for mode_name in ("current-rust-vulkan-shaders-off", "frozen-opengl-shaders-off"):
+                target = fake_repo(root, mode_name)
+                mode = next(m for m in harness.MATRIX_MODES if m.name == mode_name)
+                _, env = harness.build_capture_command(target, mode, root/mode_name/"capture", "correctness", args, "capture")
+                self.assertIn("-Dmattmc.dev.graphicsAuditDroppedItemFoil=1", env["JAVA_TOOL_OPTIONS"])
+        args.mixed_item_foil = True
+        with self.assertRaises(ValueError): harness.validate_fixture_combinations(args)
+
+    def test_wide_nearest_foil_uses_existing_wide_geometry_and_explicit_filter(self):
+        wide, = capture_runner.gui_resource_pack_specs("flat-item-foil-wide")
+        nearest, = capture_runner.gui_resource_pack_specs("flat-item-foil-nearest-wide")
+        self.assertEqual(512,nearest["item_foil_sprite_size"])
+        self.assertEqual({"blur":False,"clamp":False},nearest["item_foil_sampler"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capture_runner.write_gui_resource_pack(root/"linear",wide)
+            capture_runner.write_gui_resource_pack(root/"nearest",nearest)
+            for path in (root/"linear").rglob("*"):
+                if path.is_file():
+                    relative=path.relative_to(root/"linear")
+                    if str(relative) not in ("pack.mcmeta","assets/minecraft/textures/misc/enchanted_glint_item.png.mcmeta"):
+                        self.assertEqual(path.read_bytes(),(root/"nearest"/relative).read_bytes())
+        args=harness.parse_args(["capture","--gui-resource-pack-scenario","flat-item-foil-nearest-wide",
+            "--hotbar-item-fixture","flat-items","--selected-hotbar-slot","2"])
+        harness.validate_fixture_combinations(args)
+
+    def test_wide_foil_pack_changes_only_authored_sprite_resolution(self):
+        from PIL import Image
+        normal, = capture_runner.gui_resource_pack_specs("flat-item-foil-pattern")
+        wide, = capture_runner.gui_resource_pack_specs("flat-item-foil-wide")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name,spec in (("normal",normal),("wide",wide)):
+                capture_runner.write_gui_resource_pack(root/name,spec)
+            apple = "assets/minecraft/textures/item/apple.png"
+            with Image.open(root/"normal"/apple) as a, Image.open(root/"wide"/apple) as b:
+                self.assertEqual((32,32),a.size)
+                self.assertEqual((512,512),b.size)
+                for x,y in ((8,8),(24,8),(8,24),(24,24)):
+                    self.assertEqual(a.getpixel((x,y)),b.getpixel((x*16,y*16)))
+            for path in (root/"normal").rglob("*"):
+                if path.is_file():
+                    relative = path.relative_to(root/"normal")
+                    if str(relative) not in (apple,"pack.mcmeta"):
+                        self.assertEqual(path.read_bytes(),(root/"wide"/relative).read_bytes(),str(relative))
+        args = harness.parse_args(["capture","--gui-resource-pack-scenario","flat-item-foil-wide",
+            "--hotbar-item-fixture","flat-items","--selected-hotbar-slot","2"])
+        harness.validate_fixture_combinations(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for mode_name in ("current-rust-vulkan-shaders-off","frozen-opengl-shaders-off"):
+                target = fake_repo(root,mode_name)
+                mode = next(m for m in harness.MATRIX_MODES if m.name == mode_name)
+                _,env = harness.build_capture_command(target,mode,root/mode_name/"capture","correctness",args,"capture")
+                properties = dict(value[2:].split("=",1) for value in shlex.split(env["JAVA_TOOL_OPTIONS"])
+                                  if value.startswith("-D") and "=" in value)
+                self.assertEqual("2",properties["mattmc.dev.deterministicCameraCapture.selectedHotbarSlot"])
+                self.assertEqual("true",properties["mattmc.dev.graphicsAuditGuiItemFoilBlend"])
+                self.assertEqual("true",properties["mattmc.dev.guiItemRasterTrace"])
+
+    def test_moving_held_slot_requests_clock_observers_on_both_backends(self):
+        for slot in (1,2):
+            args = harness.parse_args(["capture","--gui-resource-pack-scenario","flat-item-foil-moving",
+                "--hotbar-item-fixture","flat-items","--selected-hotbar-slot",str(slot)])
+            with tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary)
+                for mode_name in ("current-rust-vulkan-shaders-off","frozen-opengl-shaders-off"):
+                    target=fake_repo(root,mode_name)
+                    mode=next(m for m in harness.MATRIX_MODES if m.name == mode_name)
+                    _,env=harness.build_capture_command(target,mode,root/mode_name/"capture","correctness",args,"capture")
+                    properties=dict(value[2:].split("=",1) for value in shlex.split(env["JAVA_TOOL_OPTIONS"])
+                                    if value.startswith("-D") and "=" in value)
+                    self.assertEqual("true" if slot==2 else None,properties.get("mattmc.dev.handItemFoilTiming"))
+                    self.assertEqual("10000",properties["mattmc.dev.graphicsAuditGuiItemFoilPhase"])
+
     def test_second_foil_phase_is_forwarded_and_requires_reference(self):
         base=["capture","--hotbar-item-fixture","flat-items","--gui-resource-pack-scenario","flat-item-foil-moving",
               "--flat-item-foil-phase","40000"]
@@ -16035,6 +16498,23 @@ class FlatItemFixtureTests(unittest.TestCase):
                 _, env = harness.build_capture_command(target, mode, root / name / "capture", "correctness", args, "capture")
                 self.assertIn("-Dmattmc.dev.deterministicCameraCapture.hotbarItemFixture=flat-items",
                               env["JAVA_TOOL_OPTIONS"])
+
+
+class CloudLocalVisualTests(unittest.TestCase):
+    def test_local_error_cannot_be_diluted_by_empty_sky(self):
+        from PIL import Image, ImageChops, ImageStat
+        doc = {"scenario": "bounded"}
+        left = Image.new("RGB", (90, 90), (100, 100, 100))
+        right = left.copy()
+        right.paste((130, 130, 130), (30, 30, 60, 60))
+        self.assertLess(max(ImageStat.Stat(ImageChops.difference(left, right)).mean), 6.0)
+        result = harness.cloud_local_visual_evidence(doc, doc, left, right, 6.0)
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["tiles"]), 9)
+        self.assertFalse(result["tiles"][4]["passed"])
+        self.assertTrue(harness.cloud_local_visual_evidence(doc, doc, left, left, 6.0)["passed"])
+        self.assertFalse(harness.cloud_local_visual_evidence(doc, {}, left, left, 6.0)["passed"])
+        self.assertIsNone(harness.cloud_local_visual_evidence({}, {}, left, right, 6.0))
 
 
 if __name__ == "__main__":

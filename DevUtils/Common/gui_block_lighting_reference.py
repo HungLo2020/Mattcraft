@@ -15,13 +15,31 @@ from PIL import Image
 
 
 def compare(frozen: Image.Image, current: Image.Image, scale: int, include_logs: bool = False) -> dict:
+    items = (("stone", 0), ("white_wool", 6)) + ((("oak_log", 8),) if include_logs else ())
+    return _compare_faces(frozen, current, scale, items, ("stone", "white_wool"))
+
+
+def compare_animated_block(frozen: Image.Image, current: Image.Image, scale: int) -> dict:
+    # Same cube placement and interior face boxes as the stone control. The
+    # shared harness separately requires actual magma/animation upload receipts.
+    result = _compare_faces(frozen, current, scale, (("magma_block", 0),), ())
+    result["schema"] = "gui-animated-block-faces-v1"
+    # Magma includes dark red texels with equal green and blue channels.
+    # Reject achromatic/blank controls without inventing a G > B constraint
+    # that the vanilla source texture itself does not satisfy.
+    result["magma_visible"] = all(p[side][0] > max(p[side][1], p[side][2])
+        for p in result["probes"] for side in ("frozen", "current"))
+    result["passed"] &= result["magma_visible"]
+    return result
+
+
+def _compare_faces(frozen, current, scale, items, orientation_items):
     if frozen.size != current.size or scale not in (2, 3):
         raise ValueError("equal capture extents and GUI scale 2 or 3 required")
     width, height = frozen.size
     frozen, current = frozen.convert("RGB"), current.convert("RGB")
     probes = []
     # Interior model-face samples, away from silhouette and cube edges.
-    items = (("stone", 0), ("white_wool", 6)) + ((("oak_log", 8),) if include_logs else ())
     for item, slot in items:
         center = width // 2 + (slot - 4) * 20 * scale
         for face, dx, dy in (("top", 0, -14), ("left", -3, -8), ("right", 3, -8)):
@@ -37,7 +55,7 @@ def compare(frozen: Image.Image, current: Image.Image, scale: int, include_logs:
                                current=values[1], max_mean_channel_error=error,
                                passed=error <= 2.0))
     orientation = []
-    for item in ("stone", "white_wool"):
+    for item in orientation_items:
         faces = {p["face"]: p for p in probes if p["item"] == item}
         for backend in ("frozen", "current"):
             luminance = {f: sum(p[backend]) / 3 for f, p in faces.items()}

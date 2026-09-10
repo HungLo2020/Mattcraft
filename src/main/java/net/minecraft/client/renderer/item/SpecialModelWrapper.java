@@ -50,6 +50,9 @@ public class SpecialModelWrapper<T> implements ItemModel {
 		}
 
 		T object = this.specialRenderer.extractArgument(itemStack);
+		if (this.specialRenderer.isAnimated(object)) {
+			itemStackRenderState.setAnimated();
+		}
 		layerRenderState.setExtents(() -> {
 			Set<Vector3f> set = new HashSet();
 			this.specialRenderer.getExtents(set);

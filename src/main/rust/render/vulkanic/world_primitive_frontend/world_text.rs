@@ -17,7 +17,7 @@ use super::super::handles::Handle;
 use super::super::resources::{
     AccessFlags, BlendMode, BufferDesc, BufferUsage, ColorFormat, CompareOp, DepthBias, Extent3d,
     FrontFace, GraphicsPipelineDesc, MemoryDomain, PipelineLayoutDesc, PipelineStageFlags,
-    PrimitiveTopology, QueueClass, ResourceBinding, ResourceBindingDesc, ResourceBindingKind,
+    PrimitiveTopology, QueueClass, RasterYDirection, ResourceBinding, ResourceBindingDesc, ResourceBindingKind,
     ResourceLayoutDesc, ResourceSetDesc, SamplerAddressMode, SamplerDesc, SamplerFilter,
     ShaderCodeFormat, ShaderModuleDesc, ShaderStage, TextureDesc, TextureDimension, TextureFormat,
     TextureUsage, TextureViewDesc,
@@ -234,6 +234,7 @@ pub(crate) struct WorldTextFrontend {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct WorldTextResourceKey {
+    raster_y_direction: RasterYDirection,
     asset_id: u64,
     atlas_generation: u64,
     atlas_revision: u64,
@@ -448,6 +449,7 @@ impl WorldTextFrontend {
         depth_view: Handle,
         depth_before: TextureUsageState,
         color_format: ColorFormat,
+        raster_y_direction: RasterYDirection,
         view_matrix: [f32; 16],
         projection_matrix: [f32; 16],
         quads: &[WorldTextQuadRequest],
@@ -496,6 +498,7 @@ impl WorldTextFrontend {
                 })?
                 .clone();
             let key = WorldTextResourceKey {
+                raster_y_direction,
                 asset_id: batch.asset_id,
                 atlas_generation: batch.atlas_generation,
                 atlas_revision: batch.atlas_revision,
@@ -788,6 +791,8 @@ impl WorldTextFrontend {
                     topology: PrimitiveTopology::Triangles,
                     cull_mode: CullMode::None,
                     front_face: FrontFace::CounterClockwise,
+                    provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+                    raster_y_direction: key.raster_y_direction,
                     blend: BlendMode::Alpha,
                     depth_compare,
                     depth_write: false,
@@ -1453,6 +1458,7 @@ mod tests {
     #[test]
     fn atlas_upload_residency_commits_only_on_submission_confirmation() {
         let key = WorldTextResourceKey {
+            raster_y_direction: RasterYDirection::Up,
             asset_id: 7,
             atlas_generation: 2,
             atlas_revision: 3,
@@ -1510,6 +1516,7 @@ mod tests {
                 Handle::NULL,
                 TextureUsageState::Undefined,
                 ColorFormat::Bgra8Unorm,
+                RasterYDirection::Up,
                 [0.0; 16],
                 [0.0; 16],
                 &[],
@@ -1525,6 +1532,7 @@ mod tests {
     #[test]
     fn begin_submission_discards_previous_producer_markers() {
         let key = WorldTextResourceKey {
+            raster_y_direction: RasterYDirection::Up,
             asset_id: 7,
             atlas_generation: 2,
             atlas_revision: 3,
@@ -1629,6 +1637,7 @@ mod tests {
                 depth_view,
                 TextureUsageState::DepthStencilAttachment,
                 ColorFormat::Bgra8Unorm,
+                RasterYDirection::Up,
                 [
                     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 ],
@@ -1699,6 +1708,34 @@ mod tests {
             )),
             "direct world text retains the already-attached depth state"
         );
+        let up_pipelines = bound_pipelines;
+        let mut down_ops = Vec::new();
+        frontend.append_frame_ops(
+            &mut gal, target, pass, target, depth_texture, depth_view,
+            TextureUsageState::DepthStencilAttachment, ColorFormat::Bgra8Unorm,
+            RasterYDirection::Down,
+            super::super::matrix4_identity(), super::super::matrix4_identity(),
+            &[quad(WORLD_TEXT_DEPTH_SEE_THROUGH), quad(WORLD_TEXT_DEPTH_NORMAL),
+                quad(WORLD_TEXT_DEPTH_POLYGON_OFFSET)], &mut down_ops, false,
+        ).unwrap();
+        assert_eq!(frontend.resources.len(), 2,
+            "the same atlas must not alias opposite target orientations");
+        let down_pipelines = down_ops.iter().filter_map(|op| match op {
+            CommandOp::BindGraphicsPipeline(handle) => Some(*handle), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(down_pipelines.len(), 3);
+        for (direction, pipelines) in [(RasterYDirection::Up, up_pipelines),
+            (RasterYDirection::Down, down_pipelines)] {
+            for pipeline in pipelines {
+                assert_eq!(gal.graphics_pipeline_descriptor_for_test(pipeline).unwrap()
+                    .raster_y_direction, direction);
+            }
+        }
+        frontend.reset(&mut gal);
+        for handle in [pass, depth_view, depth_texture, target] {
+            gal.destroy(handle).unwrap();
+        }
+        assert_eq!(gal.metrics().resource_creates, gal.metrics().resource_destroys);
     }
 
     #[test]
@@ -1769,6 +1806,7 @@ mod tests {
                 depth_view,
                 TextureUsageState::ShaderRead,
                 ColorFormat::Bgra8Unorm,
+                RasterYDirection::Up,
                 [
                     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 ],

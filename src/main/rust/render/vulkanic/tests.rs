@@ -272,6 +272,8 @@ fn simple_graphics_scene(gal: &mut VulkanicGal) -> (Handle, Handle, Handle, Hand
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: None,
             depth_write: false,
@@ -418,6 +420,8 @@ fn capability_limits_reject_descriptor_and_attachment_overflows() {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::None,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: None,
             depth_write: false,
@@ -702,6 +706,8 @@ fn acquired_frame_targets_are_normal_pass_targets_without_attachment_borrows() {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Alpha,
             depth_compare: None,
             depth_write: false,
@@ -1788,6 +1794,8 @@ fn pipeline_and_pass_compatibility_is_validated() {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: None,
             depth_write: false,
@@ -1838,6 +1846,8 @@ fn graphics_pipeline_depth_bias_requires_finite_enabled_depth_contract() {
         topology: PrimitiveTopology::Triangles,
         cull_mode: CullMode::None,
         front_face: FrontFace::CounterClockwise,
+        provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+        raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
         blend: BlendMode::Disabled,
         depth_compare,
         depth_write: false,
@@ -2019,6 +2029,8 @@ fn attachment_and_presentation_hazards_require_semantic_separation() {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: None,
             depth_write: false,
@@ -2086,6 +2098,8 @@ fn attachment_and_presentation_hazards_require_semantic_separation() {
             topology: PrimitiveTopology::Triangles,
             cull_mode: CullMode::Back,
             front_face: crate::render::vulkanic::resources::FrontFace::CounterClockwise,
+            provoking_vertex: crate::render::vulkanic::resources::ProvokingVertex::Last,
+            raster_y_direction: crate::render::vulkanic::resources::RasterYDirection::Up,
             blend: BlendMode::Disabled,
             depth_compare: None,
             depth_write: false,
@@ -4308,6 +4322,47 @@ fn hazard_tracking_still_checks_same_resource_ranges() {
     );
 }
 
+#[test]
+fn storage_binding_hazards_use_explicit_ranges_and_effective_dynamic_offsets() {
+    for overrides in [false, true] {
+        for second_access in [AccessFlags::READ, AccessFlags::WRITE] {
+            for (second_offset, accepted) in [(256u64, true), (128, false), (0, false)] {
+                let mut gal = gal();
+                let buffer = gal.create_buffer(BufferDesc { label: "ranged-storage".into(),
+                    size: 1024, memory: MemoryDomain::DeviceLocal, usages: vec![BufferUsage::Storage] }).unwrap();
+                let layout = gal.create_resource_layout(ResourceLayoutDesc {
+                    label: "ranged-storage-layout".into(), bindings: vec![ResourceBindingDesc {
+                        binding: 0, kind: ResourceBindingKind::StorageBuffer, stages: PipelineStageFlags::COMPUTE,
+                        array_count: 1, optional: false, dynamic_offset_count: 1,
+                    }],
+                }).unwrap();
+                let pipeline_layout = gal.create_pipeline_layout(PipelineLayoutDesc {
+                    label: "ranged-storage-pipeline-layout".into(), resource_layouts: vec![layout],
+                }).unwrap();
+                let shader = gal.create_shader_module(shader("ranged-storage-shader", ShaderStage::Compute)).unwrap();
+                let pipeline = gal.create_compute_pipeline(ComputePipelineDesc {
+                    label: "ranged-storage-pipeline".into(), layout: pipeline_layout, shader,
+                }).unwrap();
+                let mut operations = vec![CommandOp::BindComputePipeline(pipeline)];
+                for (offset, access) in [(0, AccessFlags::WRITE), (second_offset, second_access)] {
+                    let set = gal.create_resource_set(ResourceSetDesc { label: "ranged-storage-set".into(), layout,
+                        bindings: vec![ResourceBinding { binding: 0, array_index: 0, resource: buffer,
+                            kind: ResourceBindingKind::StorageBuffer, access,
+                            dynamic_offsets: vec![if overrides { 0 } else { offset }], buffer_range: Some(256) }],
+                    }).unwrap();
+                    operations.push(CommandOp::BindResourceSet { pipeline_layout, set_index: 0, set,
+                        dynamic_offsets: if overrides { vec![offset] } else { vec![] } });
+                    operations.push(CommandOp::Dispatch { groups_x: 1, groups_y: 1, groups_z: 1 });
+                }
+                let commands = gal.create_command_list(CommandListDesc { label: "ranged-storage-commands".into(), operations }).unwrap();
+                let result = gal.submit(SubmissionBatch { label: "ranged-storage-submit".into(), command_lists: vec![commands] });
+                assert_eq!(result.is_ok(), accepted, "offset={second_offset} overrides={overrides} access={second_access:?}: {result:?}");
+                if let Err(error) = result { assert_eq!(error.domain, ErrorDomain::Submission); }
+            }
+        }
+    }
+}
+
 fn empty_resource_batch() -> FfiResourceBatch {
     FfiResourceBatch {
         header: ffi_header_for::<FfiResourceBatch>(),
@@ -4386,7 +4441,7 @@ fn frozen_ffi_abi_sizes_and_capability_negotiation_are_stable() {
     assert_eq!(FFI_ABI_V40_VERSION, 40);
     assert_eq!(FFI_ABI_V41_VERSION, 41);
     assert_eq!(FFI_ABI_V42_VERSION, 42);
-    assert_eq!(FFI_ABI_VERSION, FFI_ABI_V42_VERSION);
+    assert_eq!(FFI_ABI_VERSION, 54);
     assert!(!FFI_INITIAL_PRESENTATION_SUPPORTED);
     assert_eq!(size_of::<FfiHeader>(), 8);
     assert_eq!(size_of::<FfiHandle>(), 8);

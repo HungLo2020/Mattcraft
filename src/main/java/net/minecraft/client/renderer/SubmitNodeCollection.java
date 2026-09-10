@@ -256,6 +256,22 @@ public class SubmitNodeCollection implements OrderedSubmitNodeCollector, Ordered
 	}
 
 	@Override
+	public <S> void submitModelOutlineSemanticTexture(Model<? super S> model, S state,
+		PoseStack poseStack, RenderType material, int light,
+		net.minecraft.resources.ResourceLocation textureIdentity, int outlineColor) {
+		if (!(state instanceof net.minecraft.client.renderer.entity.state.EntityRenderState entityState)) {
+			throw new IllegalArgumentException("outline-only model requires semantic entity identity");
+		}
+		var entityIdentity = net.vulkanic.world.RustGalWorldPrimitiveRenderer.entityIdentity(entityState);
+		if (entityIdentity == null || !net.vulkanic.world.RustGalWorldPrimitiveRenderer.enqueueStandaloneModelMeshOutlineOnly(
+			model, state, poseStack.last(), material, textureIdentity, entityIdentity, light, outlineColor)) {
+			throw new IllegalStateException("outline-only semantic model route unavailable");
+		}
+		net.vulkanic.world.RustGalWorldPrimitiveRenderer.recordModelMeshRouteDecision(
+			"rust-vulkan-whole-frame", textureIdentity, model.getClass().getName(), entityState.entityId, true, true, false);
+	}
+
+	@Override
 	public <S> void submitModelSemanticTexture(
 		Model<? super S> model,
 		S object,
@@ -693,6 +709,15 @@ public class SubmitNodeCollection implements OrderedSubmitNodeCollector, Ordered
 		int l,
 		@Nullable ModelFeatureRenderer.CrumblingOverlay crumblingOverlay
 	) {
+		// Atlas-backed entity foil is a separate semantic command, not another
+		// base draw. Preserve its source sprite UVs for Rust-owned foil lowering.
+		if (rustWholeFramePresenterActive()
+			&& net.vulkanic.world.WorldRenderRoutePolicy.currentModelMeshRoute(true).usesRustWholeFrameVulkan()
+			&& renderType == RenderType.entityGlint() && textureAtlasSprite != null
+			&& net.vulkanic.world.RustGalWorldPrimitiveRenderer.enqueueAtlasGlintModelMesh(
+				model, object, poseStack.last(), renderType, textureAtlasSprite, i, j, k, l, crumblingOverlay)) {
+			return;
+		}
 		// ArmorEntityGlint is emitted as a sprite-less second model submit. Copy
 		// its model-local geometry directly into the explicit Rust glint material;
 		// the Java RenderType remains only a semantic selector.
@@ -978,7 +1003,7 @@ public class SubmitNodeCollection implements OrderedSubmitNodeCollector, Ordered
 		int l
 	) {
 		String rustEligibility = net.vulkanic.world.RustGalWorldPrimitiveRenderer.modelPartMeshEligibilityReason(
-			modelPart, renderType, textureAtlasSprite, j, bl, bl2, k, crumblingOverlay
+			modelPart, renderType, textureAtlasSprite, j, bl, bl2, l, crumblingOverlay
 		);
 		boolean rustEligible = "eligible".equals(rustEligibility);
 		net.vulkanic.world.WorldRenderRoutePolicy.Route rustRoute =
@@ -1000,7 +1025,7 @@ public class SubmitNodeCollection implements OrderedSubmitNodeCollector, Ordered
 		}
 		if (rustRoute.usesRustWholeFrameVulkan()) {
 			if (!net.vulkanic.world.RustGalWorldPrimitiveRenderer.enqueueModelPartMesh(
-				modelPart, poseStack.last(), renderType, textureAtlasSprite, i, j, bl, bl2, l, crumblingOverlay, k
+				modelPart, poseStack.last(), renderType, textureAtlasSprite, i, j, bl, bl2, k, crumblingOverlay, l
 			)) {
 				throw new IllegalStateException("Rust whole-frame ModelPart route selected without a copied indexed mesh request");
 			}

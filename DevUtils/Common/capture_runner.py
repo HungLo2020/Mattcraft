@@ -3192,6 +3192,51 @@ def flat_item_orientation_colors(index):
 
 
 def gui_resource_pack_specs(scenario: str) -> list[dict[str, object]]:
+    if scenario in ("shield-animation", "shield-animation-interpolated"):
+        return [dict(name="mattmc-" + scenario, variant="a", shield_animation=True,
+                     shield_interpolation=scenario.endswith("-interpolated"),
+                     sprites=(("assets/minecraft/textures/entity/shield_base_nopattern.png",64,192),))]
+    if scenario in ("shield-alpha", "shield-alpha-zero", "shield-alpha-occlusion"):
+        return [dict(name="mattmc-" + scenario, variant="a", shield_alpha=True,
+                     shield_alpha_zero=scenario != "shield-alpha",
+                     shield_alpha_opaque_handle=scenario == "shield-alpha-occlusion",
+                     sprites=(("assets/minecraft/textures/entity/shield_base_nopattern.png", 64, 64),))]
+    if scenario == "experience-orb-occlusion":
+        return [{"name":"mattmc-experience-orb-occlusion", "variant":"a", "solid_occluder":True,
+                 "sprites":(("assets/minecraft/textures/block/stone.png",16,16),)}]
+    if scenario == "experience-orb-replacement":
+        return gui_resource_pack_specs("experience-orb-b") + gui_resource_pack_specs("experience-orb-a")
+    if scenario in ("experience-orb-a", "experience-orb-b"):
+        return [{"name": "mattmc-" + scenario, "variant": scenario[-1],
+                 "experience_orb_sheet": True,
+                 "sprites": (("assets/minecraft/textures/entity/experience_orb.png", 64, 64),)}]
+    if scenario == "block-marker-replacement":
+        return gui_resource_pack_specs("block-marker-b") + gui_resource_pack_specs("block-marker-a")
+    if scenario in ("block-marker-a", "block-marker-b"):
+        return [{"name": "mattmc-" + scenario, "variant": scenario[-1],
+                 "sprites": tuple((f"assets/minecraft/textures/item/{name}.png",16,16)
+                     for name in ("barrier", *(f"light_{level:02d}" for level in range(16))))}]
+    if scenario in ("block-item-foil", "block-item-foil-moving"):
+        return [dict(name="mattmc-block-item-foil",variant="a",sprites=(),item_foil_blend=True,item_foil_pattern=True)]
+    if scenario in ("block-item-expanded", "block-item-oversized"):
+        return [dict(name="mattmc-"+scenario,variant="a",sprites=(),block_item_expanded=True,
+                     block_item_oversized=scenario=="block-item-oversized")]
+    if scenario in ("special-item-foil-pattern", "special-item-foil-moving"):
+        # Glint only: preserve vanilla clock/compass models, selectors and sprites.
+        return [dict(name="mattmc-special-item-foil-pattern", variant="a", sprites=(),
+                     item_foil_blend=True, item_foil_pattern=True)]
+    if scenario == "flat-item-foil-nearest-wide":
+        spec, = gui_resource_pack_specs("flat-item-foil-nearest")
+        return [dict(spec, name="mattmc-"+scenario, item_foil_sprite_size=512)]
+    if scenario in ("flat-item-foil-nearest", "flat-item-foil-clamp", "flat-item-foil-nearest-clamp"):
+        spec, = gui_resource_pack_specs("flat-item-foil-pattern")
+        return [dict(spec, name="mattmc-"+scenario, item_foil_sampler={
+            "blur": "nearest" not in scenario, "clamp": "clamp" in scenario})]
+    if scenario == "flat-item-foil-wide":
+        spec, = gui_resource_pack_specs("flat-item-foil-pattern")
+        # Ordinary high-resolution resource-pack sprite: the model geometry
+        # is unchanged, but its atlas UV interval exercises foil repeat/filter.
+        return [dict(spec, name="mattmc-flat-item-foil-wide", item_foil_sprite_size=512)]
     if scenario in ("flat-item-foil-pattern", "flat-item-foil-moving"):
         spec, = gui_resource_pack_specs("flat-item-foil-blend")
         return [dict(spec, name="mattmc-flat-item-foil-pattern", item_foil_pattern=True)]
@@ -3274,9 +3319,11 @@ def gui_resource_pack_specs(scenario: str) -> list[dict[str, object]]:
     if scenario == "lava-mip-minification":
         return [{"name": "mattmc-lava-mip-minification", "variant": "a", "sprites": (),
                  "water_mip_compatible": True, "lava_mip_minification": True}]
-    if scenario in ("water-face-isolation", "water-bottom-isolation"):
+    if scenario in ("water-face-isolation", "water-bottom-isolation", "water-overlay-isolation", "water-overlay-hidden"):
         return [{"name": "mattmc-" + scenario, "variant": "a", "sprites": (),
-                 "water_face_isolation": True, "water_bottom_isolation": scenario == "water-bottom-isolation"}]
+                 "water_face_isolation": True, "water_bottom_isolation": scenario == "water-bottom-isolation",
+                 "water_overlay_isolation": scenario in ("water-overlay-isolation", "water-overlay-hidden"),
+                 "water_overlay_hidden": scenario == "water-overlay-hidden"}]
     if scenario == "water-mip-compatible":
         return [{"name": "mattmc-water-mip-compatible", "variant": "a", "sprites": (),
                  "water_mip_compatible": True}]
@@ -3428,6 +3475,38 @@ def lava_minification_image(source):
     return scaled
 
 
+def shield_alpha_png(*, zero: bool = False, opaque_handle: bool = False) -> bytes:
+    """Static plate bands at zero alpha and around the .1 cutout boundary.
+
+    Nonzero RGB at zero alpha intentionally tests opaque semantics. No model,
+    shader, pipeline, timing or UV override is included in this resource pack.
+    """
+    rows = bytearray()
+    for y in range(64):
+        alpha = 0 if zero else (0, 1, 25, 26, 128, 255)[(y // 4) % 6]
+        rows.append(0)
+        for x in range(64):
+            # ShieldModel's handle occupies texOffs(26,0), extent 16x12.
+            # Its opaque green surface must not leak through a zero-alpha
+            # plate whose opaque material still writes color and depth.
+            rows.extend((40, 240, 80, 255) if opaque_handle and 26 <= x < 42 and y < 12
+                        else (224, 160, 80, alpha))
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 6, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(bytes(rows))) + png_chunk(b"IEND", b""))
+
+
+SHIELD_ANIMATION_COLORS = ((224,64,32,255), (32,208,64,255), (48,80,224,255))
+SHIELD_ANIMATION_FRAMES = ((2,3), (0,5), (2,2), (1,7))
+
+
+def shield_animation_png() -> bytes:
+    rows = b"".join((b"\0" + bytes(color)*64)*64 for color in SHIELD_ANIMATION_COLORS)
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR",struct.pack(">IIBBBBB",64,192,8,6,0,0,0))
+            + png_chunk(b"IDAT",zlib.compress(rows)) + png_chunk(b"IEND",b""))
+
+
 def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
     if pack_dir.exists():
         shutil.rmtree(pack_dir)
@@ -3446,6 +3525,21 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
         encoding="utf-8",
     )
     variant = str(spec["variant"])
+    if spec.get("block_item_expanded"):
+        # Replace only the middle GUI fixture item; world block models and
+        # the stone/wool/log lighting controls remain vanilla.
+        model = "item/mattmc_expanded_oak_slab"
+        target = pack_dir / "assets/minecraft/models" / (model + ".json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"gui_light":"side", "textures":{"all":"minecraft:block/oak_planks"},
+            "display":{"gui":{"rotation":[30,225,0],"translation":[3,1,0],"scale":[0.9,0.7,0.8]}},
+            "elements":[{"from":[-8,0,0],"to":[24,16,16],
+                "faces":{face:{"texture":"#all","uv":[0,0,16,16]}
+                         for face in ("down","up","north","south","west","east")}}]}),encoding="utf-8")
+        target = pack_dir / "assets/minecraft/items/oak_slab.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"model":{"type":"minecraft:model","model":"minecraft:"+model},
+                                     "oversized_in_gui":bool(spec.get("block_item_oversized"))}),encoding="utf-8")
     if spec.get("lava_mip_minification"):
         from PIL import Image
         resources = Path(__file__).resolve().parents[2] / "src/main/resources/assets/minecraft/textures/block"
@@ -3468,6 +3562,12 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
                   "oak_door_bottom": (0, 0, 0, 0)}
         if spec.get("water_bottom_isolation"):
             colors["blue_stained_glass"] = (0, 0, 0, 0)
+        if spec.get("water_overlay_isolation"):
+            # Keep the real ice block, collision and fluid-overlay eligibility.
+            # Only remove its visual obstruction through normal pack loading.
+            colors["ice"] = (0, 0, 0, 0)
+        if spec.get("water_overlay_hidden"):
+            colors["water_overlay"] = (0, 0, 0, 0)
         for name, color in colors.items():
             target = pack_dir / f"assets/minecraft/textures/block/{name}.png"
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -3560,7 +3660,11 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
         if spec.get("item_foil_pattern"):
             from gui_foil_reference import pattern_pixel
             rows=b"".join(bytes([0])+bytes(c for x in range(16) for c in pattern_pixel(x,y)) for y in range(16))
-            target.with_suffix(".png.mcmeta").write_text(json.dumps({"texture":{"blur":True,"clamp":False}}))
+            sampler = spec.get("item_foil_sampler", {"blur": True, "clamp": False})
+            if (not isinstance(sampler, dict) or set(sampler) != {"blur", "clamp"}
+                    or any(type(value) is not bool for value in sampler.values())):
+                raise ValueError("foil fixture requires explicit boolean blur/clamp")
+            target.with_suffix(".png.mcmeta").write_text(json.dumps({"texture":sampler}))
         target.write_bytes(b"\x89PNG\r\n\x1a\n"+png_chunk(b"IHDR",struct.pack(">IIBBBBB",16,16,8,6,0,0,0))
                           +png_chunk(b"IDAT",zlib.compress(rows))+png_chunk(b"IEND",b""))
     wrong_size = set(spec.get("wrong_size", ()))
@@ -3610,18 +3714,44 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
             target.write_bytes(b"not a png")
             continue
         actual_width = width + 1 if resource_path in wrong_size else width
+        if spec.get("shield_animation"):
+            target.write_bytes(shield_animation_png())
+            target.with_name(target.name + ".mcmeta").write_text(json.dumps({"animation": {
+                "width":64,"height":64,"interpolate":bool(spec.get("shield_interpolation")),
+                "frames":[{"index":index,"time":duration} for index,duration in SHIELD_ANIMATION_FRAMES]
+            }}),encoding="utf-8")
+            continue
+        if spec.get("shield_alpha"):
+            target.write_bytes(shield_alpha_png(zero=bool(spec.get("shield_alpha_zero")),
+                opaque_handle=bool(spec.get("shield_alpha_opaque_handle"))))
+            target.with_name(target.name + ".mcmeta").write_text("{}", encoding="utf-8")
+            continue
+        if spec.get("solid_occluder"):
+            # An ordinary resource-pack texture isolates depth from texel-boundary
+            # interpolation. No shader override, image mask or renderer change.
+            rows = (b"\x00" + bytes((128,128,128,255))*16)*16
+            target.write_bytes(b"\x89PNG\r\n\x1a\n"
+                + png_chunk(b"IHDR", struct.pack(">IIBBBBB",16,16,8,6,0,0,0))
+                + png_chunk(b"IDAT",zlib.compress(rows)) + png_chunk(b"IEND",b""))
+            continue
+        if spec.get("experience_orb_sheet"):
+            target.write_bytes(experience_orb_sheet_png(variant))
+            continue
         target.write_bytes(asymmetric_png(actual_width, height, GUI_PACK_COLORS[variant], variant,
                                          item_alpha_steps=bool(spec.get("item_alpha_steps"))))
     world_border_texture = str(spec.get("world_border_texture", ""))
     if "item_uvs" in spec:
         rows = bytearray()
         animation = bool(spec.get("item_animation"))
-        height = 64 if animation else 32
+        width = int(spec.get("item_foil_sprite_size", 32))
+        if width not in (32,512) or width != 32 and (animation or spec.get("item_cutout")):
+            raise ValueError("wide foil sprite is a bounded static opaque fixture")
+        height = 64 if animation else width
         for y in range(height):
             rows.append(0)
-            for x in range(32):
-                quadrant = ((y%32)//16)*2+x//16
-                if y >= 32: quadrant = 3-quadrant
+            for x in range(width):
+                quadrant = ((y%width)//(width//2))*2+x//(width//2)
+                if y >= width: quadrant = 3-quadrant
                 alpha = 255
                 if spec.get("item_cutout") and (x < 4 or x >= 28 or y < 4 or y >= 28
                                                or (12 <= x < 20 and 12 <= y < 20)):
@@ -3630,7 +3760,7 @@ def write_gui_resource_pack(pack_dir: Path, spec: dict[str, object]) -> None:
         target = pack_dir / ("assets/minecraft/textures/item/feather.png" if animation
                              else "assets/minecraft/textures/item/apple.png")
         target.write_bytes(b"\x89PNG\r\n\x1a\n"
-            + png_chunk(b"IHDR",struct.pack(">IIBBBBB",32,height,8,6,0,0,0))
+            + png_chunk(b"IHDR",struct.pack(">IIBBBBB",width,height,8,6,0,0,0))
             + png_chunk(b"IDAT",zlib.compress(bytes(rows))) + png_chunk(b"IEND",b""))
         if animation:
             target.with_suffix(".png.mcmeta").write_text(json.dumps({"animation":{
@@ -3810,6 +3940,28 @@ def sky_sun_minification_png() -> bytes:
             + png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
             + png_chunk(b"IDAT", zlib.compress(bytes(rows)))
             + png_chunk(b"IEND", b""))
+
+
+def experience_orb_sheet_png(variant: str) -> bytes:
+    """Ordinary resource override: distinct cells, orientation and cutout edges."""
+    if variant not in ("a", "b"):
+        raise ValueError("unknown orb sheet variant")
+    rows = bytearray()
+    for y in range(64):
+        rows.append(0)
+        for x in range(64):
+            cell = (y // 16) * 4 + x // 16
+            u, v = x % 16, y % 16
+            color = ((43 + cell * 13) % 256, (211 - cell * 7) % 256, (71 + cell * 11) % 256)
+            if variant == "b":
+                color = tuple(255 - channel for channel in color)
+            alpha = 0 if u < 2 or v < 2 or u > 13 or v > 13 else 255
+            if u < 5 and v < 7:
+                color = (255, 255, 255)
+            rows.extend((*color, alpha))
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 6, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(bytes(rows))) + png_chunk(b"IEND", b""))
 
 
 def asymmetric_png(width: int, height: int, base: tuple[int, int, int, int], variant: str,

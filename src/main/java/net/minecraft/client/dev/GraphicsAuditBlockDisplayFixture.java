@@ -16,9 +16,16 @@ public final class GraphicsAuditBlockDisplayFixture {
         return Boolean.getBoolean("mattmc.dev.graphicsAuditWaterCycleCapture");
     }
     public static boolean guiItemAnimationRequested() {
-        return Boolean.getBoolean("mattmc.dev.graphicsAuditGuiItemAnimation");
+        return Boolean.getBoolean("mattmc.dev.graphicsAuditGuiItemAnimation") || shieldAnimationRequested();
+    }
+    private static boolean shieldAnimationRequested() {
+        return Boolean.getBoolean("mattmc.dev.graphicsAuditShieldAnimation");
     }
     public static net.minecraft.resources.ResourceLocation observedSprite() {
+        if (shieldAnimationRequested())
+            return net.minecraft.resources.ResourceLocation.withDefaultNamespace("entity/shield_base_nopattern");
+        if (net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.requested())
+            return net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.SPRITE;
         if (guiItemAnimationRequested())
             return net.minecraft.resources.ResourceLocation.withDefaultNamespace("item/feather");
         if (net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested())
@@ -39,7 +46,9 @@ public final class GraphicsAuditBlockDisplayFixture {
     }
 
     private static net.minecraft.resources.ResourceLocation observedAtlas() {
-        return net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested()
+        if (shieldAnimationRequested()) return net.minecraft.client.renderer.Sheets.SHIELD_SHEET;
+        return (net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested()
+            || net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.requested())
             ? net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_PARTICLES
             : net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS;
     }
@@ -73,6 +82,7 @@ public final class GraphicsAuditBlockDisplayFixture {
 
     public static String animationObservation(Minecraft minecraft) {
         if ((!requested() && !net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested()
+            && !net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.requested()
             && !net.minecraft.client.particle.GraphicsAuditTerrainParticleFixture.requested() && !waterAnimationRequested() && !GraphicsAuditLavaFixture.requested() && !guiItemAnimationRequested())
             || minecraft.level == null) return "null";
         var texture = minecraft.getTextureManager().getTexture(observedAtlas());
@@ -96,6 +106,7 @@ public final class GraphicsAuditBlockDisplayFixture {
         if (net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.staticRequested())
             return net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.staticReady(minecraft);
         if (!guiItemAnimationRequested() && !net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested()
+            && !net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.requested()
             && !GraphicsAuditLavaFixture.requested() && !waterAnimationRequested() && ((!requested() && !net.minecraft.client.particle.GraphicsAuditTerrainParticleFixture.requested())
             || !Boolean.getBoolean("mattmc.dev.graphicsAuditMagmaCycleCapture"))) return true;
         var texture = minecraft.getTextureManager().getTexture(observedAtlas());
@@ -107,7 +118,8 @@ public final class GraphicsAuditBlockDisplayFixture {
             .filter(value -> value.name().equals(sprite.contents().name())).findFirst().orElse(null);
         if (declaration == null) return PHASE_WAIT.observe(false);
         long duration = declaration.source().frames().stream().mapToLong(value -> value.durationTicks()).sum();
-        if (guiItemAnimationRequested() || net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested()) {
+        if (guiItemAnimationRequested() || net.minecraft.client.particle.GraphicsAuditAtlasParticleFixture.requested()
+            || net.minecraft.client.particle.GraphicsAuditVibrationParticleFixture.requested()) {
             return PHASE_WAIT.observeAnimation(GraphicsAuditPhaseWait.phaseMatches(
                 resource.lastNonemptyTickNamingSpriteForDiagnostics(declaration.id()), duration,
                 GraphicsAuditPhaseWait.requestedPhase(duration)),

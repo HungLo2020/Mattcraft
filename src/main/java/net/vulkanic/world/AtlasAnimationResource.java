@@ -13,14 +13,27 @@ public final class AtlasAnimationResource implements AutoCloseable {
     private boolean closed;
     private long lastProducedTick;
 
-    /** Validation only until every atlas consumer and paired timing are proven. */
+    /** Private admission for nonstandard atlas consumers. */
     public static boolean privateTickDeliveryEnabled() {
         return Boolean.getBoolean("mattmc.dev.rustGalAtlasAnimation");
     }
 
+    public static boolean privateShieldLifecycleEnabled() {
+        return Boolean.getBoolean("mattmc.dev.rustGalShieldAtlasAnimation");
+    }
+
+    /** Standard atlas clocks follow the resource lifetime, not a draw/admission flag. */
+    public boolean tickDeliveryEnabled() {
+        return net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS.equals(atlas)
+            || net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_PARTICLES.equals(atlas)
+            || privateShieldLifecycleEnabled() && net.minecraft.client.renderer.Sheets.SHIELD_SHEET.equals(atlas)
+            || privateTickDeliveryEnabled();
+    }
+
     /** The ID names a semantic asset, never a Java or native GPU texture handle. */
     public AtlasAnimationResource(ResourceLocation atlas, int semanticTextureId, SemanticAtlasAnimationSource source) {
-        if (semanticTextureId <= 0) throw new IllegalArgumentException("Invalid semantic atlas texture identity");
+        // Java carries the nonzero native u32 identity's bit pattern.
+        if (semanticTextureId == 0) throw new IllegalArgumentException("Invalid semantic atlas texture identity");
         this.semanticTextureId = semanticTextureId;
         this.atlas = java.util.Objects.requireNonNull(atlas);
         this.source = java.util.Objects.requireNonNull(source);

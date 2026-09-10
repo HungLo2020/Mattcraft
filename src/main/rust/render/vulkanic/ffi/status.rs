@@ -540,6 +540,8 @@ pub(crate) fn input_bytes_for_gui_frame(request: &FfiGuiFrameSubmitRequest) -> u
 
 pub(crate) fn input_bytes_for_whole_frame(request: &FfiWholeFrameSubmitRequest) -> u64 {
     (size_of::<FfiWholeFrameSubmitRequest>() as u64)
+        .saturating_add(request.world_particle_quads.count.saturating_mul(size_of::<FfiWorldParticleQuadRequest>() as u64))
+        .saturating_add(request.world_experience_orbs.count.saturating_mul(size_of::<FfiWorldExperienceOrbInstanceRecord>() as u64))
         .saturating_add(request.gui_tiled_quads.count.saturating_mul(size_of::<FfiGuiTiledQuadRequest>() as u64))
         .saturating_add(
             request
@@ -754,6 +756,7 @@ pub(crate) fn input_bytes_for_world_mesh_asset_update(
     .unwrap_or(0);
     (size_of::<FfiWorldMeshAssetUpdateRequest>() as u64)
         .saturating_add(mesh_headers)
+        .saturating_add(request.experience_orbs.count.saturating_mul(size_of::<FfiWorldExperienceOrbAssetRecord>() as u64))
         .saturating_add(texture_headers)
         .saturating_add(sorted_index_headers)
         .saturating_add(retirement_headers)

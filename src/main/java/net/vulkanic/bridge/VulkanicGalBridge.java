@@ -76,7 +76,7 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		}
 	}
 
-	public static final int ABI_VERSION = 42;
+	public static final int ABI_VERSION = 54;
 
 	/** Immutable engine inputs; Rust owns Globals normalization, packing and GPU storage. */
 	public record EngineGlobalsRecord(int screenWidth, int screenHeight, long gameTicks,
@@ -183,8 +183,10 @@ public final class VulkanicGalBridge implements AutoCloseable {
 	public static final int HANDLE_FRAME_TARGET = 13;
 	/** GUI mesh ABI mode for a Frozen-parity panorama: unlit, no culling, no depth test. */
 	public static final int GUI_MESH_MATERIAL_PANORAMA = 5;
+	public static final int GUI_MESH_MATERIAL_MODEL_OVERLAY = 6;
 	/** Ordinary inventory model lighting in the Y-down GUI normal space. */
 	public static final int GUI_MESH_LIGHTING_INVENTORY_BLOCK = 3;
+	public static final int GUI_MESH_LIGHTING_FRONT_MODEL = 4;
 
 	// Long-lived context requests use the context arena; large frame payloads
 	// are serialized in a per-submit confined arena and released immediately
@@ -647,6 +649,8 @@ public final class VulkanicGalBridge implements AutoCloseable {
 				for (int component = 0; component < 2; component++) item.set(ValueLayout.JAVA_FLOAT, Struct.GUI_MESH_VERTEX.offset(2) + component * 4L, vertex.localUv()[component]);
 				Struct.GUI_MESH_VERTEX.setInt(item, 3, vertex.colorArgb());
 				Struct.GUI_MESH_VERTEX.setInt(item, 4, vertex.normalPacked());
+				Struct.GUI_MESH_VERTEX.setInt(item, 5, vertex.sourceFace());
+				Struct.GUI_MESH_VERTEX.setInt(item, 6, vertex.sourceFoilType());
 			}
 			MemorySegment indices = arena.allocate((long)batch.indices().size() * Integer.BYTES, Integer.BYTES);
 			for (int index = 0; index < batch.indices().size(); index++) indices.setAtIndex(ValueLayout.JAVA_INT, index, batch.indices().get(index));
@@ -679,13 +683,77 @@ public final class VulkanicGalBridge implements AutoCloseable {
 			Abi.writeSlice(item, Struct.GUI_MESH_BATCH_REQUEST, 25, vertices, batch.vertices().size());
 			Abi.writeSlice(item, Struct.GUI_MESH_BATCH_REQUEST, 26, indices, batch.indices().size());
 			StandardItemFoilRecord foil = batch.itemFoil();
-			Struct.GUI_MESH_BATCH_REQUEST.setInt(item, 27, foil == null ? 0 : 1);
+			Struct.GUI_MESH_BATCH_REQUEST.setInt(item, 27, foil == null ? 0 : foil.kind().wireValue());
 			Struct.GUI_MESH_BATCH_REQUEST.setLong(item, 28, foil == null ? 0 : foil.clockMillis());
 			item.set(ValueLayout.JAVA_DOUBLE, Struct.GUI_MESH_BATCH_REQUEST.offset(29), foil == null ? 0.0 : foil.speed());
 			Struct.GUI_MESH_BATCH_REQUEST.setFloat(item, 30, foil == null ? 0.0F : foil.strength());
 			Struct.GUI_MESH_BATCH_REQUEST.setInt(item, 31, batch.itemRasterScale());
+			GuiDecalFoilRecord decal = batch.decalFoil();
+			float[] decalModelPose = decal == null ? null : decal.modelPose();
+			float[] decalNormalPose = decal == null ? null : decal.normalPose();
+			Struct.GUI_MESH_BATCH_REQUEST.setInt(item, 32, decal == null ? 0 : decal.nativeItemLayout() ? 2 : 1);
+			for (int component = 0; component < 16; component++) item.set(ValueLayout.JAVA_FLOAT,
+				Struct.GUI_MESH_BATCH_REQUEST.offset(33) + component * 4L, decalModelPose == null ? 0.0F : decalModelPose[component]);
+			for (int component = 0; component < 9; component++) item.set(ValueLayout.JAVA_FLOAT,
+				Struct.GUI_MESH_BATCH_REQUEST.offset(34) + component * 4L, decalNormalPose == null ? 0.0F : decalNormalPose[component]);
+			GuiBlockItemRasterRecord block = batch.blockItemRaster();
+			Struct.GUI_MESH_BATCH_REQUEST.setInt(item, 35, block == null ? 0 : block.guiScale());
+			Struct.GUI_MESH_BATCH_REQUEST.setInt(item, 37, block == null ? 0 : block.oversizedGui() ? 2 : 1);
+			GuiItemCacheRecord cache = batch.itemCache();
+			Struct.GUI_MESH_BATCH_REQUEST.setLong(item, 38, cache == null ? 0 : cache.identity());
+			Struct.GUI_MESH_BATCH_REQUEST.setInt(item, 39, cache == null ? 0 : cache.animated() ? 2 : 1);
+			double[] bounds = block == null ? null : block.modelBounds();
+			for (int component = 0; component < 6; component++) item.set(ValueLayout.JAVA_DOUBLE,
+				Struct.GUI_MESH_BATCH_REQUEST.offset(36) + component * 8L, bounds == null ? 0.0 : bounds[component]);
 		}
 		return batchArray;
+	}
+
+	static MemorySegment encodeParticleQuads(Arena arena, List<WorldParticleQuadRecord> particles) {
+		if (particles.size() > 65_536) throw new IllegalArgumentException("too many particle semantics");
+		var layout = Struct.WORLD_PARTICLE_QUAD_REQUEST;
+		MemorySegment array = layout.array(arena, particles.size());
+		int previousIndex = 0;
+		for (int i = 0; i < particles.size(); i++) {
+			var p = particles.get(i);
+			if (p.materialIndex() < previousIndex) throw new IllegalArgumentException("particle ordering must be nondecreasing");
+			previousIndex = p.materialIndex();
+			var item = Abi.item(array, layout, i);
+			layout.setInt(item, 0, layout.byteSize());
+			layout.setInt(item, 1, p.textureId());
+			layout.setInt(item, 2, p.surface().wireValue());
+			layout.setInt(item, 3, p.materialIndex());
+			item.asSlice(layout.offset(4), 12).copyFrom(MemorySegment.ofArray(p.center()));
+			item.asSlice(layout.offset(5), 16).copyFrom(MemorySegment.ofArray(p.rotation()));
+			layout.setFloat(item, 6, p.size());
+			item.asSlice(layout.offset(7), 16).copyFrom(MemorySegment.ofArray(p.uvBounds()));
+			layout.setInt(item, 8, p.colorArgb());
+			layout.setInt(item, 9, p.packedLight());
+		}
+		return array;
+	}
+
+	/** Map collection indices to the bridge's per-vertex-then-compact stream. */
+	static List<WorldParticleQuadRecord> mapParticleMaterialOrder(
+		List<WorldMaterialQuadRecord> materials, List<WorldParticleQuadRecord> particles) {
+		if ((long)materials.size() + particles.size() > 65_536)
+			throw new IllegalArgumentException("combined particle/material frame bound exceeded");
+		if (particles.isEmpty()) return List.of();
+		int[] compactPrefix = new int[materials.size() + 1];
+		for (int i = 0; i < materials.size(); i++)
+			compactPrefix[i + 1] = compactPrefix[i] + (materials.get(i).hasVertexModulation() ? 0 : 1);
+		int modulated = materials.size() - compactPrefix[materials.size()];
+		var result = new ArrayList<WorldParticleQuadRecord>(particles.size());
+		int previous = 0;
+		for (var p : particles) {
+			if (p.materialIndex() < previous || p.materialIndex() > materials.size())
+				throw new IllegalArgumentException("invalid particle collection order");
+			previous = p.materialIndex();
+			result.add(new WorldParticleQuadRecord(p.textureId(), p.surface(),
+				modulated + compactPrefix[p.materialIndex()], p.center(), p.rotation(),
+				p.size(), p.uvBounds(), p.colorArgb(), p.packedLight()));
+		}
+		return List.copyOf(result);
 	}
 
 	private MemorySegment encodeGuiTiledQuads(List<GuiTiledQuadRecord> tiles, int guiWidth, int guiHeight) {
@@ -1387,15 +1455,41 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		String postEffectId,
 		GuiProjectionRecord guiProjection,
 		List<GuiTiledQuadRecord> guiTiledQuads,
-		EngineGlobalsRecord engineGlobals
+		EngineGlobalsRecord engineGlobals,
+		List<WorldParticleQuadRecord> worldParticles
 	) {
 		return submitWorldFrame(
 			generation, frameId, correlationId, frameTarget, guiWidth, guiHeight, viewportWidth, viewportHeight,
 			viewMatrix, projectionMatrix, worldBackground, worldSegments, worldCrackQuads, worldBorderQuads,
 			worldMaterialQuads, worldMeshInstances, voxelVolumeFrame, shaderEnvironmentFrame, worldLodInstances,
 			worldLodRenderFrame, worldFeatureCoverage, guiSprites, guiAffineQuads, guiMeshBatches, worldTextQuads,
-			firstPersonFrame, firstPersonMeshInstances, guiBlurBeforeStratum, guiBlurRadius, postEffectId, true, guiProjection, guiTiledQuads, engineGlobals
+			firstPersonFrame, firstPersonMeshInstances, guiBlurBeforeStratum, guiBlurRadius, postEffectId, true, guiProjection, guiTiledQuads, engineGlobals, worldParticles, List.of()
 		);
+	}
+
+	public WholeFrameSubmitResult submitWholeFrameWithAffineGuiAndWorldTextAndFirstPerson(
+		long generation, long frameId, long correlationId, long frameTarget,
+		int guiWidth, int guiHeight, int viewportWidth, int viewportHeight,
+		float[] viewMatrix, float[] projectionMatrix, WorldBackgroundRecord worldBackground,
+		List<WorldLineSegmentRecord> worldSegments, List<WorldCrackQuadRecord> worldCrackQuads,
+		List<WorldBorderQuadRecord> worldBorderQuads, List<WorldMaterialQuadRecord> worldMaterialQuads,
+		List<WorldMeshInstanceRecord> worldMeshInstances, WorldVoxelVolumeFrameRecord voxelVolumeFrame,
+		WorldShaderEnvironmentFrameRecord shaderEnvironmentFrame, List<WorldLodColumnInstanceRecord> worldLodInstances,
+		WorldLodRenderFrameRecord worldLodRenderFrame, WorldFeatureCoverageRecord worldFeatureCoverage,
+		List<GuiSpriteRecord> guiSprites, List<GuiAffineQuadRecord> guiAffineQuads,
+		List<GuiMeshBatchRecord> guiMeshBatches, List<WorldTextQuadRecord> worldTextQuads,
+		WorldFirstPersonFrameRecord firstPersonFrame, List<WorldMeshInstanceRecord> firstPersonMeshInstances,
+		int guiBlurBeforeStratum, int guiBlurRadius, String postEffectId, GuiProjectionRecord guiProjection,
+		List<GuiTiledQuadRecord> guiTiledQuads, EngineGlobalsRecord engineGlobals,
+		List<WorldParticleQuadRecord> worldParticles, List<WorldExperienceOrbInstanceRecord> worldOrbs
+	) {
+		return submitWorldFrame(generation, frameId, correlationId, frameTarget, guiWidth, guiHeight,
+			viewportWidth, viewportHeight, viewMatrix, projectionMatrix, worldBackground, worldSegments,
+			worldCrackQuads, worldBorderQuads, worldMaterialQuads, worldMeshInstances, voxelVolumeFrame,
+			shaderEnvironmentFrame, worldLodInstances, worldLodRenderFrame, worldFeatureCoverage,
+			guiSprites, guiAffineQuads, guiMeshBatches, worldTextQuads, firstPersonFrame,
+			firstPersonMeshInstances, guiBlurBeforeStratum, guiBlurRadius, postEffectId, true,
+			guiProjection, guiTiledQuads, engineGlobals, worldParticles, worldOrbs);
 	}
 
 	private WholeFrameSubmitResult submitWorldFrame(
@@ -1471,6 +1565,47 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		GuiProjectionRecord guiProjection,
 		List<GuiTiledQuadRecord> guiTiledQuads,
 		EngineGlobalsRecord engineGlobals
+	) {
+		return submitWorldFrame(generation, frameId, correlationId, frameTarget, guiWidth, guiHeight, viewportWidth, viewportHeight, viewMatrix, projectionMatrix, worldBackground, worldSegments, worldCrackQuads, worldBorderQuads, worldMaterialQuads, worldMeshInstances, voxelVolumeFrame, shaderEnvironmentFrame, worldLodInstances, worldLodRenderFrame, worldFeatureCoverage, guiSprites, guiAffineQuads, guiMeshBatches, worldTextQuads, firstPersonFrame, firstPersonMeshInstances, guiBlurBeforeStratum, guiBlurRadius, postEffectId, wholeFrame, guiProjection, guiTiledQuads, engineGlobals, List.of(), List.of());
+	}
+
+	private WholeFrameSubmitResult submitWorldFrame(
+		long generation,
+		long frameId,
+		long correlationId,
+		long frameTarget,
+		int guiWidth,
+		int guiHeight,
+		int viewportWidth,
+		int viewportHeight,
+		float[] viewMatrix,
+		float[] projectionMatrix,
+		WorldBackgroundRecord worldBackground,
+		List<WorldLineSegmentRecord> worldSegments,
+		List<WorldCrackQuadRecord> worldCrackQuads,
+		List<WorldBorderQuadRecord> worldBorderQuads,
+		List<WorldMaterialQuadRecord> worldMaterialQuads,
+		List<WorldMeshInstanceRecord> worldMeshInstances,
+		WorldVoxelVolumeFrameRecord voxelVolumeFrame,
+		WorldShaderEnvironmentFrameRecord shaderEnvironmentFrame,
+		List<WorldLodColumnInstanceRecord> worldLodInstances,
+		WorldLodRenderFrameRecord worldLodRenderFrame,
+		WorldFeatureCoverageRecord worldFeatureCoverage,
+		List<GuiSpriteRecord> guiSprites,
+		List<GuiAffineQuadRecord> guiAffineQuads,
+		List<GuiMeshBatchRecord> guiMeshBatches,
+		List<WorldTextQuadRecord> worldTextQuads,
+		WorldFirstPersonFrameRecord firstPersonFrame,
+		List<WorldMeshInstanceRecord> firstPersonMeshInstances,
+		int guiBlurBeforeStratum,
+		int guiBlurRadius,
+		String postEffectId,
+		boolean wholeFrame,
+		GuiProjectionRecord guiProjection,
+		List<GuiTiledQuadRecord> guiTiledQuads,
+		EngineGlobalsRecord engineGlobals,
+		List<WorldParticleQuadRecord> worldParticles,
+		List<WorldExperienceOrbInstanceRecord> worldOrbs
 	) {
 		Arena previousArena = arena;
 		Arena frameArena = Arena.ofConfined();
@@ -1915,6 +2050,11 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		Abi.writeSlice(request, Struct.WHOLE_FRAME_SUBMIT, 36,
 			encodeGuiTiledQuads(guiTiledQuads, guiWidth, guiHeight), guiTiledQuads.size());
 		writeEngineGlobals(request, engineGlobals);
+		var orderedParticles = mapParticleMaterialOrder(worldMaterialQuads, worldParticles);
+		Abi.writeSlice(request, Struct.WHOLE_FRAME_SUBMIT, 44,
+			encodeParticleQuads(arena, orderedParticles), orderedParticles.size());
+		Abi.writeSlice(request, Struct.WHOLE_FRAME_SUBMIT, 45,
+			encodeExperienceOrbInstances(arena, worldOrbs, worldMeshInstances.size()), worldOrbs.size());
 		MemorySegment firstPerson = request.asSlice(
 			Struct.WHOLE_FRAME_SUBMIT.offset(29),
 			Struct.WORLD_FIRST_PERSON_FRAME.byteSize()
@@ -2164,6 +2304,8 @@ public final class VulkanicGalBridge implements AutoCloseable {
 				Struct.GUI_RAW_IMAGE_ASSET_PAYLOAD.setInt(item, 3, asset.width());
 				Struct.GUI_RAW_IMAGE_ASSET_PAYLOAD.setInt(item, 4, asset.height());
 				Abi.writeBytes(updateArena, item, Struct.GUI_RAW_IMAGE_ASSET_PAYLOAD, 5, asset.pixels());
+				Struct.GUI_RAW_IMAGE_ASSET_PAYLOAD.setInt(item, 6, asset.samplingFilter());
+				Struct.GUI_RAW_IMAGE_ASSET_PAYLOAD.setInt(item, 7, asset.samplingAddress());
 			}
 			MemorySegment request = Struct.GUI_RAW_IMAGE_UPDATE.allocate(updateArena);
 			Abi.writeHeader(request, Struct.GUI_RAW_IMAGE_UPDATE);
@@ -2382,10 +2524,25 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		List<WorldMeshSortedIndexRecord> sortedIndices,
 		List<WorldMeshAssetRetirementRecord> retirements
 	) {
+		return updateWorldMeshAssets(generation, meshes, textures, sortedIndices, retirements, List.of());
+	}
+
+	/** Typed immutable orb appearances use the same explicit mesh lifetime transaction. */
+	public Status updateWorldMeshAssets(
+		long generation,
+		List<WorldMeshAssetRecord> meshes,
+		List<WorldMeshTextureAssetRecord> textures,
+		List<WorldMeshSortedIndexRecord> sortedIndices,
+		List<WorldMeshAssetRetirementRecord> retirements,
+		List<WorldExperienceOrbAssetRecord> experienceOrbs
+	) {
 		Objects.requireNonNull(meshes, "meshes");
 		Objects.requireNonNull(textures, "textures");
 		Objects.requireNonNull(sortedIndices, "sortedIndices");
 		Objects.requireNonNull(retirements, "retirements");
+		Objects.requireNonNull(experienceOrbs, "experienceOrbs");
+		if ((long) meshes.size() + experienceOrbs.size() > 16_384)
+			throw new IllegalArgumentException("combined world mesh/orb asset count exceeds residency");
 		try (Arena updateArena = Arena.ofConfined()) {
 			MemorySegment textureArray = Struct.WORLD_MESH_TEXTURE_ASSET_PAYLOAD.array(updateArena, textures.size());
 			for (int i = 0; i < textures.size(); i++) {
@@ -2499,6 +2656,8 @@ public final class VulkanicGalBridge implements AutoCloseable {
 			Abi.writeSlice(request, Struct.WORLD_MESH_ASSET_UPDATE, 4, sortedIndexArray, sortedIndices.size());
 			Struct.WORLD_MESH_ASSET_UPDATE.setLong(request, 5, negotiatedFeatures);
 			Abi.writeSlice(request, Struct.WORLD_MESH_ASSET_UPDATE, 6, retirementArray, retirements.size());
+			Abi.writeSlice(request, Struct.WORLD_MESH_ASSET_UPDATE, 7,
+				encodeExperienceOrbAssets(updateArena, experienceOrbs), experienceOrbs.size());
 			MemorySegment status = Struct.STATUS.allocate(updateArena);
 			checkStatus(Native.worldMeshUpdateAssets(contextId, request, status), "world mesh asset update");
 			return new Status(Struct.STATUS.getLong(status, 5), Struct.STATUS.metricsFfiCalls(status), Struct.STATUS.metricsFfiInputBytes(status), Struct.STATUS.backendMetrics(status));
@@ -2702,12 +2861,19 @@ public final class VulkanicGalBridge implements AutoCloseable {
 	}
 
 	/** Format values deliberately match the semantic Rust image contract. */
-	public record GuiRawImageAssetRecord(long assetId, int format, int width, int height, byte[] pixels) {
+	public record GuiRawImageAssetRecord(long assetId, int format, int width, int height, byte[] pixels, int samplingFilter, int samplingAddress) {
+		public GuiRawImageAssetRecord(long assetId, int format, int width, int height, byte[] pixels) {
+			this(assetId, format, width, height, pixels, 0, 0);
+		}
 		private static final int MAX_RAW_IMAGE_BYTES = 64 * 1024 * 1024;
 		private static final int MAX_RAW_IMAGE_DIMENSION = 8192;
 		private static final int MAX_RAW_IMAGE_PIXELS = 16 * 1024 * 1024;
 
 		public GuiRawImageAssetRecord {
+			if (!((samplingFilter == 0 && samplingAddress == 0)
+				|| (samplingFilter >= 1 && samplingFilter <= 2 && samplingAddress >= 1 && samplingAddress <= 2))) {
+				throw new IllegalArgumentException("invalid explicit raw GUI image sampling");
+			}
 			if (assetId == 0L || format < 1 || format > 2 || width <= 0 || height <= 0
 				|| width > MAX_RAW_IMAGE_DIMENSION || height > MAX_RAW_IMAGE_DIMENSION) {
 				throw new IllegalArgumentException("invalid semantic GUI raw image asset");
@@ -2867,7 +3033,7 @@ public final class VulkanicGalBridge implements AutoCloseable {
 	public Status stageAtlasAnimationAssets(int textureId, long acceptedTextureGeneration, long initialTick,
 		net.minecraft.client.renderer.texture.SemanticAtlasAnimationSource snapshot) {
 		Objects.requireNonNull(snapshot, "snapshot");
-		if (textureId <= 0 || acceptedTextureGeneration <= 0 || initialTick < 0) {
+		if (textureId == 0 || acceptedTextureGeneration <= 0 || initialTick < 0) {
 			throw new IllegalArgumentException("Invalid atlas animation staging identity");
 		}
 		// The resource snapshot generation and accepted mesh-update generation
@@ -2882,7 +3048,7 @@ public final class VulkanicGalBridge implements AutoCloseable {
 	public AtlasAnimationTickResult tickAtlasAnimation(int textureId, long generation, long tick,
 		int[] visibleSpriteIds, boolean animateOnlyVisible) {
 		Objects.requireNonNull(visibleSpriteIds, "visibleSpriteIds");
-		if (textureId <= 0 || generation <= 0 || tick < 0 || visibleSpriteIds.length > 16384) {
+		if (textureId == 0 || generation <= 0 || tick < 0 || visibleSpriteIds.length > 16384) {
 			throw new IllegalArgumentException("Invalid atlas animation tick");
 		}
 		try (Arena arena = Arena.ofConfined()) {
@@ -2958,7 +3124,7 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		long initialTick, List<AtlasAnimationSourceRecord> sprites) {
 		Objects.requireNonNull(arena, "arena");
 		Objects.requireNonNull(sprites, "sprites");
-		if (textureId <= 0 || generation <= 0 || initialTick < 0 || sprites.size() > 16384) {
+		if (textureId == 0 || generation <= 0 || initialTick < 0 || sprites.size() > 16384) {
 			throw new IllegalArgumentException("Invalid atlas animation update");
 		}
 		sprites = List.copyOf(sprites);
@@ -3193,6 +3359,78 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		public byte[] indexBytes() {
 			return indexBytes.clone();
 		}
+	}
+
+	/** No Java-generated corners, UV cells, material policy or GPU objects. */
+	public record WorldExperienceOrbInstanceRecord(long meshKey, long meshGeneration, int meshIndex,
+		float[] entityTransform, float[] cameraOrientation, int entityId) {
+		public WorldExperienceOrbInstanceRecord {
+			if (meshKey == 0 || meshGeneration == 0 || meshIndex < 0
+				|| entityTransform == null || entityTransform.length != 16
+				|| cameraOrientation == null || cameraOrientation.length != 4)
+				throw new IllegalArgumentException("invalid orb placement semantics");
+			entityTransform = entityTransform.clone();
+			cameraOrientation = cameraOrientation.clone();
+			for (float value : entityTransform) if (!Float.isFinite(value))
+				throw new IllegalArgumentException("orb entity transform must be finite");
+			for (float value : cameraOrientation) if (!Float.isFinite(value))
+				throw new IllegalArgumentException("orb camera orientation must be finite");
+		}
+		@Override public float[] entityTransform() { return entityTransform.clone(); }
+		@Override public float[] cameraOrientation() { return cameraOrientation.clone(); }
+	}
+
+	static MemorySegment encodeExperienceOrbInstances(Arena arena, List<WorldExperienceOrbInstanceRecord> orbs, int meshCount) {
+		if (meshCount < 0 || (long) meshCount + orbs.size() > 65_536)
+			throw new IllegalArgumentException("combined mesh/orb frame bound exceeded");
+		var layout = Struct.WORLD_EXPERIENCE_ORB_INSTANCE;
+		var records = layout.array(arena, orbs.size());
+		int previous = 0;
+		for (int i = 0; i < orbs.size(); i++) {
+			var orb = orbs.get(i);
+			if (orb.meshIndex() < previous || orb.meshIndex() > meshCount)
+				throw new IllegalArgumentException("invalid orb mesh ordering");
+			previous = orb.meshIndex();
+			var item = Abi.item(records, layout, i);
+			layout.setInt(item, 0, layout.byteSize());
+			layout.setInt(item, 1, orb.meshIndex());
+			layout.setLong(item, 2, orb.meshKey());
+			layout.setLong(item, 3, orb.meshGeneration());
+			item.asSlice(layout.offset(4), 64).copyFrom(MemorySegment.ofArray(orb.entityTransform()));
+			item.asSlice(layout.offset(5), 16).copyFrom(MemorySegment.ofArray(orb.cameraOrientation()));
+			layout.setInt(item, 6, orb.entityId());
+			layout.setInt(item, 7, 0);
+		}
+		return records;
+	}
+
+	public record WorldExperienceOrbAssetRecord(long meshKey, long meshGeneration,
+		int icon, int red, int blue, int packedLight) {
+		public WorldExperienceOrbAssetRecord {
+			if (meshKey == 0 || meshGeneration == 0 || icon < 0 || icon > 10
+				|| red < 0 || red > 255 || blue < 0 || blue > 255) {
+				throw new IllegalArgumentException("invalid immutable experience orb appearance");
+			}
+		}
+	}
+
+	static MemorySegment encodeExperienceOrbAssets(Arena arena, List<WorldExperienceOrbAssetRecord> orbs) {
+		if (orbs.size() > 16_384) throw new IllegalArgumentException("too many experience orb assets");
+		var layout = Struct.WORLD_EXPERIENCE_ORB_ASSET;
+		MemorySegment records = layout.array(arena, orbs.size());
+		for (int i = 0; i < orbs.size(); i++) {
+			var orb = Objects.requireNonNull(orbs.get(i), "orb");
+			MemorySegment item = Abi.item(records, layout, i);
+			layout.setInt(item, 0, layout.byteSize());
+			layout.setInt(item, 1, orb.icon());
+			layout.setLong(item, 2, orb.meshKey());
+			layout.setLong(item, 3, orb.meshGeneration());
+			layout.setInt(item, 4, orb.red());
+			layout.setInt(item, 5, orb.blue());
+			layout.setInt(item, 6, orb.packedLight());
+			layout.setInt(item, 7, 0);
+		}
+		return records;
 	}
 
 	public record WorldMeshVertexRecord(
@@ -4098,9 +4336,16 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		float[] atlasUv,
 		float[] localUv,
 		int colorArgb,
-		int normalPacked
+		int normalPacked,
+		int sourceFace,
+		int sourceFoilType
 	) {
+		public GuiMeshVertexRecord(float[] position, float[] atlasUv, float[] localUv, int colorArgb, int normalPacked) {
+			this(position, atlasUv, localUv, colorArgb, normalPacked, 0, 0);
+		}
 		public GuiMeshVertexRecord {
+			if (sourceFace < 0 || sourceFace > 6 || sourceFoilType < 0 || sourceFoilType > 1
+				|| (sourceFoilType != 0 && sourceFace == 0)) throw new IllegalArgumentException("invalid GUI baked face/foil semantics");
 			position = checkedFiniteCopy(position, 3, "GUI mesh position");
 			atlasUv = checkedFiniteCopy(atlasUv, 2, "GUI mesh atlas UV");
 			localUv = checkedFiniteCopy(localUv, 2, "GUI mesh local UV");
@@ -4113,13 +4358,66 @@ public final class VulkanicGalBridge implements AutoCloseable {
 
 	/** One coarse copied material layer. Backends see no Java renderer state. */
 	/** Immutable standard foil inputs; texture coordinates are computed only in Rust. */
-	public record StandardItemFoilRecord(long clockMillis, double speed, float strength) {
+	public enum StandardFoilKind {
+		ITEM(1), ENTITY(2);
+		private final int wireValue;
+		StandardFoilKind(int wireValue) { this.wireValue = wireValue; }
+		public int wireValue() { return this.wireValue; }
+	}
+
+	public record StandardItemFoilRecord(long clockMillis, double speed, float strength, StandardFoilKind kind) {
+		public StandardItemFoilRecord(long clockMillis, double speed, float strength) {
+			this(clockMillis, speed, strength, StandardFoilKind.ITEM);
+		}
 		public StandardItemFoilRecord {
+			Objects.requireNonNull(kind, "kind");
 			if (clockMillis < 0 || !Double.isFinite(speed) || speed < 0.0 || speed > 1.0
 				|| !Float.isFinite(strength) || strength < 0.0F || strength > 1.0F) {
 				throw new IllegalArgumentException("invalid standard item foil semantics");
 			}
 		}
+	}
+
+	/** Copied unscaled model/normal poses, never Java-computed decal UVs or inverse texture matrices. */
+	public record GuiDecalFoilRecord(float[] modelPose, float[] normalPose, boolean nativeItemLayout) {
+		public GuiDecalFoilRecord(float[] modelPose, float[] normalPose) {
+			this(modelPose,normalPose,false);
+		}
+		public static GuiDecalFoilRecord forNativeItemLayout() {
+			return new GuiDecalFoilRecord(new float[16],new float[9],true);
+		}
+		public GuiDecalFoilRecord {
+			modelPose = checkedFiniteCopy(modelPose, 16, "GUI decal model pose");
+			normalPose = checkedFiniteCopy(normalPose, 9, "GUI decal normal pose");
+			if (nativeItemLayout) {
+				for (float value:modelPose) if (Float.floatToRawIntBits(value)!=0) throw new IllegalArgumentException("native item layout cannot carry caller raster pose");
+				for (float value:normalPose) if (Float.floatToRawIntBits(value)!=0) throw new IllegalArgumentException("native item layout cannot carry caller normal pose");
+			} else if (modelPose[3] != 0 || modelPose[7] != 0 || modelPose[11] != 0 || modelPose[15] != 1)
+				throw new IllegalArgumentException("GUI decal model pose must be affine");
+		}
+		@Override public float[] modelPose() { return modelPose.clone(); }
+		@Override public float[] normalPose() { return normalPose.clone(); }
+	}
+
+	/** Immutable model-space bounds and GUI scale; never a Java raster pose or GPU handle. */
+	public record GuiBlockItemRasterRecord(int guiScale, double[] modelBounds, boolean oversizedGui) {
+		public GuiBlockItemRasterRecord(int guiScale, double[] modelBounds) {
+			this(guiScale,modelBounds,false);
+		}
+		public GuiBlockItemRasterRecord {
+			if (guiScale <= 0 || guiScale > 256 || modelBounds == null || modelBounds.length != 6)
+				throw new IllegalArgumentException("invalid semantic block item layout");
+			modelBounds = modelBounds.clone();
+			for (double value : modelBounds) if (!Double.isFinite(value)) throw new IllegalArgumentException("nonfinite item bounds");
+			for (int axis = 0; axis < 3; axis++) if (modelBounds[axis] > modelBounds[axis+3])
+				throw new IllegalArgumentException("unordered item bounds");
+		}
+		@Override public double[] modelBounds() { return modelBounds.clone(); }
+	}
+
+	/** Semantic model identity and authored animation flag, never a GPU/cache handle. */
+	public record GuiItemCacheRecord(long identity, boolean animated) {
+		public GuiItemCacheRecord { if (identity <= 0) throw new IllegalArgumentException("Invalid GUI item identity"); }
 	}
 
 	public record GuiMeshBatchRecord(
@@ -4128,8 +4426,47 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		int left, int top, int right, int bottom, int guiWidth, int guiHeight,
 		int renderWidth, int renderHeight, int guardPixels,
 		int clipMode, int clipLeft, int clipTop, int clipWidth, int clipHeight,
-		List<GuiMeshVertexRecord> vertices, List<Integer> indices, StandardItemFoilRecord itemFoil, int itemRasterScale
+		List<GuiMeshVertexRecord> vertices, List<Integer> indices, StandardItemFoilRecord itemFoil, int itemRasterScale,
+		GuiDecalFoilRecord decalFoil, GuiBlockItemRasterRecord blockItemRaster, GuiItemCacheRecord itemCache
 	) {
+		public GuiMeshBatchRecord(
+			int stratum, int layerIndex, int materialMode, int lightingMode, long assetId, long sequence,
+			float alphaCutoff, float[] modelTransform, float[] guiPose,
+			int left, int top, int right, int bottom, int guiWidth, int guiHeight,
+			int renderWidth, int renderHeight, int guardPixels,
+			int clipMode, int clipLeft, int clipTop, int clipWidth, int clipHeight,
+			List<GuiMeshVertexRecord> vertices, List<Integer> indices, StandardItemFoilRecord itemFoil, int itemRasterScale,
+			GuiDecalFoilRecord decalFoil, GuiBlockItemRasterRecord blockItemRaster
+		) {
+			this(stratum, layerIndex, materialMode, lightingMode, assetId, sequence, alphaCutoff, modelTransform, guiPose,
+				left, top, right, bottom, guiWidth, guiHeight, renderWidth, renderHeight, guardPixels,
+				clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, itemFoil, itemRasterScale, decalFoil, blockItemRaster, null);
+		}
+		public GuiMeshBatchRecord(
+			int stratum, int layerIndex, int materialMode, int lightingMode, long assetId, long sequence,
+			float alphaCutoff, float[] modelTransform, float[] guiPose,
+			int left, int top, int right, int bottom, int guiWidth, int guiHeight,
+			int renderWidth, int renderHeight, int guardPixels,
+			int clipMode, int clipLeft, int clipTop, int clipWidth, int clipHeight,
+			List<GuiMeshVertexRecord> vertices, List<Integer> indices, StandardItemFoilRecord itemFoil, int itemRasterScale,
+			GuiDecalFoilRecord decalFoil
+		) {
+			this(stratum, layerIndex, materialMode, lightingMode, assetId, sequence, alphaCutoff, modelTransform, guiPose,
+				left, top, right, bottom, guiWidth, guiHeight, renderWidth, renderHeight, guardPixels,
+				clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, itemFoil, itemRasterScale, decalFoil, null);
+		}
+		public GuiMeshBatchRecord(
+			int stratum, int layerIndex, int materialMode, int lightingMode, long assetId, long sequence,
+			float alphaCutoff, float[] modelTransform, float[] guiPose,
+			int left, int top, int right, int bottom, int guiWidth, int guiHeight,
+			int renderWidth, int renderHeight, int guardPixels,
+			int clipMode, int clipLeft, int clipTop, int clipWidth, int clipHeight,
+			List<GuiMeshVertexRecord> vertices, List<Integer> indices, StandardItemFoilRecord itemFoil, int itemRasterScale
+		) {
+			this(stratum, layerIndex, materialMode, lightingMode, assetId, sequence, alphaCutoff, modelTransform, guiPose,
+				left, top, right, bottom, guiWidth, guiHeight, renderWidth, renderHeight, guardPixels,
+				clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, itemFoil, itemRasterScale, null);
+		}
 		public GuiMeshBatchRecord(
 			int stratum, int layerIndex, int materialMode, int lightingMode, long assetId, long sequence,
 			float alphaCutoff, float[] modelTransform, float[] guiPose,
@@ -4156,12 +4493,28 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		}
 
 		public GuiMeshBatchRecord {
-			if (itemRasterScale < 0 || (itemRasterScale > 0 && (lightingMode != 1 || renderWidth != 0
+			if (itemCache != null && (itemRasterScale == 0 || !itemCache.animated() && itemFoil != null))
+				throw new IllegalArgumentException("Item cache requires coherent native item animation semantics");
+			if (materialMode == GUI_MESH_MATERIAL_MODEL_OVERLAY && (itemRasterScale == 0
+				|| lightingMode != GUI_MESH_LIGHTING_FRONT_MODEL || alphaCutoff != 0.0F || itemFoil != null))
+				throw new IllegalArgumentException("model overlay requires native front-lit base geometry without cutout or foil");
+			if (blockItemRaster != null && (itemRasterScale != 0 || renderWidth != 0 || renderHeight != 0 || guardPixels != 0
+				|| decalFoil != null || !(materialMode == 4 ? lightingMode == 1 && itemFoil != null
+					: materialMode >= 1 && materialMode <= 3 && lightingMode == GUI_MESH_LIGHTING_INVENTORY_BLOCK)))
+				throw new IllegalArgumentException("conflicting native block item layout semantics");
+			if (decalFoil != null && itemFoil == null) throw new IllegalArgumentException("decal foil requires explicit timing and strength");
+			if (decalFoil != null && decalFoil.nativeItemLayout() != (itemRasterScale > 0)) throw new IllegalArgumentException("decal and item raster coordinate spaces differ");
+			if (lightingMode == GUI_MESH_LIGHTING_FRONT_MODEL && (itemRasterScale == 0 || materialMode == 4 || decalFoil != null || blockItemRaster != null))
+				throw new IllegalArgumentException("front model lighting requires a native base item mesh");
+			if (itemRasterScale < 0 || (itemRasterScale > 0 && ((lightingMode != 1 && lightingMode != GUI_MESH_LIGHTING_FRONT_MODEL) || renderWidth != 0
 				|| renderHeight != 0 || guardPixels != 0))) throw new IllegalArgumentException("conflicting flat item raster semantics");
 			if (itemFoil != null && materialMode != 4) throw new IllegalArgumentException("standard foil requires glint material");
-			if (assetId == 0L || layerIndex < 0 || (materialMode != 1 && materialMode != 2 && materialMode != 3 && materialMode != 4 && materialMode != GUI_MESH_MATERIAL_PANORAMA)
-				|| (lightingMode != 1 && lightingMode != 2 && lightingMode != GUI_MESH_LIGHTING_INVENTORY_BLOCK) || !Float.isFinite(alphaCutoff)
-				|| guiWidth <= 0 || guiHeight <= 0 || (itemRasterScale == 0 && (renderWidth <= guardPixels * 2 || renderHeight <= guardPixels * 2))
+			if (itemFoil != null && itemFoil.kind() == StandardFoilKind.ENTITY
+				&& (itemRasterScale == 0 || blockItemRaster != null || decalFoil != null || lightingMode != 1))
+				throw new IllegalArgumentException("entity foil requires native front-lit model item layout");
+			if (assetId == 0L || layerIndex < 0 || (materialMode != 1 && materialMode != 2 && materialMode != 3 && materialMode != 4 && materialMode != GUI_MESH_MATERIAL_PANORAMA && materialMode != GUI_MESH_MATERIAL_MODEL_OVERLAY)
+				|| (lightingMode != 1 && lightingMode != 2 && lightingMode != GUI_MESH_LIGHTING_INVENTORY_BLOCK && lightingMode != GUI_MESH_LIGHTING_FRONT_MODEL) || !Float.isFinite(alphaCutoff)
+				|| guiWidth <= 0 || guiHeight <= 0 || (itemRasterScale == 0 && blockItemRaster == null && (renderWidth <= guardPixels * 2 || renderHeight <= guardPixels * 2))
 				|| left >= right || top >= bottom) throw new IllegalArgumentException("invalid semantic GUI mesh batch");
 			if (clipMode == 0) {
 				if (clipLeft != 0 || clipTop != 0 || clipWidth != 0 || clipHeight != 0) throw new IllegalArgumentException("disabled GUI mesh clip must be zero");
@@ -4183,13 +4536,34 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		public GuiMeshBatchRecord withSequence(long value) {
 			return new GuiMeshBatchRecord(stratum, layerIndex, materialMode, lightingMode, assetId, value,
 				alphaCutoff, modelTransform, guiPose, left, top, right, bottom, guiWidth, guiHeight,
-				renderWidth, renderHeight, guardPixels, clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, itemFoil, itemRasterScale);
+				renderWidth, renderHeight, guardPixels, clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, itemFoil, itemRasterScale, decalFoil, blockItemRaster, itemCache);
 		}
 
 		public GuiMeshBatchRecord withItemFoil(StandardItemFoilRecord value) {
 			return new GuiMeshBatchRecord(stratum, layerIndex, materialMode, lightingMode, assetId, sequence,
 				alphaCutoff, modelTransform, guiPose, left, top, right, bottom, guiWidth, guiHeight,
-				renderWidth, renderHeight, guardPixels, clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, value, itemRasterScale);
+				renderWidth, renderHeight, guardPixels, clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, value, itemRasterScale, decalFoil, blockItemRaster, itemCache);
+		}
+
+		public GuiMeshBatchRecord withDecalFoil(GuiDecalFoilRecord value) {
+			return new GuiMeshBatchRecord(stratum, layerIndex, materialMode, lightingMode, assetId, sequence,
+				alphaCutoff, modelTransform, guiPose, left, top, right, bottom, guiWidth, guiHeight,
+				renderWidth, renderHeight, guardPixels, clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, itemFoil, itemRasterScale, value, blockItemRaster, itemCache);
+		}
+
+		/** Input vertices retain ORIGINAL model-space normals when this layout is present. */
+		public GuiMeshBatchRecord withBlockItemRaster(GuiBlockItemRasterRecord value) {
+			Objects.requireNonNull(value, "block item layout");
+			return new GuiMeshBatchRecord(stratum, layerIndex, materialMode, lightingMode, assetId, sequence,
+				alphaCutoff, modelTransform, guiPose, left, top, right, bottom, guiWidth, guiHeight,
+				0, 0, 0, clipMode, clipLeft, clipTop, clipWidth, clipHeight, vertices, indices, itemFoil, itemRasterScale, decalFoil, value, itemCache);
+		}
+
+		public GuiMeshBatchRecord withItemCache(GuiItemCacheRecord value) {
+			return new GuiMeshBatchRecord(stratum, layerIndex, materialMode, lightingMode, assetId, sequence,
+				alphaCutoff, modelTransform, guiPose, left, top, right, bottom, guiWidth, guiHeight,
+				renderWidth, renderHeight, guardPixels, clipMode, clipLeft, clipTop, clipWidth, clipHeight,
+				vertices, indices, itemFoil, itemRasterScale, decalFoil, blockItemRaster, value);
 		}
 	}
 
@@ -4319,6 +4693,37 @@ public final class VulkanicGalBridge implements AutoCloseable {
 		public float[] vertices() {
 			return vertices.clone();
 		}
+	}
+
+	/** Game surface semantics, not native pipeline or GPU state. */
+	public enum ParticleSurface {
+		ORDINARY_OPAQUE(0), ORDINARY_TRANSLUCENT(1), TERRAIN_OPAQUE(2), TERRAIN_CUTOUT(3), TERRAIN_TRANSLUCENT(4);
+		private final int wireValue;
+		ParticleSurface(int wireValue) { this.wireValue = wireValue; }
+		public int wireValue() { return wireValue; }
+	}
+	/** Immutable particle inputs. Geometry and raster policy belong to Rust. */
+	public record WorldParticleQuadRecord(int textureId, ParticleSurface surface, int materialIndex,
+		float[] center, float[] rotation, float size, float[] uvBounds, int colorArgb, int packedLight) {
+		public WorldParticleQuadRecord(int textureId, boolean translucent, int materialIndex,
+			float[] center, float[] rotation, float size, float[] uvBounds, int colorArgb, int packedLight) {
+			this(textureId, translucent ? ParticleSurface.ORDINARY_TRANSLUCENT : ParticleSurface.ORDINARY_OPAQUE,
+				materialIndex, center, rotation, size, uvBounds, colorArgb, packedLight);
+		}
+		public boolean translucent() {
+			return surface == ParticleSurface.ORDINARY_TRANSLUCENT || surface == ParticleSurface.TERRAIN_TRANSLUCENT;
+		}
+		public WorldParticleQuadRecord {
+			Objects.requireNonNull(surface, "particle surface");
+			if (textureId == 0 || materialIndex < 0 || !Float.isFinite(size))
+				throw new IllegalArgumentException("invalid particle identity, order, or size");
+			center = checkedFiniteCopy(center, 3, "particle center");
+			rotation = checkedFiniteCopy(rotation, 4, "particle orientation");
+			uvBounds = checkedFiniteCopy(uvBounds, 4, "particle sprite bounds");
+		}
+		@Override public float[] center() { return center.clone(); }
+		@Override public float[] rotation() { return rotation.clone(); }
+		@Override public float[] uvBounds() { return uvBounds.clone(); }
 	}
 
 	public record WorldMaterialQuadRecord(
@@ -4477,7 +4882,7 @@ public final class VulkanicGalBridge implements AutoCloseable {
 	}
 
 	private static void encodeWorldItemFoil(MemorySegment item, StandardItemFoilRecord foil) {
-		Struct.WORLD_MESH_INSTANCE_RECORD.setInt(item, 20, foil == null ? 0 : 1);
+		Struct.WORLD_MESH_INSTANCE_RECORD.setInt(item, 20, foil == null ? 0 : foil.kind().wireValue());
 		Struct.WORLD_MESH_INSTANCE_RECORD.setLong(item, 21, foil == null ? 0L : foil.clockMillis());
 		item.set(ValueLayout.JAVA_DOUBLE, Struct.WORLD_MESH_INSTANCE_RECORD.offset(22), foil == null ? 0.0 : foil.speed());
 		Struct.WORLD_MESH_INSTANCE_RECORD.setFloat(item, 23, foil == null ? 0.0F : foil.strength());
@@ -5538,6 +5943,9 @@ public final class VulkanicGalBridge implements AutoCloseable {
 			GUI_ASSET_UPDATE(48),
 			WINDOWED_VULKAN_CONTEXT_CREATE(49),
 			WORLD_LINE_SEGMENT_REQUEST(50),
+			WORLD_PARTICLE_QUAD_REQUEST(108),
+			WORLD_EXPERIENCE_ORB_ASSET(109),
+			WORLD_EXPERIENCE_ORB_INSTANCE(110),
 			WORLD_CRACK_QUAD_REQUEST(51),
 			WORLD_BORDER_QUAD_REQUEST(52),
 			WHOLE_FRAME_SUBMIT(53),

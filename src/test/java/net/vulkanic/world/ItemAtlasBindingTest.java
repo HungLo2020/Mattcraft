@@ -25,6 +25,7 @@ class ItemAtlasBindingTest {
     }
     private static final class Sprite extends TextureAtlasSprite {
         Sprite(SpriteContents contents) { super(TextureAtlas.LOCATION_BLOCKS, contents, 16, 16, 4, 8); }
+        Sprite(ResourceLocation atlas, SpriteContents contents) { super(atlas, contents, 16, 16, 4, 8); }
     }
 
     @Test
@@ -61,13 +62,13 @@ class ItemAtlasBindingTest {
                 RustGalWorldPrimitiveRenderer.MATERIAL_MODE_CUTOUT,
                 RustGalWorldPrimitiveRenderer.DEPTH_POLICY_TEST_WRITE, RustGalWorldPrimitiveRenderer.CULL_BACK);
             Method extract = RustGalWorldPrimitiveRenderer.class.getDeclaredMethod("extractItemQuadMesh",
-                List.class, int[].class, int.class, semanticsType, String.class, boolean.class, Matrix4f.class);
+                List.class, int[].class, int.class, semanticsType, String.class, boolean.class);
             extract.setAccessible(true);
-            System.setProperty(property, "true");
+            System.clearProperty(property);
             // No Minecraft singleton, Java GPU device, resource manager, or selected
             // animation frame is available. Extraction must only emit atlas semantics.
             Object result = extract.invoke(null, List.of(quad), new int[0], 0x00f000f0, semantics,
-                "minecraft:audit/item", false, null);
+                "minecraft:audit/item", false);
             var assetAccessor = result.getClass().getDeclaredMethod("asset");
             assetAccessor.setAccessible(true);
             var asset = (VulkanicGalBridge.WorldMeshAssetRecord) assetAccessor.invoke(result);
@@ -104,21 +105,20 @@ class ItemAtlasBindingTest {
                 return true;
             }));
             System.setProperty(property, "false");
-            Object separate = extract.invoke(null, List.of(quad), new int[0], 0x00f000f0, semantics,
-                "minecraft:audit/item", false, null);
-            var separateAsset = (VulkanicGalBridge.WorldMeshAssetRecord) assetAccessor.invoke(separate);
-            assertEquals(1, ((List<?>) textureAccessor.invoke(separate)).size());
-            assertNotEquals(section.textureId(), separateAsset.sections().getFirst().textureId());
-            assertEquals(0.1F, separateAsset.vertices().getFirst().u(), 0.000001F);
-            System.setProperty(property, "true");
-            Object foil = extract.invoke(null, List.of(quad), new int[0], 0x00f000f0, semantics,
-                "minecraft:audit/item", false, new Matrix4f());
-            assertEquals(1, ((List<?>) textureAccessor.invoke(foil)).size(), "special foil stays a separate texture projection");
-            assertNotEquals(section.textureId(), ((VulkanicGalBridge.WorldMeshAssetRecord)
-                assetAccessor.invoke(foil)).sections().getFirst().textureId());
+            Object repeated = extract.invoke(null, List.of(quad), new int[0], 0x00f000f0, semantics,
+                "minecraft:audit/item", false);
+            var repeatedAsset = (VulkanicGalBridge.WorldMeshAssetRecord) assetAccessor.invoke(repeated);
+            assertTrue(((List<?>) textureAccessor.invoke(repeated)).isEmpty());
+            assertEquals(section.textureId(), repeatedAsset.sections().getFirst().textureId());
+            assertEquals(asset.vertices(), repeatedAsset.vertices(), "a disabled diagnostic flag must not select Java frame copies");
+            assertEquals("special-foil-native-projection-unavailable",
+                RustGalWorldPrimitiveRenderer.itemEntityMeshIneligibility(
+                    net.minecraft.world.item.ItemDisplayContext.GROUND, 0x00f000f0, 0, 0,
+                    new int[0], List.of(quad), null,
+                    net.minecraft.client.renderer.item.ItemStackRenderState.FoilType.SPECIAL));
             resource.enqueueTick(2, true);
             assertTrue(resource.drain(17, (texture, generation, tick, visible, onlyVisible) -> {
-                assertEquals(0, visible.length, "separate textures and foil must not activate atlas animation");
+                assertArrayEquals(new int[]{11}, visible, "the normal item route reports owned atlas use");
                 return true;
             }));
             var device = net.vulkanic.VulkanicAPI.class.getDeclaredField("device");
@@ -132,6 +132,16 @@ class ItemAtlasBindingTest {
                 // The resource already owns immutable source pixels. Neither
                 // eligibility nor extraction may read this retired Java image.
                 contents.originalImage.close();
+                var unsupportedSprite = new Sprite(TextureAtlas.LOCATION_PARTICLES, contents);
+                var unsupportedQuad = new BakedQuad(packed, -1, Direction.SOUTH, unsupportedSprite, true, 0);
+                var unsupported = assertThrows(java.lang.reflect.InvocationTargetException.class,
+                    () -> extract.invoke(null, List.of(unsupportedQuad), new int[0], 0x00f000f0, semantics,
+                        "minecraft:audit/unsupported-atlas", false));
+                assertEquals("animated-item-atlas-native-contract-unavailable", unsupported.getCause().getMessage(),
+                    "an unsupported animated atlas must never use closed Java frame pixels as fallback");
+                var itemEligibility = RustGalWorldPrimitiveRenderer.class.getDeclaredMethod("itemSpriteTextureIneligibility",TextureAtlasSprite.class);
+                itemEligibility.setAccessible(true);
+                assertEquals("animated-item-atlas-native-contract-unavailable",itemEligibility.invoke(null,unsupportedSprite));
                 var firstPersonState = new net.minecraft.client.renderer.item.ItemStackRenderState();
                 var context = firstPersonState.getClass().getDeclaredField("displayContext");
                 context.setAccessible(true);
@@ -224,7 +234,11 @@ class ItemAtlasBindingTest {
                     assertArrayEquals(new int[]{11}, visible, "ModelPart reports its semantic sprite use");
                     return true;
                 }));
+                // Terrain particles consume the already-owned block atlas;
+                // their sprite visibility must not require a private flag.
+                System.clearProperty(property);
                 verifyTerrainParticleUse(resource, sprite);
+                System.clearProperty(property);
                 resource.close();
                 var retiredModel = assertThrows(java.lang.reflect.InvocationTargetException.class,
                     () -> modelExtract.invoke(null, model, TextureAtlas.LOCATION_BLOCKS, sprite,
@@ -281,21 +295,27 @@ class ItemAtlasBindingTest {
                 assertArrayEquals(new int[0], visible, "rejected particles must not report sprite use");
                 return true;
             }));
-            assertTrue(enqueueParticle(resource, sprite, camera, 0.25F));
+            int materialCount = ((List<?>)quads.get(null)).size();
+            for (var surface : new VulkanicGalBridge.ParticleSurface[]{
+                    VulkanicGalBridge.ParticleSurface.TERRAIN_OPAQUE,
+                    VulkanicGalBridge.ParticleSurface.TERRAIN_CUTOUT,
+                    VulkanicGalBridge.ParticleSurface.TERRAIN_TRANSLUCENT}) {
+            RustGalWorldPrimitiveRenderer.rollbackMaterialQuadBatch(checkpoint);
+            assertTrue(enqueueParticle(resource, sprite, camera, 0.25F, surface));
             assertEquals(checkpoint + 1, RustGalWorldPrimitiveRenderer.markMaterialQuadBatch());
-            var emitted = ((List<VulkanicGalBridge.WorldMaterialQuadRecord>)quads.get(null)).getLast();
-            assertEquals(atlas, emitted.textureId());
-            assertEquals(sprite.getU(0.25F), emitted.uv0U());
-            assertEquals(sprite.getV(0.9F), emitted.uv0V());
-            assertNotEquals(0.75F, emitted.uv0U(), "atlas coordinates must not collapse to sprite-local UVs");
-            assertEquals(sprite.getU(0.75F), emitted.uv2U(), "reversed U must retain vanilla's corner orientation");
-            assertEquals(0x00400020, emitted.packedLight());
-            assertEquals(0xff804020, emitted.colorArgb(), "Java must preserve raw color for Rust lightmap evaluation");
-            assertEquals(0xff804020, emitted.sourceColorArgb());
-            assertEquals(0xff804020, emitted.vertex0ColorArgb());
-            assertEquals(0xff804020, emitted.vertex1ColorArgb());
-            assertEquals(0xff804020, emitted.vertex2ColorArgb());
-            assertEquals(0xff804020, emitted.vertex3ColorArgb());
+            assertEquals(materialCount, ((List<?>)quads.get(null)).size(),
+                "native terrain must not enqueue Java-expanded material geometry");
+            var typedField = renderer.getDeclaredField("PENDING_PARTICLE_QUADS");
+            typedField.setAccessible(true);
+            var typed = ((List<VulkanicGalBridge.WorldParticleQuadRecord>)typedField.get(null)).getLast();
+            assertEquals(surface, typed.surface());
+            assertEquals(surface == VulkanicGalBridge.ParticleSurface.TERRAIN_TRANSLUCENT, typed.translucent());
+            assertEquals(atlas, typed.textureId());
+            assertArrayEquals(new float[]{sprite.getU(.75F),sprite.getU(.25F),
+                sprite.getV(.1F),sprite.getV(.9F)}, typed.uvBounds());
+            assertEquals(0xff804020, typed.colorArgb());
+            assertEquals(0x00400020, typed.packedLight());
+            }
             resource.enqueueTick(6, true);
             assertTrue(resource.drain(17, (texture, generation, tick, visible, onlyVisible) -> {
                 assertArrayEquals(new int[]{11}, visible, "accepted particle alone activates its owned sprite");
@@ -318,9 +338,15 @@ class ItemAtlasBindingTest {
 
     private static boolean enqueueParticle(AtlasAnimationResource resource, TextureAtlasSprite sprite,
             net.minecraft.client.Camera camera, float size) {
+        return enqueueParticle(resource,sprite,camera,size,VulkanicGalBridge.ParticleSurface.TERRAIN_OPAQUE);
+    }
+
+    private static boolean enqueueParticle(AtlasAnimationResource resource, TextureAtlasSprite sprite,
+            net.minecraft.client.Camera camera, float size, VulkanicGalBridge.ParticleSurface surface) {
         return RustGalWorldPrimitiveRenderer.enqueueTerrainParticle(
             net.minecraft.world.level.block.Blocks.MAGMA_BLOCK.defaultBlockState(), sprite.contents().name(), resource, camera,
             0, 0, 0, 0, -2, -2, new org.joml.Quaternionf(), 1, size,
-            sprite.getU(0.75F), sprite.getU(0.25F), sprite.getV(0.1F), sprite.getV(0.9F), 0xff804020, 0x00400020, true);
+            sprite.getU(0.75F), sprite.getU(0.25F), sprite.getV(0.1F), sprite.getV(0.9F), 0xff804020, 0x00400020,
+            surface);
     }
 }

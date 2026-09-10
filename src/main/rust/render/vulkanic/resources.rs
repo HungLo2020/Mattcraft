@@ -318,6 +318,15 @@ pub enum FrontFace {
     Clockwise = 2,
 }
 
+/// Vertex supplying flat-shaded outputs for each assembled primitive.
+/// This is explicit pipeline state, never the backend's implicit default.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvokingVertex {
+    First = 1,
+    Last = 2,
+}
+
 /// Explicit raster depth bias in backend-neutral units.
 ///
 /// `slope_factor` scales the maximum depth slope and `constant_factor` applies
@@ -365,6 +374,9 @@ pub enum BlendMode {
     /// Vulkan lowers this as per-attachment blend state; OpenGL treats it as
     /// ordinary alpha because its legacy path has a single blend state.
     TerrainTranslucent = 10,
+    /// Source-alpha RGB composition with destination alpha preserved:
+    /// RGB factors SrcAlpha/OneMinusSrcAlpha, alpha factors Zero/One.
+    AlphaPreserveAlpha = 11,
 }
 
 #[repr(u32)]
@@ -566,9 +578,9 @@ impl BackendCapabilities {
         }
 
         let format_supported = match self.api {
-            // These two formats are not implemented by the private OpenGL
-            // isolated-resource path; do not advertise them just because the
-            // driver might support a related native format.
+            // BGRA and three-dimensional packed depth/stencil storage remain
+            // unavailable in private OpenGL lowering. D2 depth/stencil
+            // attachment support does not admit an unimplemented D3 route.
             BackendApi::OpenGl => !matches!(
                 format,
                 TextureFormat::Bgra8Unorm | TextureFormat::Depth24Stencil8
@@ -646,6 +658,16 @@ const fn is_depth_format(format: TextureFormat) -> bool {
 
 pub type ColorFormat = TextureFormat;
 
+/// Direction of positive clip-space Y in the logical target image. This is
+/// explicit raster state, not a shader rewrite or an image-copy convention.
+/// FrontFace retains its existing clip-space winding meaning in both modes.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RasterYDirection {
+    Up = 0,
+    Down = 1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphicsPipelineDesc {
     pub label: String,
@@ -655,6 +677,8 @@ pub struct GraphicsPipelineDesc {
     pub topology: PrimitiveTopology,
     pub cull_mode: CullMode,
     pub front_face: FrontFace,
+    pub provoking_vertex: ProvokingVertex,
+    pub raster_y_direction: RasterYDirection,
     pub blend: BlendMode,
     pub depth_compare: Option<CompareOp>,
     pub depth_write: bool,
